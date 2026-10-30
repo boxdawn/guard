@@ -1,4 +1,5 @@
-"""Rule values for the command guard. Server side only — never shipped.
+"""Rule values for the command guard: the fixed rules that ship with it.
+Anyone can read them, in this file or inside the built binary.
 
 Lists are the place a guard goes stale (Continue CVE-2026-76072 was a list
 missing `/home`), so the evaluator does not rely on them alone: a value it
@@ -13,7 +14,7 @@ _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "ash", "busybox
 # Inline code is read as text, so these are keyword scans with the weakness
 # GuardFall describes. Per language: a backtick means "run" in ruby, not in
 # python (found on real transcripts, 2026-10-29). What a scan reads as clean
-# gets no decision (design §5).
+# gets no decision.
 _PYTHON = (
     r"\bshutil\.(rmtree|move)\b", r"\bos\.(remove|unlink|rmdir|removedirs|truncate|kill)\b",
     r"\bos\.(system|popen|exec\w*|spawn\w*|startfile)\b", r"\bsubprocess\b",
@@ -85,7 +86,7 @@ def default_command_rules() -> CommandRules:
         ),
         # Inline code is read as text, so this is a keyword scan with the
         # weakness GuardFall describes; anything it cannot rule out it asks
-        # about, and what it reads as clean gets no decision (design §5).
+        # about, and what it reads as clean gets no decision.
         inline_code_risky={
             **{n: _PYTHON + _SQL for n in ("python", "python3")},
             **{n: _NODE + _SQL for n in ("node", "deno", "bun")},

@@ -1,7 +1,6 @@
 """Judge a shell command before it runs: deny, ask, or no decision.
 
-A-1 of the destructive-action guard (engine repo field_test/diagnostics/
-_destructive_guard_A1_design_2026_10_29.md). What it is built against:
+What it is built against:
 
 - GuardFall (CSA research note, 2026-07-11): filters that read the command as
   text lose to the shell rewriting it — quote removal, $IFS, command
@@ -40,7 +39,7 @@ _PARSER = Parser(Language(tree_sitter_bash.language()))
 
 @dataclass(frozen=True)
 class CommandRules:
-    """The rule values. Data, so the server can ship them (design §2)."""
+    """The rule values. Data, so they can come from a signed bundle later."""
 
     interpreters: frozenset[str]          # read code from stdin when piped into
     shells: frozenset[str]                # their -c text is judged as shell
