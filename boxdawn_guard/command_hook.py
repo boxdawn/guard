@@ -1,6 +1,7 @@
-"""Claude Code PreToolUse hook around `command_guard.evaluate`.
+"""Claude Code PreToolUse hook around `command_guard.evaluate` (Bash) and
+`powershell_guard.evaluate_powershell` (PowerShell).
 
-Reads the hook input on stdin and prints a decision for Bash calls:
+Reads the hook input on stdin and prints a decision for Bash and PowerShell calls:
 `deny` or `ask` with a reason, or nothing (the normal permission flow).
 Never `allow`. Register it with `"onFailure": "block"` (Claude Code
 v2.1.295+): a command hook that times out does not block by default.
@@ -16,17 +17,19 @@ import sys
 
 from boxdawn_guard.command_guard import evaluate
 from boxdawn_guard.command_rules_source import default_command_rules
+from boxdawn_guard.powershell_guard import evaluate_powershell
 
 
 def decide(payload: dict) -> dict | None:
-    if payload.get("tool_name") != "Bash":
+    tool = payload.get("tool_name")
+    if tool not in ("Bash", "PowerShell"):
         return None
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return None
     rules = default_command_rules()
     known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR") if os.environ.get(k)}
-    verdict = evaluate(
+    verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
         command,
         cwd=payload.get("cwd") or os.getcwd(),
         home=os.path.expanduser("~"),
@@ -34,7 +37,7 @@ def decide(payload: dict) -> dict | None:
         unattended=payload.get("permission_mode") in rules.unattended_modes,
         known_env=known_env,
     )
-    if verdict.decision is None:
+    if verdict is None or verdict.decision is None:
         return None
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
