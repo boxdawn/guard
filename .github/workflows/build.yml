@@ -74,3 +74,34 @@ jobs:
             boxdawn-guard-plugin.zip
             boxdawn-guard-plugin.zip.sha256
           retention-days: 7
+
+  # Real Claude Code sessions against the installed plugin. Costs API calls
+  # (haiku, ~14 sessions per OS), so it runs only when started by hand.
+  runtime:
+    if: github.event_name == 'workflow_dispatch'
+    needs: plugin
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: boxdawn-guard-plugin
+      - name: unpack plugin
+        shell: bash
+        run: mkdir assembled && cd assembled && unzip -q ../boxdawn-guard-plugin.zip
+      - run: npm install -g @anthropic-ai/claude-code
+      - name: real sessions against the installed plugin
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || { echo "::error::ANTHROPIC_API_KEY secret is not set"; exit 1; }
+          python packaging/runtime_test.py assembled
