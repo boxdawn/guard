@@ -8,11 +8,15 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Private-repo Actions minutes are counted per OS (macOS and Windows
+  # several times Linux), so a pull request or a push to main builds on
+  # Linux only. A manual run and a release tag build all five, with the
+  # plugin and the real-session test. Run one by hand before merging.
   binary:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["windows-latest", "macos-latest", "macos-15-intel", "ubuntu-latest", "ubuntu-24.04-arm"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -67,6 +71,7 @@ jobs:
   # One plugin carries every OS's build; place.sh / place.ps1 pick one at
   # session start. BUILD_ID is what they compare to skip a re-copy.
   plugin:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     needs: binary
     runs-on: ubuntu-latest
     timeout-minutes: 10
