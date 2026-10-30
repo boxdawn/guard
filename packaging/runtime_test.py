@@ -100,7 +100,9 @@ def main() -> int:
     if not CLAUDE:
         sys.exit("claude not on PATH")
     src = pathlib.Path(sys.argv[1]).resolve()
-    root = pathlib.Path(tempfile.mkdtemp(prefix="bdxg_rt_"))
+    # resolve(): the Windows runner's TEMP is an 8.3 short path (RUNNER~1),
+    # which Claude Code's own permission check holds for approval.
+    root = pathlib.Path(tempfile.mkdtemp(prefix="bdxg_rt_")).resolve()
     market = root / "market"
     (market / ".claude-plugin").mkdir(parents=True)
     shutil.copytree(src, market / "plugin")
