@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]" "pyinstaller==6.22.3"
+      - run: python -c "import tree_sitter_bash"
+      - run: python -m pytest boxdawn_guard -q
+      # PyInstaller does not cross-compile: each OS builds its own binary.
+      - run: pyinstaller packaging/bdxguard.spec --noconfirm
+      # Fails the job if the binary's output differs from the Python code's
+      # on any sample command.
+      - name: binary matches the Python code
+        shell: bash
+        run: |
+          exe=dist/bdxguard/bdxguard
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          python packaging/check_binary.py "$exe" 21
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bdxguard-${{ runner.os }}-${{ runner.arch }}
+          path: dist/bdxguard
+          retention-days: 7
