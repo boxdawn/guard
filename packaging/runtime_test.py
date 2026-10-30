@@ -38,6 +38,8 @@ DATA = pathlib.Path.home() / ".claude" / "plugins" / "data" / "boxdawn-guard-box
 # CLAUDE_BIN overrides PATH: on Windows `claude` on PATH can be npm's claude.CMD,
 # and a batch file mangles arguments.
 CLAUDE = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+PROJECTS = pathlib.Path.home() / ".claude" / "projects"
+TRANSCRIPT_DIRS: set[pathlib.Path] = set()
 
 
 def sh(args, cwd):
@@ -82,10 +84,13 @@ def session(d: pathlib.Path, mode: str, case: str) -> dict:
     except ValueError:
         j = {}
     placed = DATA / "current" / "BUILD_ID"
+    # The guard's reason is in Claude Code's own transcript of the session,
+    # not reliably in the model's final answer.
+    transcripts = list(PROJECTS.glob(f"*/{j.get('session_id')}.jsonl")) if j.get("session_id") else []
+    TRANSCRIPT_DIRS.update(t.parent for t in transcripts)
     return {"mode": mode, "case": case, "executed": executed,
             "denials": len(j.get("permission_denials") or []),
-            "by_guard": "Boxdawn guard" in json.dumps(j.get("permission_denials") or [])
-                        or "Boxdawn" in (j.get("result") or ""),
+            "by_guard": any("Boxdawn guard" in t.read_text(encoding="utf-8") for t in transcripts),
             "placed": placed.read_text().strip() if placed.exists() else None,
             "exit": p.returncode, "stderr": p.stderr[-300:],
             "stdout_head": "" if j else p.stdout[:300]}
@@ -116,6 +121,8 @@ def main() -> int:
                        capture_output=True, text=True)
         shutil.rmtree(DATA, ignore_errors=True)
         shutil.rmtree(root, ignore_errors=True)
+        for t in TRANSCRIPT_DIRS:
+            shutil.rmtree(t, ignore_errors=True)
 
 
 def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path) -> int:
