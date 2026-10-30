@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # The tests skip themselves without tree-sitter-bash, and a skip here
+      # would be a green check over zero checks. Assert the import first.
+      - run: python -c "import tree_sitter_bash"
+      - run: python -m pytest boxdawn_guard -q

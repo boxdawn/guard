@@ -1,0 +1,814 @@
+"""Judge a shell command before it runs: deny, ask, or no decision.
+
+A-1 of the destructive-action guard (engine repo field_test/diagnostics/
+_destructive_guard_A1_design_2026_10_29.md). What it is built against:
+
+- GuardFall (CSA research note, 2026-07-11): filters that read the command as
+  text lose to the shell rewriting it — quote removal, $IFS, command
+  substitution, base64 piped to sh, other tools with the same effect. So the
+  command is parsed (tree-sitter-bash) and every word is reduced to the value
+  the shell would see, or to "unknown" when that value only exists at run time.
+- Continue CVE-2026-76072: its evaluator survived GuardFall and still fell to
+  `rm -rf $HOME` (a variable read as an empty token), to directories missing
+  from its list, and to "needs permission" passing unattended. So an unknown
+  value is never a safe one, anything risky outside a list asks rather than
+  passing, and `unattended=True` turns every ask into a deny.
+
+The output is deny, ask or None — never allow. None leaves the call to the
+user's own permission settings; this guard only ever adds friction.
+
+The parser is not bash (it splits `rm$IFS-rf$IFS/` differently), so any parse
+error or unreadable name is "ask", not a guess.
+"""
+from __future__ import annotations
+
+import posixpath
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+import tree_sitter_bash
+from tree_sitter import Language, Node, Parser
+
+Value = Optional[str]  # None: only known at run time
+
+_LEVEL = {None: 0, "ask": 1, "deny": 2}
+_MAX_DEPTH = 4  # sh -c inside eval inside sh -c ...
+
+_PARSER = Parser(Language(tree_sitter_bash.language()))
+
+
+@dataclass(frozen=True)
+class CommandRules:
+    """The rule values. Data, so the server can ship them (design §2)."""
+
+    interpreters: frozenset[str]          # read code from stdin when piped into
+    shells: frozenset[str]                # their -c text is judged as shell
+    code_flags: dict[str, frozenset[str]]  # interpreter -> flags taking code
+    wrappers: frozenset[str]              # run the rest of the line as a command
+    privilege: frozenset[str]             # run the rest with more rights
+    source: frozenset[str]                # run a script file in this shell
+    always_deny: frozenset[str]
+    always_deny_prefixes: tuple[str, ...]
+    devices: tuple[str, ...]              # block-device paths
+    harmless_devices: frozenset[str]
+    db_clients: frozenset[str]
+    db_code_flags: frozenset[str]
+    db_file_flags: frozenset[str]
+    db_destructive: tuple[str, ...]       # regexes, case-insensitive
+    inline_code_risky: dict[str, tuple[str, ...]]  # interpreter -> regexes over its code
+    scratch_dirs: tuple[str, ...]         # temp roots: work inside is fine, wiping them is not
+    unattended_modes: frozenset[str]
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One flag in a form that may leave the machine: every field comes from
+    a closed set, so no path, command text or value can ride along. `reasons`
+    on the Verdict keep the readable sentence (with paths) for the person
+    at the keyboard; they stay local."""
+    rule: str                  # one of RULE_IDS; stable, never reused
+    level: str                 # "deny" or "ask"
+    target: Optional[str] = None  # one of TARGETS, or None when no path is involved
+
+
+@dataclass(frozen=True)
+class Verdict:
+    decision: Optional[str]
+    reasons: tuple[str, ...]
+    findings: tuple[Finding, ...] = ()
+    escalated: bool = False    # an "ask" became "deny" because nobody is present
+
+
+# Stable ids (SARIF: rule ids SHALL be stable). Retire an id, never reuse it.
+RULE_IDS = frozenset({
+    "guard.crashed", "parse.too_deep", "parse.unreadable", "name.runtime",
+    "code.inline_unknown_language", "code.inline_risky", "code.runtime", "code.stdin_runtime",
+    "privilege.elevated", "privilege.su_runtime", "eval.runtime", "source.script",
+    "destroy.by_design", "pipe.into_interpreter",
+    "redirect.runtime", "redirect.disk_device", "redirect.outside",
+    "rm.runtime", "rm.outside", "rm.project_root", "find.delete_outside", "find.delete",
+    "dd.runtime", "dd.disk_device", "dd.outside", "dd.overwrite",
+    "truncate.outside", "truncate.file", "chmod.recursive_outside", "sed.outside",
+    "git.runtime", "git.push_force", "git.push_force_with_lease", "git.push_delete",
+    "git.reset_hard", "git.clean", "git.branch_delete", "git.rewrite_history",
+    "db.destructive", "db.runtime", "db.file",
+    "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
+    "docker.prune",
+})
+# Where the target sits, never what it is. "project_root" is the project
+# directory itself; "unknown" is a path known only at run time.
+TARGETS = frozenset({"project", "project_root", "outside", "unknown", "disk_device"})
+_TARGET_OF_WHERE = {"inside": "project", "cwd": "project_root",
+                    "outside": "outside", "unknown": "unknown"}
+
+
+def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
+             unattended: bool = False, known_env: dict[str, str] | None = None) -> Verdict:
+    """`known_env`: variables whose value the caller read from the process
+    environment (the hook passes TEMP/TMP/TMPDIR). Used only when the line
+    itself never assigns them — the same rules as any other variable."""
+    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}))
+    try:
+        judge.run(command, depth=0)
+    except Exception as exc:  # noqa: BLE001 - a guard that crashes must not pass
+        judge.flag("ask", "guard.crashed", f"the guard could not read this command ({type(exc).__name__})")
+    decision = judge.decision
+    escalated = unattended and decision == "ask"
+    if escalated:
+        decision = "deny"
+        judge.reasons.append("nobody is present to approve it")
+    return Verdict(decision, tuple(judge.reasons), tuple(judge.findings), escalated)
+
+
+# ── words to values ─────────────────────────────────────────────────────────
+
+def _unescape(text: str) -> str:
+    """Unquoted word: a backslash keeps the next character literally."""
+    return re.sub(r"\\(.)", r"\1", text, flags=re.S)
+
+
+def _unescape_dq(text: str) -> str:
+    """Inside double quotes only these four lose their backslash."""
+    return re.sub(r'\\([$`"\\])', r"\1", text)
+
+
+Env = "dict[str, list[tuple[int, Value]]]"  # name -> [(byte where set, value)]
+
+
+def _value(node: Node, env: dict | None = None) -> Value:
+    text = node.text.decode("utf-8", "replace")
+    kind = node.type
+    if kind in ("word", "number"):
+        return _unescape(text)
+    if kind == "raw_string":
+        return text[1:-1]
+    if kind == "string":
+        parts = []
+        for child in node.named_children:
+            if child.type == "string_content":
+                parts.append(_unescape_dq(child.text.decode("utf-8", "replace")))
+            else:
+                part = _value(child, env)
+                if part is None:
+                    return None
+                parts.append(part)
+        return "".join(parts)
+    if kind == "concatenation":
+        parts = [_value(c, env) for c in node.children]
+        return None if any(p is None for p in parts) else "".join(parts)
+    if kind in ("simple_expansion", "expansion"):
+        return _lookup(node, env)
+    return None  # substitutions, $'..', arithmetic, anything new
+
+
+def _plain_variable(node: Node) -> str | None:
+    """`$X` or `${X}` — not `${X:-…}`, `${#X}` or any other operator form."""
+    named = node.named_children
+    if len(named) != 1 or named[0].type != "variable_name":
+        return None
+    if node.type == "expansion" and node.child_count != 3:
+        return None
+    return named[0].text.decode()
+
+
+def _lookup(node: Node, env: dict | None) -> Value:
+    """The value set straight-line before this point, else unknown."""
+    name = _plain_variable(node)
+    if name is None or not env or name not in env:
+        return None
+    use = node.start_byte
+    earlier = [(v, span) for at, v, span in env[name] if at < use]
+    if not earlier:
+        return None
+    value, span = earlier[-1]
+    if span is not None and not (span[0] <= use < span[1]):
+        return None  # set inside an && chain that has ended: may not have run
+    return value
+
+
+def _posix(path: str) -> str:
+    """Git Bash form for a Windows path: C:\\x or C:/x -> /c/x."""
+    if re.match(r"^[A-Za-z]:[\\/]", path) or re.fullmatch(r"[A-Za-z]:", path):
+        return "/" + path[0].lower() + path[2:].replace("\\", "/")
+    return path
+
+
+def _short_flags(args: list[Value]) -> set[str]:
+    out: set[str] = set()
+    for a in args:
+        if a and a.startswith("-") and not a.startswith("--"):
+            out.update(a[1:])
+    return out
+
+
+# ── the judge ───────────────────────────────────────────────────────────────
+
+@dataclass
+class _Judge:
+    cwd: str
+    home: str
+    rules: CommandRules
+    decision: Optional[str] = None
+    reasons: list[str] = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)
+    workdirs: list[Optional[str]] = field(default_factory=list)
+    env: dict = field(default_factory=dict)
+    known_env: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._windows = bool(re.match(r"^[A-Za-z]:", self.cwd))
+        self.cwd = posixpath.normpath(_posix(self.cwd))
+        self.home = posixpath.normpath(_posix(self.home))
+
+    def flag(self, level: str, rule: str, reason: str, target: Optional[str] = None) -> None:
+        if rule not in RULE_IDS:
+            raise ValueError(f"unregistered rule id {rule!r}")
+        if target is not None:
+            target = _TARGET_OF_WHERE.get(target, target)
+            if target not in TARGETS:
+                raise ValueError(f"unregistered target class {target!r}")
+        if _LEVEL[level] > _LEVEL[self.decision]:
+            self.decision = level
+        self.reasons.append(reason)
+        self.findings.append(Finding(rule, level, target))
+
+    # entry ──────────────────────────────────────────────────────────────
+    def run(self, text: str, depth: int) -> None:
+        if depth > _MAX_DEPTH:
+            self.flag("ask", "parse.too_deep", "commands nested too deep to read")
+            return
+        tree = _PARSER.parse(text.encode("utf-8"))
+        root = tree.root_node
+        if root.has_error:
+            self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
+        outer = (self.env, self.workdirs)
+        self.env = self._collect_env(root)
+        self._collect_workdirs(root)
+        try:
+            for node in _walk(root):
+                if node.type == "command":
+                    self._command(node, depth)
+                elif node.type == "file_redirect":
+                    self._redirect(node)
+                elif node.type == "pipeline":
+                    self._pipeline(node)
+        finally:
+            self.env, self.workdirs = outer
+
+    # variables ──────────────────────────────────────────────────────────
+    def _collect_env(self, root: Node) -> dict:
+        """Values assigned straight-line at the top level of this line.
+
+        Only an assignment that certainly ran before the use, in this shell,
+        counts: a top-level `X=…` or `export X=…`. Anything that might not
+        run, runs in a subshell, or could reassign unseen leaves the name
+        unknown — the bypass shapes are listed in the tests.
+        """
+        poisoned: set[str] = set()
+        for node in _walk(root):
+            kind = node.type
+            if kind == "variable_assignment":
+                name = node.child_by_field_name("name")
+                ops = {c.type for c in node.children if not c.is_named}
+                if name is not None and (not _straight_line(node)[0] or "+=" in ops):
+                    poisoned.add(name.text.decode())
+            elif kind == "unset_command":
+                return {}  # its own node type, not a `command` (found by the suite)
+            elif kind in ("for_statement", "c_style_for_statement"):
+                var = node.child_by_field_name("variable")
+                if var is not None:
+                    poisoned.add(var.text.decode())
+            elif kind == "expansion" and _plain_variable(node) is None:
+                poisoned.update(c.text.decode() for c in node.named_children
+                                if c.type == "variable_name")
+            elif kind in ("binary_expression", "unary_expression", "postfix_expression",
+                          "arithmetic_expansion"):
+                poisoned.update(c.text.decode() for c in _walk(node) if c.type == "variable_name")
+            elif kind == "declaration_command" and node.children and node.children[0].type != "export":
+                poisoned.update(c.text.decode() for c in _walk(node) if c.type == "variable_name")
+            elif kind == "command":
+                name_node = node.child_by_field_name("name")
+                word = _value(name_node.named_children[0]) if name_node is not None and name_node.named_children else ""
+                if word is None or word in _REASSIGNS:
+                    return {}  # eval, read, source …: any name may change unseen
+
+        env: dict = {"HOME": [(-1, self.home, None)]}
+        for name, value in self.known_env.items():
+            env[name] = [(-1, value, None)]
+        for node in _walk(root):
+            if node.type != "variable_assignment":
+                continue
+            holds, scope = _straight_line(node)
+            if not holds:
+                continue
+            name = node.child_by_field_name("name").text.decode()
+            if name in poisoned:
+                continue
+            value_node = node.child_by_field_name("value")
+            value = "" if value_node is None else _value(value_node, env)
+            span = None if scope is None else (scope.start_byte, scope.end_byte)
+            env.setdefault(name, []).append((node.start_byte, value, span))
+        for name in poisoned:
+            env.pop(name, None)
+        return env
+
+    # stdin ──────────────────────────────────────────────────────────────
+    def _stdin(self, node: Node) -> tuple[bool, Value]:
+        """(fed by heredoc / herestring, the text if it is known)."""
+        redirects = list(node.children_by_field_name("redirect"))
+        if node.parent is not None and node.parent.type == "redirected_statement":
+            redirects += node.parent.children_by_field_name("redirect")
+        for r in redirects:
+            if r.type == "herestring_redirect":
+                arg = r.named_children[-1] if r.named_children else None
+                return True, (None if arg is None else _value(arg, self.env))
+            if r.type == "heredoc_redirect":
+                body = next((c for c in r.named_children if c.type == "heredoc_body"), None)
+                if body is None:
+                    return True, ""
+                if any(c.type != "heredoc_content" for c in body.named_children):
+                    return True, None
+                return True, body.text.decode("utf-8", "replace")
+        return False, None
+
+    def _scan_code(self, name: str, code: str) -> None:
+        patterns = self.rules.inline_code_risky.get(name)
+        if patterns is None:
+            self.flag("ask", "code.inline_unknown_language", f"`{name}` runs inline code this guard has no rules for")
+            return
+        for pattern in patterns:
+            if re.search(pattern, code):
+                self.flag("ask", "code.inline_risky", f"`{name}` code deletes files, runs other programs or rewrites data")
+                return
+
+    # paths ──────────────────────────────────────────────────────────────
+    def _collect_workdirs(self, root: Node) -> None:
+        """`cd` moves where relative paths point. Order is not tracked, so a
+        relative path is judged against every directory the line may be in."""
+        self.workdirs = [self.cwd]
+        for node in _walk(root):
+            if node.type != "command":
+                continue
+            name, args = self._name_args(node)
+            if name in ("cd", "pushd"):
+                if not args:
+                    self.workdirs.append(self.home)
+                else:
+                    target = args[-1]
+                    self.workdirs.append(None if target is None else self._absolute(target, self.cwd))
+
+    def _absolute(self, target: str, base: str) -> str:
+        if target == "~" or target.startswith("~/"):
+            target = self.home + target[1:]
+        target = _posix(target)
+        if not target.startswith("/"):
+            target = posixpath.join(base, target)
+        return posixpath.normpath(target)
+
+    def _where(self, target: Value) -> str:
+        """'unknown', 'outside', 'cwd' (the project itself) or 'inside'."""
+        if target is None:
+            return "unknown"
+        if target.startswith("~") and not (target == "~" or target.startswith("~/")):
+            return "outside"  # ~user
+        glob = re.search(r"[*?\[]", target)
+        if glob:
+            prefix = target[:glob.start()]
+            target = prefix[: prefix.rfind("/") + 1] if "/" in prefix else ""
+            target = target or "."
+        worst = "inside"
+        order = {"inside": 0, "cwd": 1, "outside": 2, "unknown": 3}
+        for base in self.workdirs:
+            if base is None and not (target.startswith("/") or target.startswith("~")
+                                     or _posix(target) != target):
+                where = "unknown"
+            else:
+                path = self._absolute(target, base or self.cwd)
+                where = self._relation(path)
+            if order[where] > order[worst]:
+                worst = where
+        return worst
+
+    def _relation(self, path: str) -> str:
+        cwd = self.cwd
+        scratch = [self._absolute(d, self.cwd) for d in self.rules.scratch_dirs]
+        if self._windows:
+            path, cwd = path.lower(), cwd.lower()
+            scratch = [d.lower() for d in scratch]
+        if path == cwd:
+            return "cwd"
+        if path.startswith(cwd.rstrip("/") + "/"):
+            return "inside"
+        # Inside a temp root is as safe as inside the project; the root
+        # itself is not (wiping /tmp takes everyone's files with it).
+        if any(path.startswith(d.rstrip("/") + "/") for d in scratch):
+            return "inside"
+        return "outside"
+
+    # commands ───────────────────────────────────────────────────────────
+    def _name_args(self, node: Node) -> tuple[Value, list[Value]]:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return "", []
+        inner = name_node.named_children[0] if name_node.named_children else name_node
+        name = _value(inner, self.env)
+        if name is not None:
+            name = posixpath.basename(name.replace("\\", "/"))
+            if name.lower().endswith(".exe"):
+                name = name[:-4]
+        args = [_value(a, self.env) for a in node.children_by_field_name("argument")]
+        return name, args
+
+    def _command(self, node: Node, depth: int) -> None:
+        name, args = self._name_args(node)
+        if name == "":
+            return  # a bare assignment
+        if name is None:
+            self.flag("ask", "name.runtime", "the command name is only known at run time")
+            return
+        fed, text = self._stdin(node)
+        self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
+
+    def _judge(self, name: Value, args: list[Value], depth: int, *,
+               stdin_fed: bool = False, stdin_text: Value = None) -> None:
+        r = self.rules
+        if name is None:
+            self.flag("ask", "name.runtime", "the command name is only known at run time")
+            return
+
+        if name in r.privilege:
+            self.flag("ask", "privilege.elevated", f"`{name}` runs a command with more rights")
+            if name == "su":
+                if "-c" in args:
+                    i = args.index("-c")
+                    code = args[i + 1] if i + 1 < len(args) else None
+                    if code is None:
+                        self.flag("ask", "privilege.su_runtime", "`su -c` runs text known only at run time")
+                    else:
+                        self.run(code, depth + 1)
+                return
+            rest = _strip_options(args, takes_value={"-u", "-g", "-U", "-C", "-h", "-p"})
+            if rest:
+                self._judge(rest[0], rest[1:], depth)
+            return
+
+        if name in r.wrappers:
+            rest = _unwrap(name, args)
+            if name == "xargs":
+                if rest:
+                    self._judge(rest[0], rest[1:] + [None], depth)
+                return
+            if rest:
+                self._judge(rest[0], rest[1:], depth, stdin_fed=stdin_fed, stdin_text=stdin_text)
+            return
+
+        if name == "eval":
+            if any(a is None for a in args):
+                self.flag("ask", "eval.runtime", "`eval` runs text known only at run time")
+            elif args:
+                self.run(" ".join(args), depth + 1)
+            return
+
+        if name in r.source:
+            self.flag("ask", "source.script", f"`{name}` runs a script file in this shell")
+            return
+
+        if name in r.code_flags:
+            flags = r.code_flags[name]
+            for i, a in enumerate(args):
+                if a in flags:
+                    code = args[i + 1] if i + 1 < len(args) else None
+                    if code is None:
+                        self.flag("ask", "code.runtime", f"`{name}` runs code known only at run time")
+                    elif name in r.shells:
+                        self.run(code, depth + 1)
+                    else:
+                        self._scan_code(name, code)
+                    return
+            if stdin_fed and name in r.interpreters and not _positional(args):
+                if stdin_text is None:
+                    self.flag("ask", "code.stdin_runtime", f"text known only at run time is fed into `{name}` as code")
+                elif name in r.shells:
+                    self.run(stdin_text, depth + 1)
+                else:
+                    self._scan_code(name, stdin_text)
+            return
+
+        if name in r.always_deny or name.startswith(r.always_deny_prefixes):
+            self.flag("deny", "destroy.by_design", f"`{name}` destroys data by design")
+            return
+
+        handler = _HANDLERS.get(name)
+        if handler is not None:
+            handler(self, name, args, depth)
+        elif name in r.db_clients:
+            self._db(name, args)
+
+    # redirects and pipes ────────────────────────────────────────────────
+    def _redirect(self, node: Node) -> None:
+        op = "".join(c.text.decode() for c in node.children if not c.is_named)
+        if "<" in op:
+            return
+        dest_node = node.child_by_field_name("destination")
+        if dest_node is None:
+            return
+        if "&" in op and dest_node.type == "number":
+            return  # 2>&1
+        dest = _value(dest_node, self.env)
+        if dest is None:
+            self.flag("ask", "redirect.runtime", "output is written to a path known only at run time", "unknown")
+            return
+        if dest in self.rules.harmless_devices:
+            return
+        if dest.startswith(self.rules.devices):
+            self.flag("deny", "redirect.disk_device", f"output overwrites the disk device `{dest}`", "disk_device")
+            return
+        if self._where(dest) == "outside" and ">>" not in op:
+            self.flag("ask", "redirect.outside", f"output overwrites `{dest}` outside the project", "outside")
+
+    def _pipeline(self, node: Node) -> None:
+        stages = [c for c in node.named_children]
+        for stage in stages[1:]:
+            command = stage if stage.type == "command" else next(
+                (c for c in stage.named_children if c.type == "command"), None)
+            if command is None:
+                continue
+            name, args = self._name_args(command)
+            if name in self.rules.interpreters and not _code_or_file(name, args, self.rules):
+                self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{name}` code")
+
+    # handlers ───────────────────────────────────────────────────────────
+    def _rm(self, name: str, args: list[Value], depth: int) -> None:
+        flags = _short_flags(args)
+        recursive = bool(flags & {"r", "R"}) or "--recursive" in args
+        force = "f" in flags or "--force" in args
+        for target in _operands(args):
+            where = self._where(target)
+            if where == "unknown":
+                self.flag("deny" if (recursive or force) else "ask", "rm.runtime",
+                          "`rm` target is known only at run time", "unknown")
+            elif where == "outside":
+                self.flag("deny" if (recursive or force) else "ask", "rm.outside",
+                          f"`rm` reaches outside the project: `{target}`", "outside")
+            elif where == "cwd" and (recursive or force):
+                self.flag("ask", "rm.project_root", "`rm` removes the whole project directory", "project_root")
+
+    def _find(self, name: str, args: list[Value], depth: int) -> None:
+        roots: list[Value] = []
+        for a in args:
+            if a is not None and (a.startswith("-") or a in ("(", "!")):
+                break
+            roots.append(a)
+        roots = roots or ["."]
+        if "-delete" in args:
+            for root in roots:
+                where = self._where(root)
+                if where in ("unknown", "outside"):
+                    self.flag("deny", "find.delete_outside", f"`find -delete` under `{root}`", where)
+                else:
+                    self.flag("ask", "find.delete", "`find -delete` removes files in bulk", where)
+        for i, a in enumerate(args):
+            if a in ("-exec", "-execdir", "-ok", "-okdir"):
+                end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args))
+                sub = args[i + 1:end]
+                if not sub:
+                    continue
+                for root in roots:
+                    filled = [root if s == "{}" else s for s in sub]
+                    self._judge(filled[0], filled[1:], depth)
+
+    def _dd(self, name: str, args: list[Value], depth: int) -> None:
+        for a in args:
+            if a is None:
+                self.flag("ask", "dd.runtime", "`dd` operand known only at run time", "unknown")
+            elif a.startswith("of="):
+                out = a[3:]
+                if out.startswith(self.rules.devices):
+                    self.flag("deny", "dd.disk_device", f"`dd` writes over the disk device `{out}`", "disk_device")
+                elif (where := self._where(out)) in ("outside", "unknown"):
+                    self.flag("deny", "dd.outside", f"`dd` writes outside the project: `{out}`", where)
+                else:
+                    self.flag("ask", "dd.overwrite", "`dd` overwrites a file", where)
+
+    def _truncate(self, name: str, args: list[Value], depth: int) -> None:
+        for target in _operands(args, takes_value={"-s", "-r", "--size", "--reference"}):
+            where = self._where(target)
+            if where in ("outside", "unknown"):
+                self.flag("deny", "truncate.outside", f"`truncate` empties a file outside the project: `{target}`", where)
+            else:
+                self.flag("ask", "truncate.file", "`truncate` empties a file", where)
+
+    def _chmod(self, name: str, args: list[Value], depth: int) -> None:
+        if not ({"R"} & _short_flags(args) or "--recursive" in args):
+            return
+        operands = _operands(args)
+        for target in operands[1:]:  # the first operand is the mode / owner
+            if (where := self._where(target)) in ("outside", "unknown"):
+                self.flag("deny", "chmod.recursive_outside", f"`{name} -R` changes everything under `{target}`", where)
+
+    def _sed(self, name: str, args: list[Value], depth: int) -> None:
+        in_place = any(a is not None and (a.startswith("-i") or a.startswith("--in-place")) for a in args)
+        if not in_place:
+            return
+        operands = _operands(args, takes_value={"-e", "-f", "--expression", "--file"})
+        has_script_flag = any(a in ("-e", "-f", "--expression", "--file") for a in args)
+        files = operands if has_script_flag else operands[1:]
+        for target in files:
+            if (where := self._where(target)) in ("outside", "unknown"):
+                self.flag("ask", "sed.outside", f"`sed -i` edits `{target}` outside the project", where)
+
+    def _git(self, name: str, args: list[Value], depth: int) -> None:
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                i += 2
+                continue
+            if a is not None and a.startswith("-"):
+                i += 1
+                continue
+            break
+        if i >= len(args):
+            return
+        sub, rest = args[i], args[i + 1:]
+        if sub is None:
+            self.flag("ask", "git.runtime", "the git subcommand is known only at run time")
+            return
+        flags = _short_flags(rest)
+        if sub == "push":
+            if "--force" in rest or "f" in flags or any(a and a.startswith("+") for a in rest):
+                self.flag("deny", "git.push_force", "`git push --force` rewrites history others share")
+            elif any(a and (a.startswith("--force-with-lease") or a == "--force-if-includes") for a in rest):
+                self.flag("ask", "git.push_force_with_lease", "`git push --force-with-lease` rewrites remote history")
+            elif "--delete" in rest or "d" in flags or "--mirror" in rest or any(
+                    a and a.startswith(":") for a in rest):
+                self.flag("ask", "git.push_delete", "`git push` deletes or mirrors remote refs")
+        elif sub == "reset" and "--hard" in rest:
+            self.flag("ask", "git.reset_hard", "`git reset --hard` discards uncommitted work")
+        elif sub == "clean" and ("f" in flags or "--force" in rest):
+            self.flag("ask", "git.clean", "`git clean -f` deletes untracked files")
+        elif sub == "branch" and ("D" in flags or ("--delete" in rest and "--force" in rest)):
+            self.flag("ask", "git.branch_delete", "`git branch -D` deletes an unmerged branch")
+        elif sub in ("filter-branch", "filter-repo"):
+            self.flag("ask", "git.rewrite_history", f"`git {sub}` rewrites history")
+
+    def _db(self, name: str, args: list[Value]) -> None:
+        r = self.rules
+        text = " ".join(a for a in args if a is not None)
+        for pattern in r.db_destructive:
+            if re.search(pattern, text, flags=re.I):
+                self.flag("deny", "db.destructive", f"`{name}` runs a destructive statement")
+                return
+        for i, a in enumerate(args):
+            if a in r.db_code_flags and (i + 1 >= len(args) or args[i + 1] is None):
+                self.flag("ask", "db.runtime", f"`{name}` runs a statement known only at run time")
+            if a in r.db_file_flags:
+                self.flag("ask", "db.file", f"`{name}` runs statements from a file")
+
+    def _infra(self, name: str, args: list[Value], depth: int) -> None:
+        words = [a for a in args if a is not None]
+        if name in ("terraform", "tofu"):
+            if "destroy" in words or ("apply" in words and "-destroy" in words):
+                self.flag("deny", "iac.destroy", f"`{name}` destroys infrastructure")
+        elif name == "pulumi" and "destroy" in words:
+            self.flag("deny", "iac.destroy", "`pulumi destroy` destroys infrastructure")
+        elif name == "kubectl" and "delete" in words:
+            self.flag("deny", "k8s.delete", "`kubectl delete` removes cluster resources")
+        elif name == "helm" and ("uninstall" in words or "delete" in words):
+            self.flag("ask", "helm.uninstall", "`helm uninstall` removes a release")
+        elif name == "aws" and len(words) >= 2:
+            service, op = words[0], words[1]
+            if service == "s3" and op == "rm":
+                self.flag("deny" if "--recursive" in words else "ask", "s3.rm", "`aws s3 rm` deletes objects")
+            elif service == "s3" and op == "rb":
+                self.flag("deny", "s3.rb", "`aws s3 rb` deletes a bucket")
+            elif op.startswith(("delete-", "terminate-", "remove-")):
+                self.flag("deny", "cloud.delete", f"`aws {service} {op}` deletes cloud resources")
+        elif name in ("gcloud", "az") and "delete" in words:
+            self.flag("deny", "cloud.delete", f"`{name} … delete` deletes cloud resources")
+        elif name == "docker" and (words[:2] in (["system", "prune"], ["volume", "prune"],
+                                                  ["volume", "rm"], ["image", "prune"])):
+            self.flag("ask", "docker.prune", "`docker` prune removes data")
+
+
+_HANDLERS = {
+    "rm": _Judge._rm, "rmdir": _Judge._rm, "unlink": _Judge._rm,
+    "find": _Judge._find, "dd": _Judge._dd, "truncate": _Judge._truncate,
+    "chmod": _Judge._chmod, "chown": _Judge._chmod, "chgrp": _Judge._chmod,
+    "sed": _Judge._sed, "git": _Judge._git,
+    "terraform": _Judge._infra, "tofu": _Judge._infra, "pulumi": _Judge._infra,
+    "kubectl": _Judge._infra, "helm": _Judge._infra, "aws": _Judge._infra,
+    "gcloud": _Judge._infra, "az": _Judge._infra, "docker": _Judge._infra,
+}
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+# Commands that can change any variable without an assignment we can see.
+_REASSIGNS = frozenset({
+    "eval", "source", ".", "read", "mapfile", "readarray", "getopts", "unset",
+    "let", "declare", "typeset", "local", "readonly", "printf",  # printf -v
+})
+
+
+_NOT_STRAIGHT = (False, None)
+
+
+def _straight_line(assignment: Node) -> tuple[bool, Optional[Node]]:
+    """(holds, scope) for `X=…` / `export X=…` running in this shell.
+
+    Top level: holds for the rest of the line (scope None). Inside an
+    `a && X=… && b` chain: holds only for later uses inside that same chain,
+    because those run only if the assignment did; after the chain ends the
+    assignment may not have run (scope = the chain). A subshell, pipeline
+    stage, `||`, if/for/while/case body or function body fails.
+    """
+    parent = assignment.parent
+    while parent is not None and parent.type == "variable_assignments":
+        parent = parent.parent
+    if parent is not None and parent.type == "declaration_command":
+        if not parent.children or parent.children[0].type != "export":
+            return _NOT_STRAIGHT
+        parent = parent.parent
+    scope = None
+    # tree-sitter hangs the redirect of `a && b > f` on the whole chain
+    # (redirected_statement over the list); bash gives it to `b`, which runs
+    # only after the assignment did, so the wrapper stays inside the scope.
+    while parent is not None and parent.type in ("list", "redirected_statement"):
+        if parent.type == "list":
+            operators = {c.type for c in parent.children if not c.is_named}
+            if operators != {"&&"}:
+                return _NOT_STRAIGHT
+        elif parent.child_by_field_name("body") is None or parent.child_by_field_name("body").type != "list":
+            return _NOT_STRAIGHT
+        scope = parent
+        parent = parent.parent
+    if parent is None or parent.type != "program":
+        return _NOT_STRAIGHT
+    return True, scope
+
+
+def _walk(node: Node):
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(reversed(n.children))
+
+
+def _operands(args: list[Value], takes_value: frozenset[str] | set[str] = frozenset()) -> list[Value]:
+    out: list[Value] = []
+    skip = False
+    after_dashdash = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if after_dashdash:
+            out.append(a)
+        elif a == "--":
+            after_dashdash = True
+        elif a is not None and a.startswith("-") and a != "-":
+            if a in takes_value:
+                skip = True
+        else:
+            out.append(a)
+    return out
+
+
+def _positional(args: list[Value]) -> list[Value]:
+    return [a for a in args if a is None or not a.startswith("-")]
+
+
+def _code_or_file(name: str, args: list[Value], rules: CommandRules) -> bool:
+    """True when the interpreter is told what to run, so stdin is data."""
+    if any(a in rules.code_flags.get(name, frozenset()) for a in args):
+        return True
+    return bool(_positional(args))
+
+
+def _strip_options(args: list[Value], takes_value: set[str]) -> list[Value]:
+    i = 0
+    while i < len(args) and args[i] is not None and args[i].startswith("-"):
+        i += 2 if args[i] in takes_value else 1
+    return args[i:]
+
+
+def _unwrap(name: str, args: list[Value]) -> list[Value]:
+    """The command a wrapper runs, with the wrapper's own options removed."""
+    if name == "env":
+        i = 0
+        while i < len(args) and args[i] is not None and (args[i].startswith("-") or "=" in args[i]):
+            i += 2 if args[i] in ("-u", "-C", "-S") else 1
+        return args[i:]
+    if name == "nice":
+        return _strip_options(args, {"-n", "--adjustment"})
+    if name == "timeout":
+        rest = _strip_options(args, {"-s", "-k", "--signal", "--kill-after"})
+        return rest[1:]  # the duration
+    if name == "xargs":
+        return _strip_options(args, {"-I", "-i", "-n", "-P", "-L", "-s", "-d", "-E", "-a"})
+    if name == "stdbuf":
+        return _strip_options(args, {"-i", "-o", "-e"})
+    return _strip_options(args, set())

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boxdawn-guard"
+version = "0.1.0"
+description = "Judge a shell command before an AI agent runs it: deny, ask, or no decision."
+license = { file = "LICENSE.md" }
+requires-python = ">=3.10"
+dependencies = ["tree-sitter>=0.26", "tree-sitter-bash>=0.25.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["boxdawn_guard"]
