@@ -18,6 +18,7 @@ marketplace's BUILD_ID changes (the placed build must be replaced).
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import platform
 import shutil
@@ -34,7 +35,9 @@ CASES = {
 MODES = ["default", "bypassPermissions"]
 PROBE = pathlib.Path.home() / "boxdawn_guard_probe.bin"
 DATA = pathlib.Path.home() / ".claude" / "plugins" / "data" / "boxdawn-guard-boxdawn"
-CLAUDE = shutil.which("claude")
+# CLAUDE_BIN overrides PATH: on Windows `claude` on PATH can be npm's claude.CMD,
+# and a batch file mangles arguments.
+CLAUDE = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
 
 
 def sh(args, cwd):
