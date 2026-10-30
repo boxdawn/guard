@@ -150,3 +150,12 @@ def test_a_broken_reader_asks():
     v = powershell_guard.evaluate_powershell("Get-Date", cwd=CWD, home=HOME,
                                              rules=default_command_rules(), parse=broken)
     assert (v.decision, [f.rule for f in v.findings]) == ("ask", ["guard.crashed"])
+
+
+@needs_helper
+def test_write_reasons_read_as_sentences():
+    # A new file is written, not overwritten; the subject is the output, not the cmdlet.
+    assert judge(r"Set-Content ..\note.txt hi").reasons == (
+        r"`Set-Content` output is written to `..\note.txt` outside the project",)
+    assert judge(r"'a' | Out-File $where").reasons == (
+        "`Out-File` output is written to a path known only at run time",)

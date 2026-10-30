@@ -405,7 +405,7 @@ class _PowerShell:
         if where == "unknown":
             j.flag("ask", "redirect.runtime", f"{what} is written to a path known only at run time", "unknown")
         elif where == "outside":
-            j.flag("ask", "redirect.outside", f"{what} overwrites `{target}` outside the project", "outside")
+            j.flag("ask", "redirect.outside", f"{what} is written to `{target}` outside the project", "outside")
 
     # cmdlet handlers ────────────────────────────────────────────────────
     def _targets(self, c: dict, b: dict, *names: str) -> list[Value]:
@@ -441,13 +441,13 @@ class _PowerShell:
 
     def _set_content(self, c, b, raw, depth) -> None:
         for t in self._targets(c, b, "path", "literalpath"):
-            self._writes(t, f"`{raw}`")
+            self._writes(t, f"`{raw}` output")
 
     def _out_file(self, c, b, raw, depth) -> None:
         if b.get("append") is True or b.get("noclobber") is True:
             return
         for t in (b.get("filepath") or []) + (b.get("literalpath") or []):
-            self._writes(t, f"`{raw}`")
+            self._writes(t, f"`{raw}` output")
 
     def _tee_object(self, c, b, raw, depth) -> None:
         self._out_file(c, b, raw, depth)

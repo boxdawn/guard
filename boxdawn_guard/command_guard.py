@@ -525,7 +525,7 @@ class _Judge:
             self.flag("deny", "redirect.disk_device", f"output overwrites the disk device `{dest}`", "disk_device")
             return
         if self._where(dest) == "outside" and ">>" not in op:
-            self.flag("ask", "redirect.outside", f"output overwrites `{dest}` outside the project", "outside")
+            self.flag("ask", "redirect.outside", f"output is written to `{dest}` outside the project", "outside")
 
     def _pipeline(self, node: Node) -> None:
         stages = [c for c in node.named_children]
