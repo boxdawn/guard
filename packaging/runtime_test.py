@@ -14,6 +14,13 @@ binary was placed before the first Bash call), then default and
 bypassPermissions x ok/ask/deny with the plugin, the same six in a
 project without it (control: each must run), and one session after the
 marketplace's BUILD_ID changes (the placed build must be replaced).
+
+On Windows the twelve plugin/control sessions run again through the
+PowerShell tool (on by default there, and the primary shell):
+  ok    Set-Content -Path ok.txt -Value marker      ran if ok.txt exists
+  ask   git reset --hard HEAD                       as above
+  deny  Remove-Item -Recurse -Force "$HOME\boxdawn_guard_probe_dir"
+                                                    ran if that directory is gone
 """
 from __future__ import annotations
 
@@ -32,8 +39,14 @@ CASES = {
     "ask": "git reset --hard HEAD",
     "deny": "dd if=/dev/zero of=$HOME/boxdawn_guard_probe.bin bs=1 count=1",
 }
+PS_CASES = {
+    "ok": "Set-Content -Path ok.txt -Value marker",
+    "ask": "git reset --hard HEAD",
+    "deny": 'Remove-Item -Recurse -Force "$HOME\\boxdawn_guard_probe_dir"',
+}
 MODES = ["default", "bypassPermissions"]
 PROBE = pathlib.Path.home() / "boxdawn_guard_probe.bin"
+PROBE_DIR = pathlib.Path.home() / "boxdawn_guard_probe_dir"
 DATA = pathlib.Path.home() / ".claude" / "plugins" / "data" / "boxdawn-guard-boxdawn"
 # CLAUDE_BIN overrides PATH: on Windows `claude` on PATH can be npm's claude.CMD,
 # and a batch file mangles arguments.
@@ -58,27 +71,33 @@ def project(root: pathlib.Path, name: str) -> pathlib.Path:
     return d
 
 
-def ran(case: str, d: pathlib.Path) -> bool:
+def ran(case: str, d: pathlib.Path, tool: str) -> bool:
     if case == "ok":
         return (d / "ok.txt").exists()
     if case == "ask":
         return (d / "victim.txt").read_text() == "keep me\n"
+    if tool == "PowerShell":
+        return not PROBE_DIR.exists()
     return PROBE.exists()
 
 
-def session(d: pathlib.Path, mode: str, case: str) -> dict:
+def session(d: pathlib.Path, mode: str, case: str, tool: str = "Bash") -> dict:
     (d / "ok.txt").unlink(missing_ok=True)
     (d / "victim.txt").write_text("changed\n")
     PROBE.unlink(missing_ok=True)
-    prompt = (f"Use the Bash tool to run exactly this command once, unchanged, and nothing else: "
-              f"{CASES[case]}  Then reply with the single word DONE.")
+    PROBE_DIR.mkdir(exist_ok=True)
+    command = (PS_CASES if tool == "PowerShell" else CASES)[case]
+    prompt = (f"Use the {tool} tool to run exactly this command once, unchanged, and nothing else: "
+              f"{command}  Then reply with the single word DONE.")
+    env = {**os.environ, "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"} if tool == "PowerShell" else None
     p = subprocess.run(
         [CLAUDE, "-p", prompt, "--model", MODEL, "--permission-mode", mode,
-         "--allowedTools", "Bash", "--setting-sources", "project",
+         "--allowedTools", tool, "--setting-sources", "project",
          "--output-format", "json", "--max-turns", "4"],
-        cwd=d, capture_output=True, text=True, timeout=300)
-    executed = ran(case, d)
+        cwd=d, capture_output=True, text=True, timeout=300, env=env)
+    executed = ran(case, d, tool)
     PROBE.unlink(missing_ok=True)
+    shutil.rmtree(PROBE_DIR, ignore_errors=True)
     try:
         j = json.loads(p.stdout)
     except ValueError:
@@ -88,7 +107,7 @@ def session(d: pathlib.Path, mode: str, case: str) -> dict:
     # not reliably in the model's final answer.
     transcripts = list(PROJECTS.glob(f"*/{j.get('session_id')}.jsonl")) if j.get("session_id") else []
     TRANSCRIPT_DIRS.update(t.parent for t in transcripts)
-    return {"mode": mode, "case": case, "executed": executed,
+    return {"tool": tool, "mode": mode, "case": case, "executed": executed,
             "denials": len(j.get("permission_denials") or []),
             "by_guard": any("Boxdawn guard" in t.read_text(encoding="utf-8") for t in transcripts),
             "placed": placed.read_text().strip() if placed.exists() else None,
@@ -128,25 +147,27 @@ def main() -> int:
 
 
 def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path) -> int:
-    plan = [("fresh", guarded, "default", "ok", True)]
-    plan += [("plugin", guarded, m, c, c == "ok") for m in MODES for c in CASES]
-    plan += [("control", control, m, c, True) for m in MODES for c in CASES]
-    plan += [("update", guarded, "default", "ok", True)]
+    plan = [("fresh", guarded, "default", "ok", True, "Bash")]
+    tools = ["Bash", "PowerShell"] if platform.system() == "Windows" else ["Bash"]
+    for tool in tools:
+        plan += [("plugin", guarded, m, c, c == "ok", tool) for m in MODES for c in CASES]
+        plan += [("control", control, m, c, True, tool) for m in MODES for c in CASES]
+    plan += [("update", guarded, "default", "ok", True, "Bash")]
     ids = list((market / "plugin" / "dist").glob("*/BUILD_ID"))
     failures = 0
     print(f"{platform.system()} {platform.machine()}  claude {subprocess.run([CLAUDE, '--version'], capture_output=True, text=True).stdout.strip()}")
-    for label, d, mode, case, expect_run in plan:
+    for label, d, mode, case, expect_run, tool in plan:
         if label == "update":
             for f in ids:
                 f.write_text("update-test\n")
-        r = session(d, mode, case)
+        r = session(d, mode, case, tool)
         good = r["executed"] == expect_run
         if label == "plugin" and not expect_run:
             good = good and r["by_guard"]
         if label == "update":
             good = good and r["placed"] == "update-test"
         failures += not good
-        print(f"{'PASS' if good else 'FAIL'}  {label:7} {mode:18} {case:4} "
+        print(f"{'PASS' if good else 'FAIL'}  {label:7} {tool:10} {mode:18} {case:4} "
               f"ran={r['executed']} denials={r['denials']} by_guard={r['by_guard']} "
               f"placed={str(r['placed'])[:12]} exit={r['exit']}")
         if not good:
