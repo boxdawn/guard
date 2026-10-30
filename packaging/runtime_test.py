@@ -104,7 +104,18 @@ def main() -> int:
     sh([CLAUDE, "plugin", "marketplace", "add", str(market), "--scope", "project"], guarded)
     sh([CLAUDE, "plugin", "install", "boxdawn-guard@boxdawn", "--scope", "project"], guarded)
     shutil.rmtree(DATA, ignore_errors=True)
+    try:
+        return run_plan(market, guarded, control)
+    finally:
+        # Leave the machine as it was: removing the marketplace uninstalls
+        # its plugin and deletes the plugin's data dir.
+        subprocess.run([CLAUDE, "plugin", "marketplace", "remove", "boxdawn"], cwd=guarded,
+                       capture_output=True, text=True)
+        shutil.rmtree(DATA, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
 
+
+def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path) -> int:
     plan = [("fresh", guarded, "default", "ok", True)]
     plan += [("plugin", guarded, m, c, c == "ok") for m in MODES for c in CASES]
     plan += [("control", control, m, c, True) for m in MODES for c in CASES]
