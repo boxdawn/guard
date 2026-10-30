@@ -4,5 +4,13 @@
   "version": "0.1.0",
   "description": "Judges each Bash and PowerShell command before Claude runs it: deny, ask, or no decision.",
   "author": { "name": "Boxdawn" },
-  "license": "FSL-1.1-ALv2"
+  "license": "FSL-1.1-ALv2",
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "Boxdawn API key (optional)",
+      "description": "With a key, the guard fetches signed rule updates from Boxdawn at session start (the request carries the key only). Leave empty to use the fixed rules with no network connection.",
+      "sensitive": true
+    }
+  }
 }

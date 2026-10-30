@@ -11,13 +11,20 @@ $dst = Join-Path $env:CLAUDE_PLUGIN_DATA 'current'
 if (-not (Test-Path $src)) { [Console]::Error.WriteLine("boxdawn guard: no build for windows-x64"); exit 1 }
 $srcId = Join-Path $src 'BUILD_ID'
 $dstId = Join-Path $dst 'BUILD_ID'
-if ((Test-Path $dstId) -and ((Get-Content -Raw $srcId) -eq (Get-Content -Raw $dstId))) { exit 0 }
-New-Item -ItemType Directory -Force $env:CLAUDE_PLUGIN_DATA | Out-Null
-$tmp = Join-Path $env:CLAUDE_PLUGIN_DATA "current.tmp.$PID"
-$old = "$dst.old"
-if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-Copy-Item -Recurse $src $tmp
-if (Test-Path $old) { Remove-Item -Recurse -Force $old }
-if (Test-Path $dst) { Move-Item $dst $old }
-Move-Item $tmp $dst
-if (Test-Path $old) { Remove-Item -Recurse -Force $old }
+if (-not ((Test-Path $dstId) -and ((Get-Content -Raw $srcId) -eq (Get-Content -Raw $dstId)))) {
+    New-Item -ItemType Directory -Force $env:CLAUDE_PLUGIN_DATA | Out-Null
+    $tmp = Join-Path $env:CLAUDE_PLUGIN_DATA "current.tmp.$PID"
+    $old = "$dst.old"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    Copy-Item -Recurse $src $tmp
+    if (Test-Path $old) { Remove-Item -Recurse -Force $old }
+    if (Test-Path $dst) { Move-Item $dst $old }
+    Move-Item $tmp $dst
+    if (Test-Path $old) { Remove-Item -Recurse -Force $old }
+}
+# With an API key in the plugin's settings, fetch the signed rules in the
+# background (the session does not wait). Without one this does nothing and
+# opens no connection.
+if ($env:CLAUDE_PLUGIN_OPTION_API_KEY) {
+    Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList 'fetch-rules' -WindowStyle Hidden
+}

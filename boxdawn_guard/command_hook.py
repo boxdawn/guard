@@ -6,8 +6,8 @@ Reads the hook input on stdin and prints a decision for Bash and PowerShell call
 Never `allow`. Register it with `"onFailure": "block"` (Claude Code
 v2.1.295+): a command hook that times out does not block by default.
 
-Rules come from `command_rules_source` for now (A-1). Step 3 of the
-protection design replaces that with the signed bundle from the server.
+Rules: the signed server bundle stored by `fetch-rules` when it is there
+and good (`rules_bundle`), else the fixed rules in `command_rules_source`.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import os
 import sys
 
 from boxdawn_guard.command_guard import evaluate
-from boxdawn_guard.command_rules_source import default_command_rules
+from boxdawn_guard.rules_bundle import load_rules
 from boxdawn_guard.powershell_guard import evaluate_powershell
 
 
@@ -27,7 +27,8 @@ def decide(payload: dict) -> dict | None:
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return None
-    rules = default_command_rules()
+    # The signed server bundle if one is stored and good, else the fixed rules.
+    rules = load_rules(os.environ.get("CLAUDE_PLUGIN_DATA"))
     known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR") if os.environ.get(k)}
     verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
         command,
