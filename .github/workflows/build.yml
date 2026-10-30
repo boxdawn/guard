@@ -37,3 +37,40 @@ jobs:
           name: bdxguard-${{ runner.os }}-${{ runner.arch }}
           path: dist/bdxguard
           retention-days: 7
+
+  # One plugin carries every OS's build; place.sh / place.ps1 pick one at
+  # session start. BUILD_ID is what they compare to skip a re-copy.
+  plugin:
+    needs: binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: assemble plugin/dist
+        run: |
+          set -eu
+          for pair in Windows-X64:windows-x64 macOS-ARM64:macos-arm64 Linux-X64:linux-x64; do
+            src="artifacts/bdxguard-${pair%%:*}"
+            dst="plugin/dist/${pair##*:}"
+            test -d "$src"
+            mkdir -p plugin/dist
+            cp -R "$src" "$dst"
+            echo "$GITHUB_SHA" > "$dst/BUILD_ID"
+          done
+          # upload-artifact drops the executable bit
+          chmod +x plugin/dist/*/bdxguard plugin/dist/*/bdxguard.exe plugin/scripts/place.sh
+          (cd plugin && zip -qr ../boxdawn-guard-plugin.zip .)
+          sha256sum boxdawn-guard-plugin.zip | tee boxdawn-guard-plugin.zip.sha256
+          ls -la boxdawn-guard-plugin.zip
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude plugin validate ./plugin && claude plugin validate .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boxdawn-guard-plugin
+          path: |
+            boxdawn-guard-plugin.zip
+            boxdawn-guard-plugin.zip.sha256
+          retention-days: 7
