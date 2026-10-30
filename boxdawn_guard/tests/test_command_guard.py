@@ -1,6 +1,6 @@
 """Destructive-command guard (A-1). Written before the evaluator.
 
-The bar (design §4-①): no case in BYPASS reaches the shell without a
+The bar: no case in BYPASS reaches the shell without a
 decision. Each is a GuardFall class (CSA research note, 2026-07-11), a gap
 from Continue's CVE-2026-76072, or a canonical destructive command. A
 missing decision is the failure this suite exists to catch; "ask" counts

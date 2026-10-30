@@ -2,9 +2,9 @@
 
 The PowerShell tool of Claude Code is on by default on Windows and is the
 primary shell there; without Git Bash there is no Bash tool at all (Claude
-Code docs, tools-reference "PowerShell tool", 2026-10-30). Design and the
-parser comparison: engine repo field_test/diagnostics/
-_a1_powershell_guard_design_2026_10_30.md.
+Code docs, tools-reference "PowerShell tool", 2026-10-30). On 263 PowerShell
+commands from real Claude Code sessions, tree-sitter-powershell 0.26.4 could
+not read 47; PowerShell's own parser could not read 1.
 
 The command is read by PowerShell's own parser (packaging/psparse, a small
 helper built against Windows PowerShell 5.1). This module turns what it sees
