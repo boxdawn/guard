@@ -1,0 +1,8 @@
+{
+  "name": "boxdawn",
+  "owner": { "name": "Boxdawn" },
+  "description": "Boxdawn plugins for Claude Code",
+  "plugins": [
+    { "name": "boxdawn-guard", "source": "./plugin" }
+  ]
+}
