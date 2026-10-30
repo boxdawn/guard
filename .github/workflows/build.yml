@@ -46,6 +46,18 @@ jobs:
           exe=dist/bdxguard/bdxguard
           [ -f "$exe.exe" ] && exe="$exe.exe"
           python packaging/check_binary.py "$exe" 21
+      # The built binary reaches the real server over TLS (a Python build can
+      # lack CA certificates on macOS). A made-up key must come back refused
+      # (401); a TLS or network failure says "unreachable" and fails the job.
+      - name: binary reaches the rules server
+        shell: bash
+        run: |
+          exe=dist/bdxguard/bdxguard
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          d=$(mktemp -d)
+          out=$(CLAUDE_PLUGIN_OPTION_API_KEY=bdk_ci_not_a_key CLAUDE_PLUGIN_DATA="$d" "$exe" fetch-rules 2>&1)
+          echo "$out"
+          case "$out" in *"refused (401)"*) ;; *) exit 1 ;; esac
       - uses: actions/upload-artifact@v4
         with:
           name: bdxguard-${{ runner.os }}-${{ runner.arch }}
