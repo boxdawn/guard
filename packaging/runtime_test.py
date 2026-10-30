@@ -92,7 +92,7 @@ def session(d: pathlib.Path, mode: str, case: str) -> dict:
             "denials": len(j.get("permission_denials") or []),
             "by_guard": any("Boxdawn guard" in t.read_text(encoding="utf-8") for t in transcripts),
             "placed": placed.read_text().strip() if placed.exists() else None,
-            "exit": p.returncode, "stderr": p.stderr[-300:],
+            "exit": p.returncode, "stderr": p.stderr[-300:], "result": (j.get("result") or "")[:300],
             "stdout_head": "" if j else p.stdout[:300]}
 
 
@@ -148,7 +148,7 @@ def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path)
               f"ran={r['executed']} denials={r['denials']} by_guard={r['by_guard']} "
               f"placed={str(r['placed'])[:12]} exit={r['exit']}")
         if not good:
-            print(f"      stderr: {r['stderr']!r}\n      stdout: {r['stdout_head']!r}")
+            print(f"      result: {r['result']!r}\n      stderr: {r['stderr']!r}\n      stdout: {r['stdout_head']!r}")
     print(f"{len(plan) - failures}/{len(plan)} as expected")
     return 1 if failures else 0
 
