@@ -169,6 +169,35 @@ jobs:
           test -n "$ANTHROPIC_API_KEY" || { echo "::error::ANTHROPIC_API_KEY secret is not set"; exit 1; }
           python packaging/runtime_test.py assembled
 
+  # The directory edition (boxdawn/guard-plugin) as the directory installs
+  # it, the git folder as it is: the first session downloads the pinned
+  # release build from GitHub and checks its sha256. By hand only.
+  directory:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, macos-15-intel, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: boxdawn/guard-plugin
+          path: guard-plugin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm install -g @anthropic-ai/claude-code
+      - name: real sessions against the directory edition
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || { echo "::error::ANTHROPIC_API_KEY secret is not set"; exit 1; }
+          python packaging/runtime_test.py guard-plugin
+
   # A tag v<version> (or v<version>-rc.N) publishes, after the real-session
   # test above passed on every OS: the zip and its sha256 become a GitHub
   # release, and a branch release/<tag> points the marketplace at that zip
