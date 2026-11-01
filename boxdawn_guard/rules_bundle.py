@@ -122,6 +122,11 @@ def verify(response: Any, public_keys: Mapping[str, str] | None = None, *,
            now: float) -> CommandRules:
     """The rules inside `response`, or BundleError. Nothing in the payload is
     read before its signature is checked against a pinned key."""
+    return _verified(response, public_keys, now=now)[0]
+
+
+def _verified(response: Any, public_keys: Mapping[str, str] | None, *,
+              now: float) -> tuple[CommandRules, int]:
     public_keys = PUBLIC_KEYS if public_keys is None else public_keys
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -154,21 +159,28 @@ def verify(response: Any, public_keys: Mapping[str, str] | None = None, *,
         raise BundleError("bundle: no expiry")
     if now >= exp:
         raise BundleError("bundle: expired")
-    return rules_from_dict(body.get("rules"))
+    return rules_from_dict(body.get("rules")), exp
 
 
 def load_rules(data_dir: str | None, *, now: float | None = None,
                public_keys: Mapping[str, str] | None = None) -> CommandRules:
     """The stored bundle's rules if it is there and good, else the fixed rules."""
+    return load_stored(data_dir, now=now, public_keys=public_keys)[0]
+
+
+def load_stored(data_dir: str | None, *, now: float | None = None,
+                public_keys: Mapping[str, str] | None = None) -> tuple[CommandRules, int | None]:
+    """(rules, the bundle's expiry) from a good stored bundle, else (the fixed
+    rules, None). The expiry says the call is judged on a paid bundle."""
     if data_dir:
         path = Path(data_dir) / FILE_NAME
         if path.is_file():
             try:
-                return verify(json.loads(path.read_text(encoding="utf-8")), public_keys,
-                              now=time.time() if now is None else now)
+                return _verified(json.loads(path.read_text(encoding="utf-8")), public_keys,
+                                 now=time.time() if now is None else now)
             except (BundleError, OSError, ValueError):
                 pass
-    return default_command_rules()
+    return default_command_rules(), None
 
 
 # ── fetching (session start) ────────────────────────────────────────────────
@@ -178,8 +190,9 @@ def fetch(api_key: str | None, data_dir: str | None, *, url: str = RULES_URL,
           public_keys: Mapping[str, str] | None = None) -> str:
     """Store a fresh bundle; returns what happened, for the log line.
 
-    A refused key (401/403) deletes the stored bundle, so a revoked key or a
-    plan that no longer includes this stops at the next session. A network
+    A refused key (401/403) deletes the stored bundle and the block record,
+    so a revoked key or a plan that no longer includes this stops at the
+    next session. A network
     failure keeps it: it is still good until its own expiry.
     """
     if not api_key or not data_dir:
@@ -199,7 +212,9 @@ def fetch(api_key: str | None, data_dir: str | None, *, url: str = RULES_URL,
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             path.unlink(missing_ok=True)
-            return f"refused ({exc.code}); stored bundle removed"
+            from boxdawn_guard import block_log
+            block_log.remove(data_dir)
+            return f"refused ({exc.code}); stored bundle and block record removed"
         return f"server error ({exc.code}); kept stored bundle"
     except (urllib.error.URLError, OSError) as exc:
         return f"unreachable ({type(exc).__name__}); kept stored bundle"
