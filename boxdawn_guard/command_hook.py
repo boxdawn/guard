@@ -8,6 +8,8 @@ v2.1.295+): a command hook that times out does not block by default.
 
 Rules: the signed server bundle stored by `fetch-rules` when it is there
 and good (`rules_bundle`), else the fixed rules in `command_rules_source`.
+A deny or ask judged on the bundle is also written to the local block
+record (`block_log`); on the fixed rules nothing is written.
 """
 from __future__ import annotations
 
@@ -15,8 +17,9 @@ import json
 import os
 import sys
 
+from boxdawn_guard import block_log
 from boxdawn_guard.command_guard import evaluate
-from boxdawn_guard.rules_bundle import load_rules
+from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
 
 
@@ -27,8 +30,10 @@ def decide(payload: dict) -> dict | None:
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return None
+    data_dir = os.environ.get("CLAUDE_PLUGIN_DATA")
+    block_log.prune(data_dir)
     # The signed server bundle if one is stored and good, else the fixed rules.
-    rules = load_rules(os.environ.get("CLAUDE_PLUGIN_DATA"))
+    rules, bundle_exp = load_stored(data_dir)
     known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR") if os.environ.get(k)}
     verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
         command,
@@ -40,6 +45,8 @@ def decide(payload: dict) -> dict | None:
     )
     if verdict is None or verdict.decision is None:
         return None
+    if bundle_exp is not None:
+        block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": verdict.decision,

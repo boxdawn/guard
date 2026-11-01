@@ -172,7 +172,13 @@ def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path)
               f"placed={str(r['placed'])[:12]} exit={r['exit']}")
         if not good:
             print(f"      result: {r['result']!r}\n      stderr: {r['stderr']!r}\n      stdout: {r['stdout_head']!r}")
-    print(f"{len(plan) - failures}/{len(plan)} as expected")
+    # No API key here, so every call was judged on the fixed rules: the free
+    # guard keeps no record, whatever it blocked above.
+    no_record = not (DATA / "log").exists()
+    failures += not no_record
+    print(f"{'PASS' if no_record else 'FAIL'}  no block record without a key")
+    total = len(plan) + 1
+    print(f"{total - failures}/{total} as expected")
     return 1 if failures else 0
 
 
