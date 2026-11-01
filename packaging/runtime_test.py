@@ -152,8 +152,11 @@ def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path)
     for tool in tools:
         plan += [("plugin", guarded, m, c, c == "ok", tool) for m in MODES for c in CASES]
         plan += [("control", control, m, c, True, tool) for m in MODES for c in CASES]
-    plan += [("update", guarded, "default", "ok", True, "Bash")]
     ids = list((market / "plugin" / "dist").glob("*/BUILD_ID"))
+    # The directory plugin (boxdawn/guard-plugin) carries no builds: it
+    # downloads a pinned one, so there is no BUILD_ID here to change.
+    if ids:
+        plan += [("update", guarded, "default", "ok", True, "Bash")]
     failures = 0
     print(f"{platform.system()} {platform.machine()}  claude {subprocess.run([CLAUDE, '--version'], capture_output=True, text=True).stdout.strip()}")
     for label, d, mode, case, expect_run, tool in plan:
