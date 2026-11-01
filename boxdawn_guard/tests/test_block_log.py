@@ -130,20 +130,35 @@ def test_a_failed_write_leaves_the_decision_alone(paid, monkeypatch):
     assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
 
 
-def test_files_older_than_30_days_go_on_a_new_day(tmp_path):
+def _day_files(folder, *days):
+    folder.mkdir(exist_ok=True)
+    names = [f"blocks-{time.strftime('%Y%m%d', time.gmtime(NOW - d * 86400))}.jsonl" for d in days]
+    for n in names:
+        (folder / n).write_text("{}\n", encoding="ascii")
+    return names
+
+
+def test_files_older_than_30_days_go(tmp_path):
     folder = tmp_path / block_log.LOG_DIR
-    folder.mkdir()
-    day = 86400
-    keep = time.strftime("%Y%m%d", time.gmtime(NOW - 30 * day))
-    old = time.strftime("%Y%m%d", time.gmtime(NOW - 31 * day))
-    for d in (keep, old):
-        (folder / f"blocks-{d}.jsonl").write_text("{}\n", encoding="ascii")
+    keep, old = _day_files(folder, 30, 31)
     (folder / "notes.txt").write_text("not ours", encoding="ascii")
-    v = Verdict("deny", (), (Finding("rm.outside", "deny", "outside"),))
-    assert block_log.record(str(tmp_path), v, tool="Bash", exp=1, now=NOW)
-    names = sorted(p.name for p in folder.iterdir())
-    today = time.strftime("%Y%m%d", time.gmtime(NOW))
-    assert names == sorted([f"blocks-{keep}.jsonl", f"blocks-{today}.jsonl", "notes.txt"])
+    block_log.prune(str(tmp_path), now=NOW)
+    assert sorted(p.name for p in folder.iterdir()) == sorted([keep, "notes.txt"])
+
+
+def test_old_files_go_on_any_call_even_without_a_bundle(tmp_path, monkeypatch):
+    # The key taken out, nothing new recorded: old lines must still go.
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+    folder = tmp_path / block_log.LOG_DIR
+    _day_files(folder, 400)
+    assert command_hook.decide(_payload("ls")) is None
+    assert list(folder.iterdir()) == []
+
+
+def test_prune_without_a_folder_or_dir_is_quiet(tmp_path):
+    block_log.prune(None)
+    block_log.prune(str(tmp_path))
+    assert not (tmp_path / block_log.LOG_DIR).exists()
 
 
 @pytest.mark.parametrize("status", [401, 403])

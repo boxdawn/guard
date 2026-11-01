@@ -30,8 +30,9 @@ def decide(payload: dict) -> dict | None:
     command = (payload.get("tool_input") or {}).get("command")
     if not isinstance(command, str):
         return None
-    # The signed server bundle if one is stored and good, else the fixed rules.
     data_dir = os.environ.get("CLAUDE_PLUGIN_DATA")
+    block_log.prune(data_dir)
+    # The signed server bundle if one is stored and good, else the fixed rules.
     rules, bundle_exp = load_stored(data_dir)
     known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR") if os.environ.get(k)}
     verdict = (evaluate if tool == "Bash" else evaluate_powershell)(

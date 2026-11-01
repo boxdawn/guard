@@ -8,8 +8,9 @@ place in a line (decision ④, 2026-10-29). It stays on this machine; nothing
 here sends it.
 
 Day files under `${CLAUDE_PLUGIN_DATA}/log/`; files older than KEEP_DAYS go
-when the first line of a new day is written. A refused key removes the whole
-folder (`rules_bundle.fetch`). Writing never raises: a failed write must not
+at the next Bash or PowerShell call, whatever the plan and whether or not
+anything new is written (`prune`, from the hook). A refused key removes the
+whole folder (`rules_bundle.fetch`). Writing never raises: a failed write must not
 change a decision, and with `onFailure: block` a crashing hook blocks every
 command.
 """
@@ -79,12 +80,22 @@ def _open_append(path: Path) -> int:
     return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
 
 
-def _prune(folder: Path, now: float) -> None:
-    cutoff = time.strftime("%Y%m%d", time.gmtime(now - KEEP_DAYS * 86400))
-    for p in folder.iterdir():
-        m = _DAY_FILE.fullmatch(p.name)
-        if m and m.group(1) < cutoff:
-            p.unlink(missing_ok=True)
+def prune(data_dir: str | None, *, now: float | None = None) -> None:
+    """Delete day files older than KEEP_DAYS. Never raises."""
+    try:
+        if not data_dir:
+            return
+        folder = Path(data_dir) / LOG_DIR
+        if not folder.is_dir():
+            return
+        now = time.time() if now is None else now
+        cutoff = time.strftime("%Y%m%d", time.gmtime(now - KEEP_DAYS * 86400))
+        for p in folder.iterdir():
+            m = _DAY_FILE.fullmatch(p.name)
+            if m and m.group(1) < cutoff:
+                p.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 - see the module docstring
+        pass
 
 
 def record(data_dir: str | None, verdict: Verdict, *, tool: str, exp: int,
@@ -99,10 +110,7 @@ def record(data_dir: str | None, verdict: Verdict, *, tool: str, exp: int,
             return False
         folder = Path(data_dir) / LOG_DIR
         folder.mkdir(parents=True, exist_ok=True)
-        today = time.strftime("%Y%m%d", time.gmtime(now))
-        path = folder / f"blocks-{today}.jsonl"
-        if not path.exists():
-            _prune(folder, now)
+        path = folder / f"blocks-{time.strftime('%Y%m%d', time.gmtime(now))}.jsonl"
         raw = (json.dumps(line, separators=(",", ":")) + "\n").encode("ascii")
         fd = _open_append(path)
         try:
