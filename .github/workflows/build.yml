@@ -96,6 +96,19 @@ jobs:
           (cd plugin && zip -qr ../boxdawn-guard-plugin.zip .)
           sha256sum boxdawn-guard-plugin.zip | tee boxdawn-guard-plugin.zip.sha256
           ls -la boxdawn-guard-plugin.zip
+      # One archive per OS for the directory plugin (boxdawn/guard-plugin),
+      # which downloads only its own machine's build at session start. tar.gz
+      # everywhere: Windows 10+ ships tar.exe, minimal Linux may lack unzip.
+      - name: per-OS archives
+        run: |
+          set -eu
+          mkdir archives
+          for d in plugin/dist/*/; do
+            n=$(basename "$d")
+            tar -czf "archives/bdxguard-$n.tar.gz" -C "$d" .
+          done
+          (cd archives && sha256sum *.tar.gz | tee bdxguard-archives.sha256)
+          ls -la archives
       - run: npm install -g @anthropic-ai/claude-code
       - run: claude plugin validate ./plugin && claude plugin validate .
       - uses: actions/upload-artifact@v4
@@ -104,6 +117,11 @@ jobs:
           path: |
             boxdawn-guard-plugin.zip
             boxdawn-guard-plugin.zip.sha256
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bdxguard-archives
+          path: archives
           retention-days: 7
 
   # Real Claude Code sessions against the installed plugin. Costs API calls
@@ -168,6 +186,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: boxdawn-guard-plugin
+      - uses: actions/download-artifact@v4
+        with:
+          name: bdxguard-archives
+          path: archives
       - name: tag matches the plugin version
         run: |
           v=$(python3 -c "import json; print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])")
@@ -176,12 +198,14 @@ jobs:
             *) echo "::error::tag $GITHUB_REF_NAME does not match plugin version $v"; exit 1 ;;
           esac
           sha256sum -c boxdawn-guard-plugin.zip.sha256
+          (cd archives && sha256sum -c bdxguard-archives.sha256)
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=""; case "$GITHUB_REF_NAME" in *-rc.*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" boxdawn-guard-plugin.zip boxdawn-guard-plugin.zip.sha256 \
+            archives/bdxguard-*.tar.gz archives/bdxguard-archives.sha256 \
             $pre --title "boxdawn-guard $GITHUB_REF_NAME" \
             --notes "Built from $GITHUB_SHA. sha256: $(cut -d' ' -f1 boxdawn-guard-plugin.zip.sha256)"
       - name: marketplace branch
