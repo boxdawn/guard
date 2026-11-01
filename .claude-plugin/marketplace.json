@@ -1,8 +1,17 @@
 {
   "name": "boxdawn",
-  "owner": { "name": "Boxdawn" },
+  "owner": {
+    "name": "Boxdawn"
+  },
   "description": "Boxdawn plugins for Claude Code",
   "plugins": [
-    { "name": "boxdawn-guard", "source": "./plugin" }
+    {
+      "name": "boxdawn-guard",
+      "source": {
+        "source": "archive",
+        "url": "https://github.com/boxdawn/guard/releases/download/v0.1.0/boxdawn-guard-plugin.zip",
+        "sha256": "e9d2578fc9263dd475f04fb2421ea8202324fa5d0e5a0cf7cf42776cb181aaff"
+      }
+    }
   ]
 }
