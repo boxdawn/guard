@@ -28,6 +28,8 @@ claude plugin install boxdawn-guard@boxdawn
 
 The plugin carries builds for Windows x64, macOS (Apple silicon and Intel) and Linux (x64 and ARM64). The first session start puts the one for your machine in the plugin's data folder.
 
+Start a new Claude Code session after installing: a session that was already open does not pick up the guard. After uninstalling or reinstalling, restart any session that was open; until then its Bash and PowerShell calls are blocked, because the guard blocks a command whenever it cannot run.
+
 ## What it does
 
 - **Deny or ask, never allow.** `deny` stops the command with the reason. `ask` shows Claude Code's own "run this?" prompt. No decision leaves the call to your permission settings.
