@@ -4,8 +4,8 @@ Written only when the call was judged on a verified signed bundle (a paying
 customer): on the fixed rules nothing is written, so the free guard keeps no
 record. One JSON line per deny or ask, never for a call let through. Every
 value is from a closed set or a number, so no command, path or name has a
-place in a line (decision ④, 2026-10-29). It stays on this machine; nothing
-here sends it.
+place in a line (decision ④, 2026-10-29). `block_send` sends it at session
+start unless the customer keeps it local.
 
 Day files under `${CLAUDE_PLUGIN_DATA}/log/`; files older than KEEP_DAYS go
 at the next Bash or PowerShell call, whatever the plan and whether or not
@@ -30,7 +30,9 @@ LOG_DIR = "log"
 KEEP_DAYS = 30
 TOOLS = frozenset({"Bash", "PowerShell"})
 LEVELS = frozenset({"deny", "ask"})
-_DAY_FILE = re.compile(r"blocks-(\d{8})\.jsonl")
+DAY_FILE = re.compile(r"blocks-(\d{8})\.jsonl")
+# Day files renamed for sending (`block_send`) keep their day, so they age out too.
+_AGED_FILE = re.compile(r"(?:blocks|outbox)-(\d{8})(?:-[0-9a-f-]{36})?\.jsonl")
 _BUILD_ID = re.compile(r"[0-9a-f]{7,64}")
 
 
@@ -91,7 +93,7 @@ def prune(data_dir: str | None, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         cutoff = time.strftime("%Y%m%d", time.gmtime(now - KEEP_DAYS * 86400))
         for p in folder.iterdir():
-            m = _DAY_FILE.fullmatch(p.name)
+            m = _AGED_FILE.fullmatch(p.name)
             if m and m.group(1) < cutoff:
                 p.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001 - see the module docstring

@@ -11,6 +11,12 @@
       "title": "Boxdawn API key (optional)",
       "description": "With a key, the guard fetches signed rule updates from Boxdawn at session start (the request carries the key only). Leave empty to use the fixed rules with no network connection.",
       "sensitive": true
+    },
+    "keep_blocks_local": {
+      "type": "boolean",
+      "title": "Keep the block record on this machine",
+      "description": "On a paid plan the guard sends its block record (tool, deny or ask, rule ids, where the target sits; never a command or a path) to Boxdawn at session start, for your team's view. Turn this on to keep it on this machine only.",
+      "default": false
     }
   }
 }
