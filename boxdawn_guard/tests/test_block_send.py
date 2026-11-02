@@ -21,6 +21,12 @@ DENY = Verdict("deny", (), (Finding("rm.outside", "deny", "outside"),))
 ASK = Verdict("ask", (), (Finding("redirect.outside", "ask", "outside"),))
 
 
+@pytest.fixture(autouse=True)
+def _no_grace(monkeypatch):
+    """The pause only matters with writers running; see the last test."""
+    monkeypatch.setattr(block_send, "RENAME_GRACE_SECONDS", 0)
+
+
 def _record(data_dir, verdict=DENY, n=1, now=NOW):
     for _ in range(n):
         assert block_log.record(str(data_dir), verdict, tool="Bash", exp=NOW + 86400, now=now)
@@ -144,9 +150,11 @@ for _ in range(int(sys.argv[2])):
 """
 
 
-def test_writers_during_a_send_lose_no_line(server, tmp_path):  # noqa: F811
+def test_writers_during_a_send_lose_no_line(server, tmp_path, monkeypatch):  # noqa: F811
     """Hooks keep writing while the session-start send renames and removes
-    files. Every line written is either sent or still on disk afterwards."""
+    files. Every line written is either sent or still on disk afterwards.
+    Without the pause after the rename this lost 4-9 lines on Linux (CI)."""
+    monkeypatch.setattr(block_send, "RENAME_GRACE_SECONDS", 2.0)
     writers, each = 10, 200
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
     procs = [subprocess.Popen([sys.executable, "-c", _WRITER, str(tmp_path), str(each)], env=env)

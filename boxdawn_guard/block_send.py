@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
@@ -30,6 +31,13 @@ from boxdawn_guard.command_guard import RULE_IDS, TARGETS
 BLOCKS_URL = "https://jeonsewon--boxdawn-analyzer-web.modal.run/guard/blocks"
 SEND_TIMEOUT_SECONDS = 60
 MAX_LINES = 5000
+# A hook opens the day file, writes one line and closes it, in well under a
+# millisecond. One that opened the file just before the rename still writes
+# into the renamed file; reading only after this pause means it has finished,
+# so the outbox read and later removed holds its line. Without the pause, 10
+# writers lost 4-9 of 2,000 lines on Linux (CI, 2026-11-02). The send runs in
+# the background, so no one waits for it.
+RENAME_GRACE_SECONDS = 2.0
 _OUTBOX = re.compile(r"outbox-(\d{8})-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.jsonl")
 _KEYS = frozenset({"v", "t", "tool", "decision", "escalated", "findings", "rules", "exp", "build"})
 _FINDING_KEYS = frozenset({"rule", "level", "target"})
@@ -53,14 +61,18 @@ def _line_ok(line) -> bool:
                for f in findings)
 
 
-def _to_outbox(folder: Path) -> None:
+def _to_outbox(folder: Path) -> bool:
+    """Rename day files to outboxes; True when any was renamed."""
+    renamed = False
     for p in sorted(folder.glob("blocks-*.jsonl")):
         m = block_log.DAY_FILE.fullmatch(p.name)
         if m:
             try:
                 os.replace(p, folder / f"outbox-{m.group(1)}-{uuid.uuid4()}.jsonl")
+                renamed = True
             except OSError:
                 pass
+    return renamed
 
 
 def _write_new_outbox(folder: Path, day: str, raw: bytes) -> None:
@@ -80,7 +92,8 @@ def send(api_key: str | None, data_dir: str | None, *, url: str = BLOCKS_URL,
     import urllib.error
     import urllib.request
 
-    _to_outbox(folder)
+    if _to_outbox(folder):
+        time.sleep(RENAME_GRACE_SECONDS)
     sent = dropped = 0
     for p in sorted(folder.glob("outbox-*.jsonl")):
         m = _OUTBOX.fullmatch(p.name)
