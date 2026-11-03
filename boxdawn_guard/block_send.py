@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 
 from boxdawn_guard import block_log
-from boxdawn_guard.command_guard import RULE_IDS, TARGETS
+from boxdawn_guard.command_guard import TARGETS, rule_id_ok
 
 BLOCKS_URL = "https://jeonsewon--boxdawn-analyzer-web.modal.run/guard/blocks"
 SEND_TIMEOUT_SECONDS = 60
@@ -56,7 +56,7 @@ def _line_ok(line) -> bool:
                                            and _BUILD_ID.fullmatch(line["build"])))
             and isinstance(findings, list) and findings):
         return False
-    return all(isinstance(f, dict) and set(f) == _FINDING_KEYS and f["rule"] in RULE_IDS
+    return all(isinstance(f, dict) and set(f) == _FINDING_KEYS and rule_id_ok(f["rule"])
                and f["level"] in block_log.LEVELS and (f["target"] is None or f["target"] in TARGETS)
                for f in findings)
 

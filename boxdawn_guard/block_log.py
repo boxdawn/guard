@@ -23,7 +23,7 @@ import shutil
 import time
 from pathlib import Path
 
-from boxdawn_guard.command_guard import RULE_IDS, TARGETS, Verdict
+from boxdawn_guard.command_guard import TARGETS, Verdict, rule_id_ok
 
 LOG_VERSION = 1
 LOG_DIR = "log"
@@ -51,7 +51,7 @@ def entry(verdict: Verdict, *, tool: str, exp: int, build: str | None, now: floa
         return None
     findings = []
     for f in verdict.findings:
-        if f.rule not in RULE_IDS or f.level not in LEVELS or not (f.target is None or f.target in TARGETS):
+        if not rule_id_ok(f.rule) or f.level not in LEVELS or not (f.target is None or f.target in TARGETS):
             return None
         findings.append({"rule": f.rule, "level": f.level, "target": f.target})
     return {"v": LOG_VERSION, "t": int(now), "tool": tool, "decision": verdict.decision,
