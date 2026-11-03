@@ -94,6 +94,10 @@ def default_command_rules() -> CommandRules:
             "ruby": _RUBY + _SQL, "perl": _PERL + _SQL, "php": _PHP + _SQL,
             # lua and osascript have no rules: their inline code asks.
         },
-        scratch_dirs=("/tmp", "/var/tmp", "/private/tmp", "~/AppData/Local/Temp"),
+        # Claude Code's memory folders: the agent is meant to write its notes
+        # there. Only these; the rest of ~/.claude (settings, credentials,
+        # this guard's own install) stays outside.
+        scratch_dirs=("/tmp", "/var/tmp", "/private/tmp", "~/AppData/Local/Temp",
+                      "~/.claude/projects/*/memory"),
         unattended_modes=frozenset({"bypassPermissions", "dontAsk"}),
     )

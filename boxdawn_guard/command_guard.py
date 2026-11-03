@@ -89,6 +89,7 @@ RULE_IDS = frozenset({
     "rm.runtime", "rm.outside", "rm.project_root", "find.delete_outside", "find.delete",
     "dd.runtime", "dd.disk_device", "dd.outside", "dd.overwrite",
     "truncate.outside", "truncate.file", "chmod.recursive_outside", "sed.outside",
+    "cp.outside", "mv.outside", "new_item.force_outside",
     "git.runtime", "git.push_force", "git.push_force_with_lease", "git.push_delete",
     "git.reset_hard", "git.clean", "git.branch_delete", "git.rewrite_history",
     "db.destructive", "db.runtime", "db.file",
@@ -400,8 +401,9 @@ class _Judge:
         if path.startswith(cwd.rstrip("/") + "/"):
             return "inside"
         # Inside a temp root is as safe as inside the project; the root
-        # itself is not (wiping /tmp takes everyone's files with it).
-        if any(path.startswith(d.rstrip("/") + "/") for d in scratch):
+        # itself is not (wiping /tmp takes everyone's files with it). A `*`
+        # stands for one directory name.
+        if any(re.match(re.escape(d.rstrip("/")).replace(r"\*", "[^/]+") + "/.", path) for d in scratch):
             return "inside"
         return "outside"
 
@@ -617,6 +619,45 @@ class _Judge:
             if (where := self._where(target)) in ("outside", "unknown"):
                 self.flag("ask", "sed.outside", f"`sed -i` edits `{target}` outside the project", where)
 
+    def _cp_mv(self, name: str, args: list[Value], depth: int) -> None:
+        """A copy or move onto a path outside the project replaces the file
+        there and keeps no copy, the same as `>` onto it. `mv` also takes each
+        source away from where it was, so a source outside counts too."""
+        target_dir: Value = None
+        has_target_dir = False
+        for i, a in enumerate(args):
+            if a in ("-t", "--target-directory"):
+                has_target_dir = True
+                target_dir = args[i + 1] if i + 1 < len(args) else None
+            elif a is not None and a.startswith("--target-directory="):
+                has_target_dir = True
+                target_dir = a.split("=", 1)[1]
+        operands = _operands(args, takes_value={"-t", "--target-directory", "-S", "--suffix"})
+        if has_target_dir:
+            dests, sources = [target_dir], operands
+        elif len(operands) >= 2:
+            dests, sources = operands[-1:], operands[:-1]
+        else:
+            return
+        keeps_old = bool(_short_flags(args) & {"n", "b"}) or any(
+            a is not None and (a in ("--no-clobber", "--update=none") or a.startswith("--backup"))
+            for a in args)
+        if not keeps_old:
+            for dest in dests:
+                where = self._where(dest)
+                if where not in ("outside", "unknown"):
+                    continue
+                said = "a path known only at run time" if dest is None else f"`{dest}` outside the project"
+                if name == "cp":
+                    self.flag("ask", "cp.outside", f"`cp` writes over {said}", where)
+                else:
+                    self.flag("ask", "mv.outside", f"`mv` writes over {said}", where)
+        if name == "mv":
+            for source in sources:
+                if (where := self._where(source)) in ("outside", "unknown"):
+                    said = "a path known only at run time" if source is None else f"`{source}` outside the project"
+                    self.flag("ask", "mv.outside", f"`mv` takes away {said}", where)
+
     def _git(self, name: str, args: list[Value], depth: int) -> None:
         i = 0
         while i < len(args):
@@ -695,7 +736,7 @@ _HANDLERS = {
     "rm": _Judge._rm, "rmdir": _Judge._rm, "unlink": _Judge._rm,
     "find": _Judge._find, "dd": _Judge._dd, "truncate": _Judge._truncate,
     "chmod": _Judge._chmod, "chown": _Judge._chmod, "chgrp": _Judge._chmod,
-    "sed": _Judge._sed, "git": _Judge._git,
+    "sed": _Judge._sed, "cp": _Judge._cp_mv, "mv": _Judge._cp_mv, "git": _Judge._git,
     "terraform": _Judge._infra, "tofu": _Judge._infra, "pulumi": _Judge._infra,
     "kubectl": _Judge._infra, "helm": _Judge._infra, "aws": _Judge._infra,
     "gcloud": _Judge._infra, "az": _Judge._infra, "docker": _Judge._infra,

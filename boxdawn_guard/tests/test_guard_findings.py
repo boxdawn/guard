@@ -11,11 +11,12 @@ import pytest
 
 pytest.importorskip("tree_sitter_bash")
 
-from boxdawn_guard import command_guard  # noqa: E402
+from boxdawn_guard import command_guard, powershell_guard  # noqa: E402
 from boxdawn_guard.command_guard import RULE_IDS, TARGETS, Finding, evaluate  # noqa: E402
 from boxdawn_guard.tests.test_command_guard import ASK, CWD, DENY, HOME, KNOWN_ENV, NONE, RULES  # noqa: E402
 
-SOURCE = pathlib.Path(command_guard.__file__).read_text(encoding="utf-8")
+# Both judges raise flags; a rule only the PowerShell one raises is still live.
+SOURCES = [pathlib.Path(m.__file__).read_text(encoding="utf-8") for m in (command_guard, powershell_guard)]
 
 
 def verdict(command: str, unattended: bool = False):
@@ -25,11 +26,12 @@ def verdict(command: str, unattended: bool = False):
 
 def _flag_rule_ids() -> list[str]:
     ids = []
-    for node in ast.walk(ast.parse(SOURCE)):
-        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "flag":
-            arg = node.args[1]
-            assert isinstance(arg, ast.Constant) and isinstance(arg.value, str), ast.dump(arg)
-            ids.append(arg.value)
+    for source in SOURCES:
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "flag":
+                arg = node.args[1]
+                assert isinstance(arg, ast.Constant) and isinstance(arg.value, str), ast.dump(arg)
+                ids.append(arg.value)
     return ids
 
 
