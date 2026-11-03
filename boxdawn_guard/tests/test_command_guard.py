@@ -234,12 +234,31 @@ def test_windows_working_directories(cwd, command, expected):
     ("cp /etc/hosts ./hosts", None, []),
     ("cp -n a.txt /home/me/x.txt", None, []),
     ("cp --backup=numbered a /home/me/x", None, []),
+    # Claude Code's memory folders are scratch; the rest of ~/.claude is not
+    ("mv ~/.claude/projects/p/memory/a.md.tmp ~/.claude/projects/p/memory/a.md", None, []),
+    ("cp a.md /home/me/.claude/projects/p/memory/b.md", None, []),
+    ("cp a ~/.claude/settings.json", "ask", ["cp.outside"]),
+    ("cp a ~/.claude/plugins/data/boxdawn-guard/current/bdxguard.exe", "ask", ["cp.outside"]),
+    ("cp a ~/.claude/projects/p/notes.md", "ask", ["cp.outside"]),
+    ("cp a ~/.claude/projects/memory/b.md", "ask", ["cp.outside"]),
 ])
 def test_copy_or_move_onto_outside(command, decision, rules):
     """A copy or move onto a file outside the project replaces it, like `>`
     onto it; `mv` also takes away a source outside."""
     v = evaluate(command, cwd=CWD, home=HOME, rules=RULES)
     assert (v.decision, [f.rule for f in v.findings]) == (decision, rules), command
+
+
+@pytest.mark.parametrize("command, decision", [
+    ("echo hi > ~/.claude/projects/p/memory/MEMORY.md", None),
+    ("rm ~/.claude/projects/p/memory/old.md", None),
+    ("rm -rf ~/.claude/projects/p/memory", "deny"),
+    ("rm -rf ~/.claude/projects/p/memory/*", "deny"),
+    ("rm -rf ~/.claude/projects", "deny"),
+    ("echo x > ~/.claude/settings.json", "ask"),
+])
+def test_a_memory_folder_is_scratch_but_not_its_root(command, decision):
+    assert decide(command) == decision, command
 
 
 def test_a_fully_bypassed_suite_has_this_many_cases():

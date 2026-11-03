@@ -401,8 +401,9 @@ class _Judge:
         if path.startswith(cwd.rstrip("/") + "/"):
             return "inside"
         # Inside a temp root is as safe as inside the project; the root
-        # itself is not (wiping /tmp takes everyone's files with it).
-        if any(path.startswith(d.rstrip("/") + "/") for d in scratch):
+        # itself is not (wiping /tmp takes everyone's files with it). A `*`
+        # stands for one directory name.
+        if any(re.match(re.escape(d.rstrip("/")).replace(r"\*", "[^/]+") + "/.", path) for d in scratch):
             return "inside"
         return "outside"
 

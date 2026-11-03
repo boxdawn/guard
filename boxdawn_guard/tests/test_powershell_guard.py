@@ -118,6 +118,10 @@ CASES = [
     (r"New-Item C:\x -ItemType Directory -Force", None, []),
     (r"ni .\out\a.txt -Force", None, []),
     (r"New-Item C:\x\y.txt", None, []),
+    (r"Copy-Item a.md C:\Users\me\.claude\projects\p\memory\b.md", None, []),
+    (r"Move-Item MEMORY.tmp C:\Users\me\.claude\projects\p\memory\MEMORY.md -Force", None, []),
+    (r"Copy-Item a C:\Users\me\.claude\settings.json", "ask", ["cp.outside"]),
+    (r"Remove-Item C:\Users\me\.claude\projects\p\memory -Recurse -Force", "deny", ["rm.outside"]),
     # Windows PowerShell 5.1 has no `&&`: unreadable, and still judged.
     (r"git status && Remove-Item C:\x", "ask", ["parse.unreadable", "rm.outside"]),
 ]
