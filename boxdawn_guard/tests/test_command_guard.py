@@ -218,6 +218,30 @@ def test_windows_working_directories(cwd, command, expected):
     assert decide(command, cwd=cwd) == expected
 
 
+@pytest.mark.parametrize("command, decision, rules", [
+    ("cp a.txt /home/me/notes.txt", "ask", ["cp.outside"]),
+    ("cp -r out ~/backup", "ask", ["cp.outside"]),
+    ('cp a.txt "$DEST"', "ask", ["cp.outside"]),
+    ("cp -t /etc a.conf", "ask", ["cp.outside"]),
+    ("cp --target-directory=/etc a.conf", "ask", ["cp.outside"]),
+    ("mv a.txt /home/me/x.txt", "ask", ["mv.outside"]),
+    ("mv ~/photos/a.jpg ./in/", "ask", ["mv.outside"]),
+    ("mv -n ~/a.jpg ./in/", "ask", ["mv.outside"]),
+    ("cp a.txt b.txt", None, []),
+    ("cp -r src out/", None, []),
+    ("mv old.py new.py", None, []),
+    ("cp a /tmp/x", None, []),
+    ("cp /etc/hosts ./hosts", None, []),
+    ("cp -n a.txt /home/me/x.txt", None, []),
+    ("cp --backup=numbered a /home/me/x", None, []),
+])
+def test_copy_or_move_onto_outside(command, decision, rules):
+    """A copy or move onto a file outside the project replaces it, like `>`
+    onto it; `mv` also takes away a source outside."""
+    v = evaluate(command, cwd=CWD, home=HOME, rules=RULES)
+    assert (v.decision, [f.rule for f in v.findings]) == (decision, rules), command
+
+
 def test_a_fully_bypassed_suite_has_this_many_cases():
     """The suite cannot quietly shrink."""
     assert len(DENY) >= 104 and len(ASK) >= 42 and len(NONE) >= 38

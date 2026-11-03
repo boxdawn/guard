@@ -62,6 +62,8 @@ _ALIASES = {
     "iex": "invoke-expression", "start": "start-process", "saps": "start-process",
     "cd": "set-location", "sl": "set-location", "chdir": "set-location",
     "pushd": "push-location",
+    "cp": "copy-item", "copy": "copy-item", "cpi": "copy-item",
+    "mv": "move-item", "move": "move-item", "mi": "move-item", "ni": "new-item",
 }
 
 _V, _S = True, False  # takes a value / is a switch
@@ -110,6 +112,12 @@ _SPECS: dict[str, tuple[dict, dict, tuple]] = {
                      _PATH_ALIASES, ("path",)),
     "push-location": ({"path": _V, "literalpath": _V, "passthru": _S, "stackname": _V},
                       _PATH_ALIASES, ("path",)),
+    "copy-item": ({**_PATHS, "destination": _V, "recurse": _S, "container": _S, "passthru": _S,
+                   "fromsession": _V, "tosession": _V}, _PATH_ALIASES, ("path", "destination")),
+    "move-item": ({**_PATHS, "destination": _V, "passthru": _S}, _PATH_ALIASES,
+                  ("path", "destination")),
+    "new-item": ({"path": _V, "name": _V, "itemtype": _V, "value": _V, "force": _S,
+                  "credential": _V}, {"type": "itemtype"}, ("path",)),
 }
 _DESTROYERS = frozenset({"format-volume", "clear-disk", "initialize-disk", "remove-partition"})
 # Anything of these anywhere: a variable may change unseen.
@@ -252,14 +260,14 @@ class _PowerShell:
         """Parameter name -> list of values, or True/False for a switch."""
         params, aliases, positional = _SPECS[name]
         bound: dict = {}
-        free: list[Value] = []
+        free: list[list[Value]] = []  # one entry per argument; `a, b` is one
         elems = c["elems"]
         i = 0
         while i < len(elems):
             e = elems[i]
             i += 1
             if "p" not in e:
-                free.extend(self._elem_values(e, c["start"]))
+                free.append(self._elem_values(e, c["start"]))
                 continue
             canon = _resolve_param(e["p"], params, aliases)
             if canon is None:
@@ -275,10 +283,13 @@ class _PowerShell:
                 bound[canon] = not _is_false(e.get("a"))
         slots = [p for p in positional if p not in bound]
         if free and slots:
-            # The first open slot takes an array (`rm a, b`); later slots one value each.
-            bound[slots[0]] = free[:1] if len(slots) > 1 else free
-            for slot, value in zip(slots[1:], free[1:]):
-                bound[slot] = [value]
+            # A single open slot takes every argument (`rm a b`); with more,
+            # each slot takes one argument, which may be an array (`cp a, b dest`).
+            if len(slots) == 1:
+                bound[slots[0]] = [v for group in free for v in group]
+            else:
+                for slot, group in zip(slots, free):
+                    bound[slot] = group
         return bound
 
     def _collect_workdirs(self, commands: list) -> list:
@@ -451,6 +462,47 @@ class _PowerShell:
 
     def _tee_object(self, c, b, raw, depth) -> None:
         self._out_file(c, b, raw, depth)
+
+    def _copy_item(self, c, b, raw, depth) -> None:
+        # Copy-Item replaces a file already at the destination.
+        self._replaces(b, raw, "cp.outside")
+
+    def _move_item(self, c, b, raw, depth) -> None:
+        j = self.j
+        for t in self._targets(c, b, "path", "literalpath"):
+            if (where := self._where(t)) in ("outside", "unknown"):
+                said = "a path known only at run time" if t is None else f"`{t}` outside the project"
+                j.flag("ask", "mv.outside", f"`{raw}` takes away {said}", where)
+        if b.get("force") is True:  # without -Force it refuses to replace a file
+            self._replaces(b, raw, "mv.outside")
+
+    def _replaces(self, b, raw, rule: str) -> None:
+        j = self.j
+        for t in b.get("destination") or ["."]:
+            if (where := self._where(t)) not in ("outside", "unknown"):
+                continue
+            said = "a path known only at run time" if t is None else f"`{t}` outside the project"
+            if rule == "cp.outside":
+                j.flag("ask", "cp.outside", f"`{raw}` writes over {said}", where)
+            else:
+                j.flag("ask", "mv.outside", f"`{raw}` writes over {said}", where)
+
+    def _new_item(self, c, b, raw, depth) -> None:
+        """`New-Item -Force` replaces a file (or registry key) already there;
+        a directory already there is kept."""
+        if b.get("force") is not True:
+            return
+        kind = (b.get("itemtype") or ["File"])[0]
+        if kind is not None and kind.lower() == "directory":
+            return
+        names = b.get("name")
+        for p in self._targets(c, b, "path") or ["."]:
+            t = p
+            if names:
+                t = None if p is None or names[0] is None else p.rstrip("/\\") + "/" + names[0]
+            if (where := self._where(t)) in ("outside", "unknown"):
+                said = "a path known only at run time" if t is None else f"`{t}` outside the project"
+                self.j.flag("ask", "new_item.force_outside", f"`{raw} -Force` replaces {said}", where)
 
     def _invoke_expression(self, c, b, raw, depth) -> None:
         code = b.get("command")
