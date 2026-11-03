@@ -38,6 +38,19 @@ _PARSER = Parser(Language(tree_sitter_bash.language()))
 
 
 @dataclass(frozen=True)
+class CustomRule:
+    """A rule a paying org added (server 0032), matched on what this guard
+    reads, never on the command text. It can only ask or deny: there is no
+    rule that lets anything through."""
+    id: str                    # "r12"; reported as "custom.r12"
+    level: str                 # "ask" or "deny"
+    command: str               # the name, lower case, no ".exe"
+    args: tuple[str, ...] = ()   # positional words, in this order (others may sit between)
+    flags: tuple[str, ...] = ()  # any one of these, as `--x` or `--x=value`
+    note: str = ""             # the org's reason, shown to the person asked
+
+
+@dataclass(frozen=True)
 class CommandRules:
     """The rule values. Data, so they can come from a signed bundle later."""
 
@@ -58,6 +71,7 @@ class CommandRules:
     inline_code_risky: dict[str, tuple[str, ...]]  # interpreter -> regexes over its code
     scratch_dirs: tuple[str, ...]         # temp roots: work inside is fine, wiping them is not
     unattended_modes: frozenset[str]
+    custom: tuple[CustomRule, ...] = ()   # the org's own rules, from a signed bundle
 
 
 @dataclass(frozen=True)
@@ -98,6 +112,13 @@ RULE_IDS = frozenset({
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
 TARGETS = frozenset({"project", "project_root", "outside", "unknown", "disk_device"})
+# An org's own rule: "custom.r<its number on the server>". Not in RULE_IDS,
+# which is this guard's own closed set.
+CUSTOM_RULE_ID = re.compile(r"custom\.r[0-9]{1,18}")
+
+
+def rule_id_ok(rule: str) -> bool:
+    return rule in RULE_IDS or CUSTOM_RULE_ID.fullmatch(rule) is not None
 _TARGET_OF_WHERE = {"inside": "project", "cwd": "project_root",
                     "outside": "outside", "unknown": "unknown"}
 
@@ -193,6 +214,33 @@ def _posix(path: str) -> str:
     return path
 
 
+def _custom_match(rule: CustomRule, args: list[Value]) -> Optional[bool]:
+    """True: matches. False: cannot match. None: matches only if an unknown
+    value turns out to be the missing word or flag."""
+    positional = _positional(args)
+    sure = _in_order(rule.args, positional, unknown_fits=False)
+    if not sure and not _in_order(rule.args, positional, unknown_fits=True):
+        return False
+    if rule.flags and not any(a is not None and any(a == f or a.startswith(f + "=") for f in rule.flags)
+                              for a in args):
+        if not any(a is None for a in args):
+            return False
+        sure = False
+    return True if sure else None
+
+
+def _in_order(words: tuple[str, ...], args: list[Value], *, unknown_fits: bool) -> bool:
+    """`words` appear in `args` in this order, other args allowed between
+    (`kubectl -n prod delete pod`: `prod` is an option's value)."""
+    i = 0
+    for a in args:
+        if i == len(words):
+            break
+        if a == words[i] or (a is None and unknown_fits):
+            i += 1
+    return i == len(words)
+
+
 def _short_flags(args: list[Value]) -> set[str]:
     out: set[str] = set()
     for a in args:
@@ -222,6 +270,14 @@ class _Judge:
 
     def flag(self, level: str, rule: str, reason: str, target: Optional[str] = None) -> None:
         if rule not in RULE_IDS:
+            raise ValueError(f"unregistered rule id {rule!r}")
+        self._record(level, rule, reason, target)
+
+    def flag_custom(self, level: str, rule: CustomRule, reason: str) -> None:
+        self._record(level, f"custom.{rule.id}", reason, None)
+
+    def _record(self, level: str, rule: str, reason: str, target: Optional[str]) -> None:
+        if not rule_id_ok(rule):
             raise ValueError(f"unregistered rule id {rule!r}")
         if target is not None:
             target = _TARGET_OF_WHERE.get(target, target)
@@ -435,6 +491,8 @@ class _Judge:
         if name is None:
             self.flag("ask", "name.runtime", "the command name is only known at run time")
             return
+        if r.custom:
+            self._custom(name, args)
 
         if name in r.privilege:
             self.flag("ask", "privilege.elevated", f"`{name}` runs a command with more rights")
@@ -503,6 +561,23 @@ class _Judge:
             handler(self, name, args, depth)
         elif name in r.db_clients:
             self._db(name, args)
+
+    def _custom(self, name: str, args: list[Value]) -> None:
+        """The org's rules on this one command. Judged here, so a rule meets
+        the command inside sudo, env, xargs, `bash -c` and eval as well. The
+        rest of the judgement still runs: a stronger rule of ours still wins."""
+        lowered = name.lower()
+        for rule in self.rules.custom:
+            if rule.command != lowered:
+                continue
+            match = _custom_match(rule, args)
+            if match is False:
+                continue
+            why = f"team rule {rule.id}" + (f": {rule.note}" if rule.note else f" on `{name}`")
+            if match is True:
+                self.flag_custom(rule.level, rule, why)
+            else:  # it may match once a value known only at run time is filled in
+                self.flag_custom("ask", rule, why + " (a value is known only at run time)")
 
     # redirects and pipes ────────────────────────────────────────────────
     def _redirect(self, node: Node) -> None:

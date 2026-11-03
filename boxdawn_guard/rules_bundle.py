@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
 import json
 import os
 import re
@@ -24,7 +25,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from boxdawn_guard.command_guard import CommandRules
+from boxdawn_guard.command_guard import CommandRules, CustomRule
 from boxdawn_guard.command_rules_source import default_command_rules
 
 BUNDLE_VERSION = 1
@@ -107,6 +108,42 @@ def rules_from_dict(data: Any) -> CommandRules:
     return CommandRules(**kw)
 
 
+_CUSTOM_KEYS = {"id", "level", "command", "args", "flags", "note"}
+_CUSTOM_MAX = 100  # the server's limit per org (0032)
+_COMMAND = re.compile(r"[A-Za-z0-9._+-]{1,64}")
+_WORD = re.compile(r"[^\s\x00-\x1f\x7f]{1,128}")
+
+
+def custom_from_list(data: Any) -> tuple[CustomRule, ...]:
+    """The org's rules (`custom` beside `rules`), checked the way the server
+    stores them (0032), or BundleError. A bundle from before them has none."""
+    if data is None:
+        return ()
+    if not isinstance(data, list) or len(data) > _CUSTOM_MAX:
+        raise BundleError("custom: not a list of at most 100")
+    out = []
+    for r in data:
+        if not isinstance(r, dict) or set(r) != _CUSTOM_KEYS:
+            raise BundleError("custom: a rule has other fields")
+        args, flags, note = r["args"], r["flags"], r["note"]
+        ok = (isinstance(r["id"], str) and re.fullmatch(r"r[0-9]{1,18}", r["id"])
+              and r["level"] in ("ask", "deny")
+              and isinstance(r["command"], str) and _COMMAND.fullmatch(r["command"])
+              and isinstance(args, list) and len(args) <= 8
+              and all(isinstance(a, str) and _WORD.fullmatch(a) and not a.startswith("-") for a in args)
+              and isinstance(flags, list) and len(flags) <= 8
+              and all(isinstance(f, str) and _WORD.fullmatch(f) and f.startswith("-") for f in flags)
+              and isinstance(note, str) and len(note) <= 120
+              and not re.search(r"[\x00-\x1f\x7f]", note))
+        if not ok:
+            raise BundleError("custom: a rule is malformed")
+        command = r["command"].lower()
+        if command.endswith(".exe"):
+            command = command[:-4]
+        out.append(CustomRule(r["id"], r["level"], command, tuple(args), tuple(flags), note))
+    return tuple(out)
+
+
 # ── the bundle ──────────────────────────────────────────────────────────────
 
 def _b64url(text: Any) -> bytes:
@@ -159,7 +196,8 @@ def _verified(response: Any, public_keys: Mapping[str, str] | None, *,
         raise BundleError("bundle: no expiry")
     if now >= exp:
         raise BundleError("bundle: expired")
-    return rules_from_dict(body.get("rules")), exp
+    rules = rules_from_dict(body.get("rules"))
+    return dataclasses.replace(rules, custom=custom_from_list(body.get("custom"))), exp
 
 
 def load_rules(data_dir: str | None, *, now: float | None = None,
