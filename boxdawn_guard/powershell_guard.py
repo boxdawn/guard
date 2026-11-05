@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
+from boxdawn_guard import secret_files
 from boxdawn_guard.command_guard import (
     CommandRules, Value, Verdict, _MAX_DEPTH, _Judge, _code_or_file,
 )
@@ -173,8 +174,22 @@ class _PowerShell:
         self.env = self._collect_env(tree)
         j.workdirs = self._collect_workdirs(commands)
         try:
+            fed_a_secret = listed_a_secret = False
             for c in commands:
                 self._command(c, depth)
+                name = _canonical(c["name"])
+                if name is None:
+                    continue
+                piped = c["pipe_index"] > 0
+                fed_a_secret, listed_a_secret = fed_a_secret and piped, listed_a_secret and piped
+                args = self._native_args(c)
+                if fed_a_secret and name in secret_files.SENDERS:
+                    j.flag("deny", "secret.send", f"`{c['name']}` sends a secret file out through a pipe")
+                if listed_a_secret and name not in secret_files.METADATA_ONLY:
+                    j.flag("ask", "secret.read", f"`{c['name']}` is handed a secret file down the pipe")
+                fed_a_secret = fed_a_secret or bool(j._named_secrets(name, args))
+                listed_a_secret = listed_a_secret or (name in secret_files.METADATA_ONLY and any(
+                    a is not None and not a.startswith("-") and j._is_secret(a) for a in args))
             for w in tree["writes"]:
                 if not w["append"]:
                     self._writes(self._value(w["to"], w["start"]), "output")
@@ -330,6 +345,7 @@ class _PowerShell:
             b = self._bind(c, name)
             if b.get("whatif") is True:
                 return
+            j._secret_args(name, self._native_args(c))
             getattr(self, "_" + name.replace("-", "_"))(c, b, raw, depth)
             return
         # Any other cmdlet has no handler there and gets no decision.

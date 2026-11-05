@@ -29,6 +29,8 @@ from typing import Optional
 import tree_sitter_bash
 from tree_sitter import Language, Node, Parser
 
+from boxdawn_guard import secret_files
+
 Value = Optional[str]  # None: only known at run time
 
 _LEVEL = {None: 0, "ask": 1, "deny": 2}
@@ -108,7 +110,7 @@ RULE_IDS = frozenset({
     "git.reset_hard", "git.clean", "git.branch_delete", "git.rewrite_history",
     "db.destructive", "db.runtime", "db.file",
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
-    "docker.prune",
+    "docker.prune", "secret.read", "secret.send",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -134,6 +136,22 @@ def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
         judge.run(command, depth=0)
     except Exception as exc:  # noqa: BLE001 - a guard that crashes must not pass
         judge.flag("ask", "guard.crashed", f"the guard could not read this command ({type(exc).__name__})")
+    decision = judge.decision
+    escalated = unattended and decision == "ask"
+    if escalated:
+        decision = "deny"
+        judge.reasons.append("nobody is present to approve it")
+    return Verdict(decision, tuple(judge.reasons), tuple(judge.findings), escalated)
+
+
+def evaluate_file_tool(tool: str, paths: list[str], *, cwd: str, home: str, rules: CommandRules,
+                       unattended: bool = False) -> Verdict:
+    """Claude Code's file tools: no shell to read, only the paths they were given."""
+    judge = _Judge(cwd=cwd, home=home, rules=rules)
+    judge.workdirs = [judge.cwd]
+    for path in paths:
+        if judge._is_secret(path, glob_matches_dots=True):
+            judge.flag("ask", "secret.read", f"`{tool}` reads the secret file `{path}`", judge._where(path))
     decision = judge.decision
     escalated = unattended and decision == "ask"
     if escalated:
@@ -389,6 +407,10 @@ class _Judge:
         return False, None
 
     def _scan_code(self, name: str, code: str) -> None:
+        for text in secret_files.literals_in_code(code):
+            if self._is_secret(text):
+                self.flag("ask", "secret.read", f"`{name}` code names the secret file `{text}`", self._where(text))
+                break
         patterns = self.rules.inline_code_risky.get(name)
         if patterns is None:
             self.flag("ask", "code.inline_unknown_language", f"`{name}` runs inline code this guard has no rules for")
@@ -463,6 +485,75 @@ class _Judge:
             return "inside"
         return "outside"
 
+    # secret files ───────────────────────────────────────────────────────
+    def _is_secret(self, target: str, glob_matches_dots: bool = False) -> bool:
+        return any(secret_files.is_secret(target if base is None else self._absolute(target, base),
+                                          glob_matches_dots=glob_matches_dots)
+                   for base in self.workdirs or [self.cwd])
+
+    def _named_secrets(self, name: str, args: list[Value]) -> list[str]:
+        """The secret files this command is given to read or send. Any command
+        reads what it is given unless it is known not to show the file: a list
+        of readers is what `xxd .env` walks past."""
+        lowered = name.lower()
+        if lowered in secret_files.SENDERS:
+            return [p for p in secret_files.sent_paths(lowered, args) if self._is_secret(p)]
+        if lowered in secret_files.METADATA_ONLY or lowered in secret_files.USES_WITHOUT_SHOWING:
+            return []
+        if lowered == "git" and secret_files.git_subcommand(args) not in secret_files.GIT_SHOWS:
+            return []
+        skip = secret_files.flag_values_to_skip(lowered, args)
+        code = self.rules.code_flags.get(name, ())
+        skip |= {i + 1 for i, a in enumerate(args) if a in code}
+        rest = [a for i, a in enumerate(args) if i not in skip]
+        if secret_files.pattern_is_first(lowered, args):
+            operands = _operands(rest)
+            if operands and operands[0] in rest:
+                rest.remove(operands[0])
+        if lowered in secret_files.COPIERS:
+            operands = _operands(rest)
+            if len(operands) >= 2 and operands[-1] in rest:
+                rest.reverse()
+                rest.remove(operands[-1])
+                rest.reverse()
+        if lowered == "git":
+            rest = [a.rsplit(":", 1)[-1] if a else a for a in rest]  # `git show HEAD:.env`
+        out = []
+        for a in rest:
+            path = None if a is None else secret_files.path_in_argument(a)
+            if path is not None and self._is_secret(path):
+                out.append(path)
+        return out
+
+    def _final(self, name: Value, args: list[Value]) -> tuple[Value, list[Value]]:
+        """The command behind `sudo`, `env`, `timeout` and the like."""
+        r = self.rules
+        while name is not None and (name in r.wrappers or name in r.privilege):
+            rest = _unwrap(name, args)
+            if not rest:
+                break
+            name, args = rest[0], rest[1:]
+        return name, args
+
+    def _sends(self, node: Node) -> bool:
+        """A sender anywhere inside this part of the line."""
+        for n in _walk(node):
+            if n.type == "command":
+                name = self._final(*self._name_args(n))[0]
+                if name and name.lower() in secret_files.SENDERS:
+                    return True
+        return False
+
+    def _flag_secret(self, name: str, path: str) -> None:
+        if name.lower() in secret_files.SENDERS:
+            self.flag("deny", "secret.send", f"`{name}` sends the secret file `{path}` out", self._where(path))
+        else:
+            self.flag("ask", "secret.read", f"`{name}` reads the secret file `{path}`", self._where(path))
+
+    def _secret_args(self, name: str, args: list[Value]) -> None:
+        for path in self._named_secrets(name, args):
+            self._flag_secret(name, path)
+
     # commands ───────────────────────────────────────────────────────────
     def _name_args(self, node: Node) -> tuple[Value, list[Value]]:
         name_node = node.child_by_field_name("name")
@@ -486,6 +577,12 @@ class _Judge:
             return
         fed, text = self._stdin(node)
         self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
+        final = self._final(name, args)[0]
+        if final and final.lower() in secret_files.SENDERS:
+            for n in _walk(node):  # `curl -d "$(cat .env)"`
+                if n.type == "command" and n.id != node.id and self._named_secrets(*self._name_args(n)):
+                    self.flag("deny", "secret.send", f"`{final}` sends what a secret file holds out")
+                    break
 
     def _judge(self, name: Value, args: list[Value], depth: int, *,
                stdin_fed: bool = False, stdin_text: Value = None) -> None:
@@ -532,6 +629,8 @@ class _Judge:
         if name in r.source:
             self.flag("ask", "source.script", f"`{name}` runs a script file in this shell")
             return
+
+        self._secret_args(name, args)
 
         if name in r.code_flags:
             flags = r.code_flags[name]
@@ -585,6 +684,7 @@ class _Judge:
     def _redirect(self, node: Node) -> None:
         op = "".join(c.text.decode() for c in node.children if not c.is_named)
         if "<" in op:
+            self._redirected_in(node)
             return
         dest_node = node.child_by_field_name("destination")
         if dest_node is None:
@@ -603,8 +703,52 @@ class _Judge:
         if self._where(dest) == "outside" and ">>" not in op:
             self.flag("ask", "redirect.outside", f"output is written to `{dest}` outside the project", "outside")
 
+    def _redirect_reads_secret(self, node: Node) -> bool:
+        source = node.child_by_field_name("destination")
+        op = "".join(c.text.decode() for c in node.children if not c.is_named)
+        path = None if source is None else _value(source, self.env)
+        return "<" in op and path is not None and self._is_secret(path)
+
+    def _find_secret(self, args: list[Value]) -> Value:
+        """The secret name `find` is told to look for."""
+        for i, a in enumerate(args[:-1]):
+            if a in ("-name", "-iname", "-path", "-ipath", "-wholename") and args[i + 1] is not None:
+                if self._is_secret(args[i + 1]):
+                    return args[i + 1]
+        return None
+
+    def _redirected_in(self, node: Node) -> None:
+        source = node.child_by_field_name("destination")
+        path = None if source is None else _value(source, self.env)
+        if path is None or not self._is_secret(path):
+            return
+        parent = node.parent
+        body = parent if parent.type == "command" else parent.child_by_field_name("body") or parent
+        names = [self._final(*self._name_args(n))[0] for n in _walk(body) if n.type == "command"]
+        if self._sends(body):
+            self.flag("deny", "secret.send", f"a secret file `{path}` is fed to a command that sends it out",
+                      self._where(path))
+        elif not names or any(n is None or n.lower() not in secret_files.METADATA_ONLY for n in names):
+            self.flag("ask", "secret.read", f"the secret file `{path}` is read through a redirect", self._where(path))
+
     def _pipeline(self, node: Node) -> None:
         stages = [c for c in node.named_children]
+        fed_a_secret = listed_a_secret = False
+        for stage in stages:
+            if fed_a_secret and self._sends(stage):
+                self.flag("deny", "secret.send", "a secret file is sent out through a pipe")
+            for n in _walk(stage):
+                if n.type != "command":
+                    continue
+                name, args = self._name_args(n)
+                if name is None:
+                    continue
+                if listed_a_secret and name == "xargs":
+                    self.flag("ask", "secret.read", "`xargs` is handed a secret file `find` listed")
+                listed_a_secret = listed_a_secret or (name == "find" and self._find_secret(args) is not None)
+                fed_a_secret = fed_a_secret or bool(self._named_secrets(name, args))
+            redirects = [n for n in _walk(stage) if n.type == "file_redirect"]
+            fed_a_secret = fed_a_secret or any(self._redirect_reads_secret(n) for n in redirects)
         for stage in stages[1:]:
             command = stage if stage.type == "command" else next(
                 (c for c in stage.named_children if c.type == "command"), None)
@@ -650,8 +794,9 @@ class _Judge:
                 sub = args[i + 1:end]
                 if not sub:
                     continue
+                found = self._find_secret(args)
                 for root in roots:
-                    filled = [root if s == "{}" else s for s in sub]
+                    filled = [(found or root) if s == "{}" else s for s in sub]
                     self._judge(filled[0], filled[1:], depth)
 
     def _dd(self, name: str, args: list[Value], depth: int) -> None:

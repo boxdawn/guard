@@ -2,7 +2,7 @@
   "name": "boxdawn-guard",
   "displayName": "Boxdawn guard",
   "version": "0.3.0",
-  "description": "Judges each Bash and PowerShell command before Claude runs it: deny, ask, or no decision.",
+  "description": "Judges each Bash and PowerShell command, and each read of a secret file by name, before Claude runs it: deny, ask, or no decision.",
   "author": { "name": "Boxdawn" },
   "license": "FSL-1.1-ALv2",
   "userConfig": {
