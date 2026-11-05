@@ -283,9 +283,10 @@ class _Judge:
     env: dict = field(default_factory=dict)
     known_env: dict = field(default_factory=dict)
     made_links: list[str] = field(default_factory=list)  # by this same command: not on disk yet
+    reals: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self._windows = bool(re.match(r"^[A-Za-z]:", self.cwd))
+        self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
         self.cwd = posixpath.normpath(_posix(self.cwd))
         self.home = posixpath.normpath(_posix(self.home))
 
@@ -436,12 +437,18 @@ class _Judge:
                     self.workdirs.append(self.home)
                 else:
                     target = args[-1]
-                    self.workdirs.append(None if target is None else self._absolute(target, self.cwd))
+                    if target is None:
+                        self.workdirs.append(None)
+                    else:
+                        self.workdirs += [self._absolute(target, self.cwd),
+                                          self._absolute(target, self.workdirs[-1] or self.cwd)]
 
     def _joined(self, target: str, base: str) -> str:
         if target == "~" or target.startswith("~/"):
             target = self.home + target[1:]
         target = _posix(target)
+        if self._windows:
+            target = target.replace("\\", "/")
         if not target.startswith("/"):
             target = posixpath.join(base, target)
         return target
@@ -449,7 +456,15 @@ class _Judge:
     def _absolute(self, target: str, base: str) -> str:
         return posixpath.normpath(self._joined(target, base))
 
+    def _fold(self, path: str) -> str:
+        return path.lower() if self._windows else path
+
     def _real(self, path: str) -> str:
+        if path not in self.reals:
+            self.reals[path] = self._on_disk(path)
+        return self.reals[path]
+
+    def _on_disk(self, path: str) -> str:
         """Where the path is on disk, in the same form as `self.cwd`. A part
         that does not exist yet stays as written."""
         if path.endswith("/.."):
@@ -459,7 +474,7 @@ class _Judge:
             path = posixpath.join(posixpath.dirname(self._real(head)), tail)
         if self._windows and re.match(r"^/[a-z](/|$)", path):
             path = path[1].upper() + ":" + (path[2:] or "/")
-        return _posix(os.path.realpath(path))
+        return _posix(os.path.realpath(path).replace(os.sep, "/"))
 
     def _leaves(self, target: str, base: str, keep_last: bool) -> bool:
         """A link on the way takes a path that reads as inside out of the
@@ -480,7 +495,9 @@ class _Judge:
         GNU rm, Git Bash rm and Windows PowerShell Remove-Item."""
         if target is None:
             return "unknown"
-        keep_last = removes_link and not re.search(r"[*?\[]", target) and not target.endswith(("/", "\\"))
+        if self._windows:
+            target = target.replace("\\", "/")
+        keep_last = removes_link and not re.search(r"[*?\[]", target) and not target.endswith("/")
         if target.startswith("~") and not (target == "~" or target.startswith("~/")):
             return "outside"  # ~user
         glob = re.search(r"[*?\[]", target)
@@ -499,7 +516,9 @@ class _Judge:
                 where = self._relation(path)
                 if where != "outside" and self._leaves(target, base or self.cwd, keep_last):
                     where = "outside"
-                if any(path == m and not keep_last or path.startswith(m + "/") for m in self.made_links):
+                folded = self._fold(path)
+                if any(folded == self._fold(m) and not keep_last or folded.startswith(self._fold(m) + "/")
+                       for m in self.made_links):
                     self.flag("ask", "link.same_command", f"`{target}` goes through a link this command makes", "unknown")
             if order[where] > order[worst]:
                 worst = where
@@ -816,10 +835,15 @@ class _Judge:
 
     def _ln(self, name: str, args: list[Value], depth: int) -> None:
         operands = _operands(args)
-        symbolic = "s" in _short_flags(args) or "--symbolic" in args
-        if symbolic and len(operands) >= 2 and operands[-1] is not None:
-            self.made_links.extend(self._absolute(operands[-1].rstrip("/") or "/", base or self.cwd)
-                                   for base in self.workdirs)
+        if not operands or not ("s" in _short_flags(args) or "--symbolic" in args):
+            return
+        made = operands[-1]
+        if made is None:
+            self.flag("ask", "link.same_command", "`ln -s` makes a link whose name is known only at run time", "unknown")
+        else:
+            made = made.rstrip("/") or "/"
+            made = made if len(operands) >= 2 else posixpath.basename(made)
+            self.made_links.extend(self._absolute(made, base or self.cwd) for base in self.workdirs)
 
     def _find(self, name: str, args: list[Value], depth: int) -> None:
         roots: list[Value] = []
@@ -921,7 +945,7 @@ class _Judge:
                     self.flag("ask", "mv.outside", f"`mv` writes over {said}", where)
         if name == "mv":
             for source in sources:
-                if (where := self._where(source)) in ("outside", "unknown"):
+                if (where := self._where(source, removes_link=True)) in ("outside", "unknown"):
                     said = "a path known only at run time" if source is None else f"`{source}` outside the project"
                     self.flag("ask", "mv.outside", f"`mv` takes away {said}", where)
 

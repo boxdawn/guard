@@ -118,7 +118,7 @@ _SPECS: dict[str, tuple[dict, dict, tuple]] = {
     "move-item": ({**_PATHS, "destination": _V, "passthru": _S}, _PATH_ALIASES,
                   ("path", "destination")),
     "new-item": ({"path": _V, "name": _V, "itemtype": _V, "value": _V, "force": _S,
-                  "credential": _V}, {"type": "itemtype"}, ("path",)),
+                  "credential": _V}, {"type": "itemtype", "target": "value"}, ("path",)),
 }
 _DESTROYERS = frozenset({"format-volume", "clear-disk", "initialize-disk", "remove-partition"})
 # Anything of these anywhere: a variable may change unseen.
@@ -320,7 +320,10 @@ class _PowerShell:
                 dirs.append(j.home)
                 continue
             t = _native_path(targets[0])
-            dirs.append(None if t is None or _provider(t) else j._absolute(t, j.cwd))
+            if t is None or _provider(t):
+                dirs.append(None)
+            else:
+                dirs += [j._absolute(t, j.cwd), j._absolute(t, dirs[-1] or j.cwd)]
         return dirs
 
     # commands ───────────────────────────────────────────────────────────
@@ -447,7 +450,8 @@ class _PowerShell:
         j = self.j
         hard = b.get("recurse") is True or b.get("force") is True
         for t in self._targets(c, b, "path", "literalpath"):
-            where = self._where(t, removes_link=True)
+            # `-Include` deletes what matches inside the link, not the link.
+            where = self._where(t, removes_link=b.get("include") is None)
             if where == "unknown":
                 j.flag("deny" if hard else "ask", "rm.runtime",
                        f"`{raw}` target is known only at run time", "unknown")
@@ -508,8 +512,8 @@ class _PowerShell:
         a directory already there is kept."""
         kind = (b.get("itemtype") or ["File"])[0]
         names = b.get("name")
-        if kind is not None and kind.lower() in ("symboliclink", "junction"):
-            for p in self._targets(c, b, "path"):
+        if kind and ("symboliclink".startswith(kind.lower()) or "junction".startswith(kind.lower())):
+            for p in self._targets(c, b, "path") or ["."]:
                 t = _native_path(p if not names or p is None or names[0] is None else p.rstrip("/\\") + "/" + names[0])
                 if t is not None:
                     self.j.made_links.extend(self.j._absolute(t, base or self.j.cwd) for base in self.j.workdirs)

@@ -97,3 +97,64 @@ def test_link_made_and_removed_itself_passes(repo):
 def test_powershell_link_made_by_the_same_command_asks(repo):
     command = "New-Item -ItemType Junction -Path x -Target ..\\home; Remove-Item -Recurse -Force x\\sub"
     assert powershell(command, repo) == "ask"
+
+
+@pytest.mark.parametrize("command", ["Remove-Item 'link\\my sub' -Recurse -Force", "Remove-Item -LiteralPath 'link\\my sub' -Recurse -Force",
+                                     "Remove-Item '.\\link\\my sub' -Recurse -Force", "Remove-Item 'link\\my sub\\*' -Recurse -Force"])
+def test_powershell_space_in_the_path_is_still_seen(repo, command):
+    assert powershell(command, repo) == "deny"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a backslash is a separator only on Windows")
+def test_backslash_in_a_bash_path_on_windows(repo):
+    assert bash("rm -rf 'link\\sub'", repo) == "deny"
+
+
+@pytest.mark.parametrize("command", ["Remove-Item link -Recurse -Force -Include *", "Remove-Item -Path link -Include *.txt -Recurse -Force"])
+def test_powershell_include_deletes_inside_the_link(repo, command):
+    assert powershell(command, repo) == "deny"
+
+
+def test_cd_after_cd_reaches_a_link(repo, tmp_path):
+    link(repo / "own" / "nest", tmp_path / "home")
+    assert bash("cd own && cd nest && rm -rf sub", repo) == "deny"
+    assert powershell("Set-Location own; Set-Location nest; Remove-Item sub -Recurse -Force", repo) == "deny"
+
+
+def test_renaming_a_link_leaves_the_target(repo):
+    assert bash("mv link x", repo) is None
+
+
+@pytest.mark.parametrize("command", ["New-Item -ItemType j -Path x -Target ..\\home; Remove-Item -Recurse -Force x\\sub",
+                                     "New-Item -ItemType sym -Path x -Target ..\\home; Remove-Item -Recurse -Force x\\sub",
+                                     "New-Item -ItemType Junction -Name x -Target ..\\home; Remove-Item -Recurse -Force x\\sub"])
+def test_powershell_link_forms_ask(repo, command):
+    assert powershell(command, repo) == "ask"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="names differ only by case on Windows")
+def test_made_link_in_another_case_asks(repo):
+    assert bash("ln -s ../home X && rm -rf x/sub", repo) == "ask"
+    assert powershell("New-Item -ItemType Junction -Path X -Target ..\\home; Remove-Item -Recurse -Force x\\sub", repo) == "ask"
+
+
+def test_ln_with_one_operand_or_unknown_name_asks(repo):
+    assert bash("ln -s ../home && rm -rf home/sub", repo) == "ask"
+    assert bash('ln -s ../home "$N"', repo) == "ask"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="UNC paths")
+def test_project_on_a_network_path_is_still_the_project(repo):
+    drive, rest = str(repo).split(":", 1)
+    share = f"\\\\localhost\\{drive}$" + rest
+    if not os.path.isdir(share):
+        pytest.skip("no admin share here")
+    v = evaluate("rm -rf own/inner", cwd=share, home=str(repo.parent / "nobody"), rules=RULES)
+    assert v.decision is None
+
+
+def test_many_targets_stay_fast(repo):
+    import time
+    start = time.perf_counter()
+    bash("rm -f " + " ".join(f"own/f{i}" for i in range(3000)), repo)
+    assert time.perf_counter() - start < 5
