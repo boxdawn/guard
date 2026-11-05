@@ -110,7 +110,8 @@ def test_backslash_in_a_bash_path_on_windows(repo):
     assert bash("rm -rf 'link\\sub'", repo) == "deny"
 
 
-@pytest.mark.parametrize("command", ["Remove-Item link -Recurse -Force -Include *", "Remove-Item -Path link -Include *.txt -Recurse -Force"])
+@pytest.mark.parametrize("command", ["Remove-Item link -Recurse -Force -Include *", "Remove-Item -Path link -Include *.txt -Recurse -Force",
+                                     "Remove-Item link -Exclude nothing -Recurse -Force", "Remove-Item link -Exclude a.txt -Recurse -Force"])
 def test_powershell_include_deletes_inside_the_link(repo, command):
     assert powershell(command, repo) == "deny"
 
@@ -149,8 +150,10 @@ def test_project_on_a_network_path_is_still_the_project(repo):
     share = f"\\\\localhost\\{drive}$" + rest
     if not os.path.isdir(share):
         pytest.skip("no admin share here")
-    v = evaluate("rm -rf own/inner", cwd=share, home=str(repo.parent / "nobody"), rules=RULES)
-    assert v.decision is None
+    nobody = str(repo.parent / "nobody")
+    for command in ["rm -rf own/inner", f"rm -rf '{share}\\own\\x'", f"cd '{share}\\own' && rm -rf x"]:
+        assert evaluate(command, cwd=share, home=nobody, rules=RULES).decision is None
+    assert evaluate("rm -rf link/sub", cwd=share, home=nobody, rules=RULES).decision == "deny"
 
 
 def test_many_targets_stay_fast(repo):

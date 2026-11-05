@@ -450,8 +450,8 @@ class _PowerShell:
         j = self.j
         hard = b.get("recurse") is True or b.get("force") is True
         for t in self._targets(c, b, "path", "literalpath"):
-            # `-Include` deletes what matches inside the link, not the link.
-            where = self._where(t, removes_link=b.get("include") is None)
+            # `-Include` and `-Exclude` delete what matches inside the link, not the link.
+            where = self._where(t, removes_link=b.get("include") is None and b.get("exclude") is None)
             if where == "unknown":
                 j.flag("deny" if hard else "ask", "rm.runtime",
                        f"`{raw}` target is known only at run time", "unknown")

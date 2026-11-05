@@ -287,6 +287,8 @@ class _Judge:
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
+        if self._windows:
+            self.cwd = self.cwd.replace("\\", "/")
         self.cwd = posixpath.normpath(_posix(self.cwd))
         self.home = posixpath.normpath(_posix(self.home))
 
