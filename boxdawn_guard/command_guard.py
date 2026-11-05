@@ -21,6 +21,7 @@ error or unreadable name is "ask", not a guess.
 """
 from __future__ import annotations
 
+import os
 import posixpath
 import re
 from dataclasses import dataclass, field
@@ -110,7 +111,7 @@ RULE_IDS = frozenset({
     "git.reset_hard", "git.clean", "git.branch_delete", "git.rewrite_history",
     "db.destructive", "db.runtime", "db.file",
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
-    "docker.prune", "secret.read", "secret.send",
+    "docker.prune", "secret.read", "secret.send", "link.same_command",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -281,6 +282,7 @@ class _Judge:
     workdirs: list[Optional[str]] = field(default_factory=list)
     env: dict = field(default_factory=dict)
     known_env: dict = field(default_factory=dict)
+    made_links: list[str] = field(default_factory=list)  # by this same command: not on disk yet
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^[A-Za-z]:", self.cwd))
@@ -436,18 +438,49 @@ class _Judge:
                     target = args[-1]
                     self.workdirs.append(None if target is None else self._absolute(target, self.cwd))
 
-    def _absolute(self, target: str, base: str) -> str:
+    def _joined(self, target: str, base: str) -> str:
         if target == "~" or target.startswith("~/"):
             target = self.home + target[1:]
         target = _posix(target)
         if not target.startswith("/"):
             target = posixpath.join(base, target)
-        return posixpath.normpath(target)
+        return target
 
-    def _where(self, target: Value) -> str:
-        """'unknown', 'outside', 'cwd' (the project itself) or 'inside'."""
+    def _absolute(self, target: str, base: str) -> str:
+        return posixpath.normpath(self._joined(target, base))
+
+    def _real(self, path: str) -> str:
+        """Where the path is on disk, in the same form as `self.cwd`. A part
+        that does not exist yet stays as written."""
+        if path.endswith("/.."):
+            path += "/"
+        while "/../" in path:  # realpath on Windows drops `x/..` before it looks at x; a shell goes through x
+            head, _, tail = path.partition("/../")
+            path = posixpath.join(posixpath.dirname(self._real(head)), tail)
+        if self._windows and re.match(r"^/[a-z](/|$)", path):
+            path = path[1].upper() + ":" + (path[2:] or "/")
+        return _posix(os.path.realpath(path))
+
+    def _leaves(self, target: str, base: str, keep_last: bool) -> bool:
+        """A link on the way takes a path that reads as inside out of the
+        project. Not normalized first: `link/..` is the parent of where the
+        link points, not the project."""
+        path = self._joined(target, base)
+        head, tail = posixpath.split(path.rstrip("/"))
+        if keep_last and tail not in (".", ".."):
+            real = posixpath.join(self._real(head), tail)
+        else:
+            real = self._real(path)
+        return self._relation(real, on_disk=True) == "outside"
+
+    def _where(self, target: Value, removes_link: bool = False) -> str:
+        """'unknown', 'outside', 'cwd' (the project itself) or 'inside'.
+        `removes_link`: the command removes a link it is given, not what the
+        link points to, unless a slash or a glob goes through it. Measured on
+        GNU rm, Git Bash rm and Windows PowerShell Remove-Item."""
         if target is None:
             return "unknown"
+        keep_last = removes_link and not re.search(r"[*?\[]", target) and not target.endswith(("/", "\\"))
         if target.startswith("~") and not (target == "~" or target.startswith("~/")):
             return "outside"  # ~user
         glob = re.search(r"[*?\[]", target)
@@ -464,13 +497,20 @@ class _Judge:
             else:
                 path = self._absolute(target, base or self.cwd)
                 where = self._relation(path)
+                if where != "outside" and self._leaves(target, base or self.cwd, keep_last):
+                    where = "outside"
+                if any(path == m and not keep_last or path.startswith(m + "/") for m in self.made_links):
+                    self.flag("ask", "link.same_command", f"`{target}` goes through a link this command makes", "unknown")
             if order[where] > order[worst]:
                 worst = where
         return worst
 
-    def _relation(self, path: str) -> str:
+    def _relation(self, path: str, on_disk: bool = False) -> str:
         cwd = self.cwd
         scratch = [self._absolute(d, self.cwd) for d in self.rules.scratch_dirs]
+        if on_disk:
+            cwd = self._real(cwd)
+            scratch = [self._real(d) for d in scratch]
         if self._windows:
             path, cwd = path.lower(), cwd.lower()
             scratch = [d.lower() for d in scratch]
@@ -764,7 +804,7 @@ class _Judge:
         recursive = bool(flags & {"r", "R"}) or "--recursive" in args
         force = "f" in flags or "--force" in args
         for target in _operands(args):
-            where = self._where(target)
+            where = self._where(target, removes_link=True)
             if where == "unknown":
                 self.flag("deny" if (recursive or force) else "ask", "rm.runtime",
                           "`rm` target is known only at run time", "unknown")
@@ -773,6 +813,13 @@ class _Judge:
                           f"`rm` reaches outside the project: `{target}`", "outside")
             elif where == "cwd" and (recursive or force):
                 self.flag("ask", "rm.project_root", "`rm` removes the whole project directory", "project_root")
+
+    def _ln(self, name: str, args: list[Value], depth: int) -> None:
+        operands = _operands(args)
+        symbolic = "s" in _short_flags(args) or "--symbolic" in args
+        if symbolic and len(operands) >= 2 and operands[-1] is not None:
+            self.made_links.extend(self._absolute(operands[-1].rstrip("/") or "/", base or self.cwd)
+                                   for base in self.workdirs)
 
     def _find(self, name: str, args: list[Value], depth: int) -> None:
         roots: list[Value] = []
@@ -953,7 +1000,7 @@ class _Judge:
 
 
 _HANDLERS = {
-    "rm": _Judge._rm, "rmdir": _Judge._rm, "unlink": _Judge._rm,
+    "rm": _Judge._rm, "rmdir": _Judge._rm, "unlink": _Judge._rm, "ln": _Judge._ln,
     "find": _Judge._find, "dd": _Judge._dd, "truncate": _Judge._truncate,
     "chmod": _Judge._chmod, "chown": _Judge._chmod, "chgrp": _Judge._chmod,
     "sed": _Judge._sed, "cp": _Judge._cp_mv, "mv": _Judge._cp_mv, "git": _Judge._git,

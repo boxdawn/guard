@@ -414,7 +414,7 @@ class _PowerShell:
         else:
             self.run(code, depth + 1)
 
-    def _where(self, target: Value) -> str:
+    def _where(self, target: Value, removes_link: bool = False) -> str:
         t = _native_path(target)
         if t is None:
             return "unknown"
@@ -422,7 +422,7 @@ class _PowerShell:
             return "outside"
         if re.match(r"^[A-Za-z]:(?![\\/])", t) and len(t) > 2:
             return "unknown"  # C:file is relative to that drive's own current directory
-        return self.j._where(t)
+        return self.j._where(t, removes_link)
 
     def _writes(self, target: Value, what: str) -> None:
         j = self.j
@@ -447,7 +447,7 @@ class _PowerShell:
         j = self.j
         hard = b.get("recurse") is True or b.get("force") is True
         for t in self._targets(c, b, "path", "literalpath"):
-            where = self._where(t)
+            where = self._where(t, removes_link=True)
             if where == "unknown":
                 j.flag("deny" if hard else "ask", "rm.runtime",
                        f"`{raw}` target is known only at run time", "unknown")
@@ -506,12 +506,17 @@ class _PowerShell:
     def _new_item(self, c, b, raw, depth) -> None:
         """`New-Item -Force` replaces a file (or registry key) already there;
         a directory already there is kept."""
+        kind = (b.get("itemtype") or ["File"])[0]
+        names = b.get("name")
+        if kind is not None and kind.lower() in ("symboliclink", "junction"):
+            for p in self._targets(c, b, "path"):
+                t = _native_path(p if not names or p is None or names[0] is None else p.rstrip("/\\") + "/" + names[0])
+                if t is not None:
+                    self.j.made_links.extend(self.j._absolute(t, base or self.j.cwd) for base in self.j.workdirs)
         if b.get("force") is not True:
             return
-        kind = (b.get("itemtype") or ["File"])[0]
         if kind is not None and kind.lower() == "directory":
             return
-        names = b.get("name")
         for p in self._targets(c, b, "path") or ["."]:
             t = p
             if names:

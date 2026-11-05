@@ -40,7 +40,7 @@ Start a new Claude Code session after installing: a session that was already ope
 
 Covered today: `rm`, `find -delete`, `dd`, `truncate`, `chmod -R`, `sed -i`, redirects onto files outside the project, `git` (force push, `reset --hard`, `clean`, branch delete, history rewrite), database clients (`DROP`, `TRUNCATE`, `DELETE` without `WHERE`), `terraform destroy`, `kubectl delete`, `helm uninstall`, `aws s3 rm/rb` and other cloud deletes, `docker prune`, privilege escalation and code piped into an interpreter. The full list is the fixed rules in [`boxdawn_guard/command_rules_source.py`](boxdawn_guard/command_rules_source.py).
 
-**Links are not followed.** The guard judges a path as it is written. A symlink or Windows junction inside the project that points outside it counts as inside, so `rm -rf link/` gets no decision and deletes what the link points to.
+**Links are followed.** A symlink or Windows junction inside the project that points outside it counts as outside, so `rm -rf link/` is denied. Removing the link itself (`rm -rf link`) gets no decision, because what it points to stays. A path that goes through a link the same command makes with `ln -s` or `New-Item` asks, since that link is not on disk yet. Links are read when the command is checked: one made another way in the same command, or by a glob like `li*/sub`, is not seen.
 
 ## Secret files
 
