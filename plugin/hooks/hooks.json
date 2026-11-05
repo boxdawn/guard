@@ -27,6 +27,16 @@
             "onFailure": "block"
           }
         ]
+      },
+      {
+        "matcher": "Read|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DATA}/current/bdxguard.exe",
+            "args": []
+          }
+        ]
       }
     ]
   }

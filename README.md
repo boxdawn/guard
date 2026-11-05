@@ -36,9 +36,19 @@ Start a new Claude Code session after installing: a session that was already ope
 - **Reads the command the way the shell does.** Bash is parsed into a syntax tree (tree-sitter), so quoting, escapes, variables and `bash -c '…'` don't hide the real command. PowerShell is read by PowerShell's own parser on Windows.
 - **Knows where the target is.** Deleting a build folder inside your project is ordinary; the same command aimed at your home directory, a system path or a disk device is not.
 - **Unattended means stricter.** When nobody can answer a prompt (`bypassPermissions`, `dontAsk`), an `ask` becomes a `deny`.
-- **Fails closed.** If the guard itself cannot run, the command is blocked, not waved through.
+- **Fails closed.** If the guard itself cannot run, the command is blocked, not waved through. The check on the `Read` and `Grep` tools is the one exception: a broken guard does not stop a session from opening files.
 
 Covered today: `rm`, `find -delete`, `dd`, `truncate`, `chmod -R`, `sed -i`, redirects onto files outside the project, `git` (force push, `reset --hard`, `clean`, branch delete, history rewrite), database clients (`DROP`, `TRUNCATE`, `DELETE` without `WHERE`), `terraform destroy`, `kubectl delete`, `helm uninstall`, `aws s3 rm/rb` and other cloud deletes, `docker prune`, privilege escalation and code piped into an interpreter. The full list is the fixed rules in [`boxdawn_guard/command_rules_source.py`](boxdawn_guard/command_rules_source.py).
+
+## Secret files
+
+Reading a secret file by name asks; sending one out is denied. That covers `.env` files (not `.env.example` and the like), SSH private keys, `~/.aws/credentials`, `.netrc`, `.pypirc`, `.npmrc`, `.git-credentials`, Docker, Kubernetes and GitHub CLI credentials, Claude Code's own credentials file, and `.p12` and `.pfx` files, in Bash, PowerShell and the `Read` and `Grep` tools. Looking at the name (`ls`, `test -f`) gets no decision. The names are in [`boxdawn_guard/secret_files.py`](boxdawn_guard/secret_files.py).
+
+This is a check on file names, not a sandbox. What it does not see:
+
+- **A search that reaches the file without naming it.** `grep -r KEY .`, and the `Grep` tool with no path, read `.env` with no decision.
+- A path put together while the code runs.
+- A value already in an environment variable, or a secret in a file with an ordinary name.
 
 ## Rules
 
@@ -48,7 +58,7 @@ With a Boxdawn API key on a paid plan, set in the plugin's settings (`/plugin co
 
 ## Block record
 
-On a paid plan, each deny or ask judged on the signed rules is appended as one line to `log/blocks-YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/block_log.py`](boxdawn_guard/block_log.py)). A line holds the tool, the decision, the rule ids and where the target sits (inside the project, outside it, …), never the command or a path. Files older than 30 days are deleted at the next Bash or PowerShell call. At session start, right after the signed rules are fetched, the lines are sent to Boxdawn and then deleted from your machine ([`boxdawn_guard/block_send.py`](boxdawn_guard/block_send.py)); the request carries the key and those lines only. To keep the record on this machine instead, turn on `keep_blocks_local` in the plugin's settings. Without a key, or on the fixed rules, nothing is recorded or sent.
+On a paid plan, each deny or ask judged on the signed rules is appended as one line to `log/blocks-YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/block_log.py`](boxdawn_guard/block_log.py)). A line holds the tool, the decision, the rule ids and where the target sits (inside the project, outside it, …), never the command or a path. Files older than 30 days are deleted at the next Bash or PowerShell call. At session start, right after the signed rules are fetched, the lines are sent to Boxdawn and then deleted from your machine ([`boxdawn_guard/block_send.py`](boxdawn_guard/block_send.py)); the request carries the key and those lines only. To keep the record on this machine instead, turn on `keep_blocks_local` in the plugin's settings. Without a key, or on the fixed rules, nothing is recorded or sent. Decisions on the `Read` and `Grep` tools are not recorded.
 
 ## Tested
 
