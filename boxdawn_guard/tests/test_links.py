@@ -74,7 +74,48 @@ def test_powershell_delete_through_a_link_is_denied(repo, command):
 
 
 def test_powershell_removing_the_link_itself_leaves_the_target(repo):
-    assert powershell("Remove-Item link -Recurse -Force", repo) is None
+    assert powershell("Remove-Item link -Force", repo) is None
+
+
+def test_powershell_recurse_on_a_link_is_denied(repo):
+    assert powershell("Remove-Item link -Recurse -Force", repo) == "deny"
+
+
+@pytest.mark.parametrize("command", ["Remove-Item own -Recurse -Force -Include *.txt", "Remove-Item own\\* -Recurse -Force -Exclude zzz",
+                                     "ri own -r -fo -inc *.txt"])
+def test_powershell_filtered_recurse_asks_because_it_follows_links_below(repo, command):
+    link(repo / "own" / "nest", repo.parent / "home")
+    assert powershell(command, repo) == "ask"
+
+
+def test_powershell_filter_without_recurse_passes(repo):
+    assert powershell("Remove-Item own\\* -Force -Exclude zzz", repo) is None
+
+
+@pytest.mark.parametrize("command", ["cd li* && rm -rf sub", "cd l?nk && rm -f a.txt"])
+def test_cd_through_a_glob_is_unknown(repo, command):
+    assert bash(command, repo) in ("ask", "deny")
+
+
+def test_powershell_cd_through_a_glob_is_unknown(repo):
+    assert powershell("cd li*; Remove-Item sub -Recurse -Force", repo) == "deny"
+
+
+@pytest.mark.parametrize("command", ["rm -rf own/*/", "rm -rf own/n*/", "rm -rf own/n*/sub"])
+def test_glob_that_goes_into_a_link_is_denied(repo, command):
+    link(repo / "own" / "nest", repo.parent / "home")
+    assert bash(command, repo) == "deny"
+
+
+def test_glob_that_goes_into_folders_stays_inside(repo):
+    (repo / "own" / "plain").mkdir()
+    assert bash("rm -rf own/*/", repo) is None
+
+
+def test_link_back_to_the_project_is_the_project(repo):
+    link(repo / "back", repo)
+    assert bash("rm -rf back/", repo) == "ask"
+    assert bash("rm -rf back", repo) is None
 
 
 @pytest.mark.parametrize("command", ["Copy-Item x link\\y -Force", "Move-Item x link\\y -Force", "New-Item link\\y -Force"])

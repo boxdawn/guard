@@ -320,7 +320,7 @@ class _PowerShell:
                 dirs.append(j.home)
                 continue
             t = _native_path(targets[0])
-            if t is None or _provider(t):
+            if t is None or _provider(t) or re.search(r"[*?\[]", t):
                 dirs.append(None)
             else:
                 dirs += [j._absolute(t, j.cwd), j._absolute(t, dirs[-1] or j.cwd)]
@@ -449,9 +449,14 @@ class _PowerShell:
     def _remove_item(self, c, b, raw, depth) -> None:
         j = self.j
         hard = b.get("recurse") is True or b.get("force") is True
+        filtered = b.get("include") is not None or b.get("exclude") is not None
+        if filtered and b.get("recurse") is True:
+            # Measured on 5.1: this walks through any link below the path, not only one in it.
+            j.flag("ask", "rm.filtered_recurse", f"`{raw} -Recurse` with `-Include` or `-Exclude` follows links below the path", "unknown")
         for t in self._targets(c, b, "path", "literalpath"):
             # `-Include` and `-Exclude` delete what matches inside the link, not the link.
-            where = self._where(t, removes_link=b.get("include") is None and b.get("exclude") is None)
+            # `-Recurse` on a directory symlink is not measured (junctions only), so it is not trusted.
+            where = self._where(t, removes_link=not filtered and b.get("recurse") is not True)
             if where == "unknown":
                 j.flag("deny" if hard else "ask", "rm.runtime",
                        f"`{raw}` target is known only at run time", "unknown")

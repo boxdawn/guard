@@ -25,6 +25,8 @@ import os
 import posixpath
 import re
 from dataclasses import dataclass, field
+from glob import escape as glob_escape, iglob
+from itertools import islice
 from typing import Optional
 
 import tree_sitter_bash
@@ -111,7 +113,7 @@ RULE_IDS = frozenset({
     "git.reset_hard", "git.clean", "git.branch_delete", "git.rewrite_history",
     "db.destructive", "db.runtime", "db.file",
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
-    "docker.prune", "secret.read", "secret.send", "link.same_command",
+    "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -439,7 +441,7 @@ class _Judge:
                     self.workdirs.append(self.home)
                 else:
                     target = args[-1]
-                    if target is None:
+                    if target is None or re.search(r"[*?\[]", target):
                         self.workdirs.append(None)
                     else:
                         self.workdirs += [self._absolute(target, self.cwd),
@@ -474,21 +476,25 @@ class _Judge:
         while "/../" in path:  # realpath on Windows drops `x/..` before it looks at x; a shell goes through x
             head, _, tail = path.partition("/../")
             path = posixpath.join(posixpath.dirname(self._real(head)), tail)
-        if self._windows and re.match(r"^/[a-z](/|$)", path):
-            path = path[1].upper() + ":" + (path[2:] or "/")
-        return _posix(os.path.realpath(path).replace(os.sep, "/"))
+        return _posix(os.path.realpath(self._native(path)).replace(os.sep, "/"))
 
-    def _leaves(self, target: str, base: str, keep_last: bool) -> bool:
-        """A link on the way takes a path that reads as inside out of the
-        project. Not normalized first: `link/..` is the parent of where the
-        link points, not the project."""
+    def _native(self, path: str) -> str:
+        if self._windows and re.match(r"^/[a-zA-Z](/|$)", path):
+            return path[1].upper() + ":" + (path[2:] or "/")
+        return path
+
+    def _lands(self, target: str, base: str, keep_last: bool) -> str:
+        """Where the path is once links are followed: a link on the way can
+        take a path that reads as inside out of the project, or back to the
+        project itself. Not normalized first: `link/..` is the parent of where
+        the link points, not the project."""
         path = self._joined(target, base)
         head, tail = posixpath.split(path.rstrip("/"))
         if keep_last and tail not in (".", ".."):
             real = posixpath.join(self._real(head), tail)
         else:
             real = self._real(path)
-        return self._relation(real, on_disk=True) == "outside"
+        return self._relation(real, on_disk=True)
 
     def _where(self, target: Value, removes_link: bool = False) -> str:
         """'unknown', 'outside', 'cwd' (the project itself) or 'inside'.
@@ -503,7 +509,10 @@ class _Judge:
         if target.startswith("~") and not (target == "~" or target.startswith("~/")):
             return "outside"  # ~user
         glob = re.search(r"[*?\[]", target)
+        through_glob = None
         if glob:
+            if "/" in target[glob.start():]:
+                through_glob = target  # `own/*/` goes into what matches, so a matching link counts
             prefix = target[:glob.start()]
             target = prefix[: prefix.rfind("/") + 1] if "/" in prefix else ""
             target = target or "."
@@ -516,8 +525,15 @@ class _Judge:
             else:
                 path = self._absolute(target, base or self.cwd)
                 where = self._relation(path)
-                if where != "outside" and self._leaves(target, base or self.cwd, keep_last):
-                    where = "outside"
+                if where != "outside":
+                    lands = self._lands(target, base or self.cwd, keep_last)
+                    if order[lands] > order[where]:
+                        where = lands
+                if where != "outside" and through_glob:
+                    pattern = self._native(self._joined(through_glob, glob_escape(base or self.cwd)))
+                    if any(self._lands(m, base or self.cwd, False) == "outside"
+                           for m in islice(iglob(pattern), 1000)):
+                        where = "outside"
                 folded = self._fold(path)
                 if any(folded == self._fold(m) and not keep_last or folded.startswith(self._fold(m) + "/")
                        for m in self.made_links):
