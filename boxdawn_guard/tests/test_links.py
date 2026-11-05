@@ -36,7 +36,10 @@ def bash(command, repo):
 
 
 def powershell(command, repo):
-    return evaluate_powershell(command, cwd=str(repo), home=str(repo.parent / "nobody"), rules=RULES).decision
+    verdict = evaluate_powershell(command, cwd=str(repo), home=str(repo.parent / "nobody"), rules=RULES)
+    if verdict is None:
+        pytest.skip("no PowerShell parser on this machine")
+    return verdict.decision
 
 
 @pytest.mark.parametrize("command", ["rm -rf link/", "rm -rf link/sub", "rm -rf link/*", "cd link && rm -rf sub",
