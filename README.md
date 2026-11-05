@@ -40,6 +40,8 @@ Start a new Claude Code session after installing: a session that was already ope
 
 Covered today: `rm`, `find -delete`, `dd`, `truncate`, `chmod -R`, `sed -i`, redirects onto files outside the project, `git` (force push, `reset --hard`, `clean`, branch delete, history rewrite), database clients (`DROP`, `TRUNCATE`, `DELETE` without `WHERE`), `terraform destroy`, `kubectl delete`, `helm uninstall`, `aws s3 rm/rb` and other cloud deletes, `docker prune`, privilege escalation and code piped into an interpreter. The full list is the fixed rules in [`boxdawn_guard/command_rules_source.py`](boxdawn_guard/command_rules_source.py).
 
+**Links are not followed.** The guard judges a path as it is written. A symlink or Windows junction inside the project that points outside it counts as inside, so `rm -rf link/` gets no decision and deletes what the link points to.
+
 ## Secret files
 
 Reading a secret file by name asks; sending one out is denied. That covers `.env` files (not `.env.example` and the like), SSH private keys, `~/.aws/credentials`, `.netrc`, `.pypirc`, `.npmrc`, `.git-credentials`, Docker, Kubernetes and GitHub CLI credentials, Claude Code's own credentials file, and `.p12` and `.pfx` files, in Bash, PowerShell and the `Read` and `Grep` tools. Looking at the name (`ls`, `test -f`) gets no decision. The names are in [`boxdawn_guard/secret_files.py`](boxdawn_guard/secret_files.py).
