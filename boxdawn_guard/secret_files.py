@@ -37,13 +37,19 @@ SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
 ))
 
 
-def search_excludes(root: str) -> tuple[str, ...]:
+def search_excludes(*roots: str) -> tuple[str, ...]:
     """A ripgrep glob is matched from the folder it starts in, so `**/.kube/config`
     misses `config` when the search starts in `.kube`."""
-    root = root.replace("\\", "/").lower().rstrip("/")
+    roots = tuple(r.replace("\\", "/").lower().rstrip("/") for r in roots)
     here = tuple("!" + _any_case(e.rsplit("/", 1)[1]) for e in _ENDINGS
-                 if root.endswith("/" + e.rsplit("/", 1)[0]))
+                 if any(r.endswith("/" + e.rsplit("/", 1)[0]) for r in roots))
     return SEARCH_EXCLUDES + here
+
+
+def secret_folder(root: str) -> Optional[str]:
+    """The `.ssh` or `.aws` this folder is, or is under."""
+    parts = root.replace("\\", "/").rstrip("/").split("/")
+    return next(("/".join(parts[:i + 1]) for i, p in enumerate(parts) if p.lower() in _DIRS), None)
 
 
 # What a pattern is tried against.

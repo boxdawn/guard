@@ -48,7 +48,7 @@ Reading a secret file by name asks; sending one out is denied. That covers `.env
 
 This is a check on file names, not a sandbox. What it does not see:
 
-- **A shell search that reaches the file without naming it.** `grep -r KEY .` reads `.env` with no decision. The `Grep` tool is different: a search over a folder leaves these names out, in any case, and a search that starts in `.ssh` or `.aws` asks. `.env.example` and the like are left out with them, and so is what is under a folder named like `.env.d`. Claude Code has that tool by default on Windows. On macOS, Linux and WSL it searches with `grep` unless the tool is turned on.
+- **A shell search that reaches the file without naming it.** `grep -r KEY .` reads `.env` with no decision. The `Grep` tool is different: a search over a folder leaves these names out, in any case, and a search that starts in or under `.ssh` or `.aws` asks. More than the secrets is left out: `.env.example`, `id_rsa.pub`, all of a `.ssh` folder, what is under a folder named like `.env.d`, and every `config` when the search starts in `.kube`. Claude Code has that tool by default on Windows. On macOS, Linux and WSL it searches with `grep` unless the tool is turned on.
 - A path put together while the code runs.
 - A value already in an environment variable, or a secret in a file with an ordinary name.
 

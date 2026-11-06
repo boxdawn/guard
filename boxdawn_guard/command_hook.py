@@ -36,11 +36,16 @@ def _globs(pattern: str) -> list[str]:
     return [m.group(1) + part + m.group(3) for part in m.group(2).split(",")] if m else [pattern]
 
 
-def _search_root(tool_input: dict, cwd: str | None) -> str:
-    """Where a `Grep` really starts. Claude Code resolves links, so the guard does too."""
+def _search_roots(tool_input: dict, cwd: str | None) -> tuple[str, ...]:
+    """Where a `Grep` starts, as written and on disk: which of the two Claude Code
+    searches from differs by system. A network path stays text: looking it up
+    contacts the host, and this runs before the person is asked."""
     path = tool_input.get("path")
     path = os.path.expanduser(path) if isinstance(path, str) and path else "."
-    return os.path.realpath(os.path.join(cwd or "", path))
+    written = os.path.abspath(os.path.join(cwd or "", path))
+    if written.replace("\\", "/").startswith(("//", "/net/")):
+        return (written,)
+    return written, os.path.realpath(written)
 
 
 def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dict | None:
@@ -48,11 +53,13 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     such search would be too many. No decision: the normal permission flow stays."""
     if tool != "Grep":
         return None
-    root = _search_root(tool_input, cwd)
-    if os.path.isfile(root):
+    roots = _search_roots(tool_input, cwd)
+    if len(roots) > 1 and os.path.isfile(roots[-1]):
         return None
     glob = tool_input.get("glob")
-    excludes = " ".join(secret_files.search_excludes(root))
+    excludes = " ".join(secret_files.search_excludes(*roots))
+    if isinstance(glob, str) and excludes in glob:  # sent back as we changed it
+        return None
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": {**tool_input, "glob": f"{glob} {excludes}" if isinstance(glob, str) and glob else excludes},
@@ -67,10 +74,12 @@ def decide(payload: dict) -> dict | None:
     if tool in _FILE_TOOLS:
         paths = [tool_input.get(k) for k in _FILE_TOOLS[tool]]
         paths = [g for p in paths if isinstance(p, str) for g in _globs(p)]
-        if tool == "Grep":  # `.ssh` as the session folder, or a link to it, names nothing
-            paths.append(_search_root(tool_input, payload.get("cwd")))
+        if tool == "Grep" and not any(secret_files.is_secret(p, glob_matches_dots=True) for p in paths):
+            # `.ssh` as the session folder, a folder under it, or a link to it names nothing
+            found = map(secret_files.secret_folder, _search_roots(tool_input, payload.get("cwd")))
+            paths += [f for f in found if f][:1]
         if not paths:
-            return None
+            return _search_without_secrets(tool, tool_input, payload.get("cwd"))
     elif tool not in ("Bash", "PowerShell"):
         return None
     elif not isinstance(tool_input.get("command"), str):

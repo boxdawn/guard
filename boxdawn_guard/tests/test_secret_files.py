@@ -370,7 +370,43 @@ def test_a_search_that_starts_in_the_folder_of_a_secret_file_leaves_it_out(root,
     assert excluded(name, secret_files.search_excludes(root))
 
 
-@pytest.mark.parametrize("cwd, path", [("/home/me/.ssh", None), ("/home/me/.aws", None), ("/work/proj", "/home/me/.ssh")])
+def test_a_link_named_like_a_secret_folder_leaves_its_file_out(monkeypatch):
+    monkeypatch.setattr(command_hook.os.path, "realpath", lambda p: "/home/me/dotfiles/kube")
+    out = command_hook.decide(payload("Grep", pattern="KEY", path="/home/me/.kube"))["hookSpecificOutput"]
+    assert excluded("config", tuple(out["updatedInput"]["glob"].split(" ")))
+
+
+@pytest.mark.parametrize("path", ["\\\\192.0.2.1\\share\\x", "//192.0.2.1/share/x", "\\\\?\\UNC\\192.0.2.1\\share"])
+def test_a_network_path_is_never_looked_up(monkeypatch, path):
+    if os.name != "nt":
+        pytest.skip("a backslash path is a plain name here")
+    def touched(*_):
+        raise AssertionError("the guard reached for the host")
+    monkeypatch.setattr(command_hook.os.path, "realpath", touched)
+    monkeypatch.setattr(command_hook.os.path, "isfile", touched)
+    assert "updatedInput" in command_hook.decide(payload("Grep", pattern="KEY", path=path))["hookSpecificOutput"]
+
+
+def test_a_search_sent_back_as_changed_is_not_changed_again():
+    changed = command_hook.decide(payload("Grep", pattern="KEY"))["hookSpecificOutput"]["updatedInput"]
+    assert command_hook.decide(payload("Grep", **changed)) is None
+
+
+@pytest.mark.parametrize("cwd", ["/work/.env.d", "/work/x.pfx", "/work/id_rsa.d", "/work/.npmrc"])
+def test_a_session_folder_named_like_a_secret_file_still_searches(cwd):
+    out = command_hook.decide({**payload("Grep", pattern="KEY"), "cwd": cwd})["hookSpecificOutput"]
+    assert "updatedInput" in out and "permissionDecision" not in out
+
+
+def test_a_search_named_by_its_path_gives_one_reason():
+    out = command_hook.decide(payload("Grep", pattern="KEY", path="/home/me/.ssh"))["hookSpecificOutput"]
+    assert out["permissionDecisionReason"].count("reads the secret file") == 1
+
+
+@pytest.mark.parametrize("cwd, path", [
+    ("/home/me/.ssh", None), ("/home/me/.aws", None), ("/work/proj", "/home/me/.ssh"),
+    ("/work/proj", "/home/me/.ssh/sub/deep"), ("/work/proj", "/home/me/.aws/sub"), ("/home/me/.ssh/project", None),
+])
 def test_a_search_of_a_secret_folder_asks(cwd, path):
     p = {**(payload("Grep", pattern="KEY", path=path) if path else payload("Grep", pattern="KEY")), "cwd": cwd}
     assert decision(command_hook.decide(p)) == "ask"
