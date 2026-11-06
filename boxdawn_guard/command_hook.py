@@ -3,7 +3,8 @@
 
 Reads the hook input on stdin and prints a decision for Bash and PowerShell calls:
 `deny` or `ask` with a reason, or nothing (the normal permission flow).
-Never `allow`. Register it with `"onFailure": "block"` (Claude Code
+Never `allow`. A `Grep` over a folder gets no decision either: its input comes
+back with the secret files left out. Register it with `"onFailure": "block"` (Claude Code
 v2.1.295+): a command hook that times out does not block by default.
 
 Rules: the signed server bundle stored by `fetch-rules` when it is there
@@ -18,7 +19,7 @@ import os
 import re
 import sys
 
-from boxdawn_guard import block_log
+from boxdawn_guard import block_log, secret_files
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -35,12 +36,39 @@ def _globs(pattern: str) -> list[str]:
     return [m.group(1) + part + m.group(3) for part in m.group(2).split(",")] if m else [pattern]
 
 
+def _search_root(tool_input: dict, cwd: str | None) -> str:
+    """Where a `Grep` really starts. Claude Code resolves links, so the guard does too."""
+    path = tool_input.get("path")
+    path = os.path.expanduser(path) if isinstance(path, str) and path else "."
+    return os.path.realpath(os.path.join(cwd or "", path))
+
+
+def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dict | None:
+    """`Grep` over a folder reads `.env` without naming it, and a window on every
+    such search would be too many. No decision: the normal permission flow stays."""
+    if tool != "Grep":
+        return None
+    root = _search_root(tool_input, cwd)
+    if os.path.isfile(root):
+        return None
+    glob = tool_input.get("glob")
+    excludes = " ".join(secret_files.search_excludes(root))
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "updatedInput": {**tool_input, "glob": f"{glob} {excludes}" if isinstance(glob, str) and glob else excludes},
+        "additionalContext": "Boxdawn guard keeps secret files such as .env out of folder searches, "
+                             "so a file may be missing here. Give a file's path to search it.",
+    }}
+
+
 def decide(payload: dict) -> dict | None:
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
     if tool in _FILE_TOOLS:
         paths = [tool_input.get(k) for k in _FILE_TOOLS[tool]]
         paths = [g for p in paths if isinstance(p, str) for g in _globs(p)]
+        if tool == "Grep":  # `.ssh` as the session folder, or a link to it, names nothing
+            paths.append(_search_root(tool_input, payload.get("cwd")))
         if not paths:
             return None
     elif tool not in ("Bash", "PowerShell"):
@@ -64,7 +92,7 @@ def decide(payload: dict) -> dict | None:
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
             tool_input["command"], known_env=known_env, **where)
     if verdict is None or verdict.decision is None:
-        return None
+        return _search_without_secrets(tool, tool_input, payload.get("cwd"))
     if bundle_exp is not None:
         block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
     return {"hookSpecificOutput": {

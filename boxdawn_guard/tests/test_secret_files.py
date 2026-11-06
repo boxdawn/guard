@@ -3,6 +3,7 @@ gets no decision. The attack rows were written before the rules, from the bypass
 shapes other guards have published; the ordinary rows come from real sessions."""
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import os
@@ -302,14 +303,82 @@ def test_file_tools_ask_on_a_secret_file(p):
 @pytest.mark.parametrize("p", [
     payload("Read", file_path="/work/proj/README.md"),
     payload("Read", file_path="/work/proj/.env.example"),
-    payload("Grep", pattern="KEY", path="/work/proj/src"),
-    payload("Grep", pattern=".env"),
     payload("Read"),
     payload("Write", file_path="/work/proj/.env"),
     payload("Edit", file_path="/work/proj/.env"),
 ])
 def test_file_tools_get_no_decision_otherwise(p):
     assert command_hook.decide(p) is None
+
+
+@pytest.mark.parametrize("p", [
+    payload("Grep", pattern="KEY"),
+    payload("Grep", pattern=".env"),
+    payload("Grep", pattern="KEY", path="/work/proj/src"),
+    payload("Grep", pattern="KEY", glob="*.ts"),
+    payload("Grep", pattern="KEY", path="src", glob="*.{ts,tsx}", output_mode="content", type="ts"),
+])
+def test_a_search_over_a_folder_leaves_the_secret_files_out(p):
+    out = command_hook.decide(p)["hookSpecificOutput"]
+    assert "permissionDecision" not in out  # the normal permission flow stays
+    changed = out["updatedInput"]
+    assert {k: v for k, v in changed.items() if k != "glob"} == {k: v for k, v in p["tool_input"].items() if k != "glob"}
+    words = changed["glob"].split(" ")
+    assert words[-len(secret_files.SEARCH_EXCLUDES):] == list(secret_files.SEARCH_EXCLUDES)
+    assert " ".join(words[:-len(secret_files.SEARCH_EXCLUDES)]) == p["tool_input"].get("glob", "")
+    assert ".env" in out["additionalContext"]
+
+
+def test_a_search_of_one_file_is_left_alone(tmp_path):
+    (tmp_path / "notes.txt").write_text("x")
+    p = {**payload("Grep", pattern="KEY", path="notes.txt"), "cwd": str(tmp_path)}
+    assert command_hook.decide(p) is None
+
+
+def excluded(name, excludes=secret_files.SEARCH_EXCLUDES):
+    """Each folder on the way counts too: ripgrep skips what is under an excluded folder."""
+    parts = name.split("/")
+    tries = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    return any(fnmatch.fnmatchcase(t, g[1:]) or fnmatch.fnmatchcase(t.rsplit("/", 1)[-1], g[1:])
+               for t in tries for g in excludes)
+
+
+@pytest.mark.parametrize("name", [
+    ".env", ".env.local", ".netrc", "_netrc", ".pypirc", ".npmrc", ".git-credentials", "id_rsa", "id_ed25519",
+    "id_ecdsa", "id_dsa", "x.p12", "x.pfx", "sub/.env", "home/.ssh/deploy", "home/.aws/credentials",
+    "home/.docker/config.json", "home/.kube/config", "home/.config/gh/hosts.yml", "home/.claude/.credentials.json",
+])
+def test_every_secret_name_has_an_exclude(name):
+    assert secret_files.is_secret(name)
+    assert excluded(name)
+    assert excluded(name.upper())
+
+
+@pytest.mark.parametrize("name", ["id_rsa_helper.py", "tools/id_dsa_parser.c", ".envrc", "infra/.aws/policy.json", "a.ts"])
+def test_an_ordinary_file_is_not_excluded(name):
+    assert not excluded(name)
+
+
+@pytest.mark.parametrize("root, name", [
+    ("/home/me/.kube", "config"),
+    ("/home/me/.docker", "config.json"),
+    ("/home/me/.config/gh", "hosts.yml"),
+    ("/home/me/.claude", ".credentials.json"),
+])
+def test_a_search_that_starts_in_the_folder_of_a_secret_file_leaves_it_out(root, name):
+    assert not excluded(name)
+    assert excluded(name, secret_files.search_excludes(root))
+
+
+@pytest.mark.parametrize("cwd, path", [("/home/me/.ssh", None), ("/home/me/.aws", None), ("/work/proj", "/home/me/.ssh")])
+def test_a_search_of_a_secret_folder_asks(cwd, path):
+    p = {**(payload("Grep", pattern="KEY", path=path) if path else payload("Grep", pattern="KEY")), "cwd": cwd}
+    assert decision(command_hook.decide(p)) == "ask"
+
+
+def test_a_search_through_a_link_to_a_secret_folder_asks(monkeypatch):
+    monkeypatch.setattr(command_hook.os.path, "realpath", lambda p: "/home/me/.aws")
+    assert decision(command_hook.decide(payload("Grep", pattern="KEY", path="link"))) == "ask"
 
 
 def test_a_broken_guard_does_not_stop_file_tools(monkeypatch, capsys):
