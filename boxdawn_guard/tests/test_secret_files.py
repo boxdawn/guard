@@ -387,6 +387,41 @@ def test_a_network_path_is_never_looked_up(monkeypatch, path):
     assert "updatedInput" in command_hook.decide(payload("Grep", pattern="KEY", path=path))["hookSpecificOutput"]
 
 
+@pytest.mark.parametrize("inp, cwd", [
+    ({"path": "/home/me/.aws/sub/.ssh/.."}, CWD),
+    ({"path": "/home/me/.ssh/sub/deep/.ssh/.."}, CWD),
+    ({"path": "/home/me/.aws/sub/x.pfx::/.."}, CWD),
+    ({"path": ".ssh/.."}, "/home/me/.aws/sub"),
+    ({"glob": "{*,.ssh/..}"}, "/home/me/.aws/sub"),
+    ({"path": " .env"}, CWD),
+    ({"path": ".env "}, CWD),
+])
+def test_a_path_that_only_looks_secret_does_not_hide_the_folder(inp, cwd):
+    assert decision(command_hook.decide({**payload("Grep", pattern="KEY", **inp), "cwd": cwd})) == "ask"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path forms")
+@pytest.mark.parametrize("path", ["\\\\?\\C:\\p\\jssh", "\\\\.\\C:\\p\\jssh", "/c/p/jssh", " C:\\p\\jssh"])
+def test_a_local_path_in_another_form_is_still_followed(monkeypatch, path):
+    monkeypatch.setattr(command_hook.os.path, "realpath", lambda p: "C:/home/me/.ssh")
+    assert decision(command_hook.decide(payload("Grep", pattern="KEY", path=path))) == "ask"
+
+
+@pytest.mark.parametrize("tail", [" .env", ",.env", " **"])
+def test_a_glob_cannot_hide_behind_the_excludes(tail):
+    glob = " ".join(secret_files.SEARCH_EXCLUDES) + tail
+    out = command_hook.decide(payload("Grep", pattern="KEY", glob=glob))["hookSpecificOutput"]
+    assert out["updatedInput"]["glob"].endswith(" ".join(secret_files.SEARCH_EXCLUDES))
+
+
+@pytest.mark.parametrize("name", ["config", "known_hosts"])
+def test_one_ordinary_file_in_a_secret_folder_gets_no_decision(tmp_path, name):
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / name).write_text("x")
+    p = {**payload("Grep", pattern="KEY", path=f".ssh/{name}"), "cwd": str(tmp_path)}
+    assert command_hook.decide(p) is None
+
+
 def test_a_search_sent_back_as_changed_is_not_changed_again():
     changed = command_hook.decide(payload("Grep", pattern="KEY"))["hookSpecificOutput"]["updatedInput"]
     assert command_hook.decide(payload("Grep", **changed)) is None

@@ -41,11 +41,29 @@ def _search_roots(tool_input: dict, cwd: str | None) -> tuple[str, ...]:
     searches from differs by system. A network path stays text: looking it up
     contacts the host, and this runs before the person is asked."""
     path = tool_input.get("path")
-    path = os.path.expanduser(path) if isinstance(path, str) and path else "."
-    written = os.path.abspath(os.path.join(cwd or "", path))
+    path = path.strip() if isinstance(path, str) else ""  # as Claude Code reads it
+    path = os.path.expanduser(path) if path else "."
+    if os.name == "nt":
+        path = re.sub(r"^/([a-zA-Z])(?=/|$)", r"\1:", path)
+    written = re.sub(r"^[\\/]{2}[?.][\\/](?=[a-zA-Z]:)", "", os.path.abspath(os.path.join(cwd or "", path)))
     if written.replace("\\", "/").startswith(("//", "/net/")):
         return (written,)
     return written, os.path.realpath(written)
+
+
+def _one_file(roots: tuple[str, ...]) -> bool:
+    return len(roots) > 1 and os.path.isfile(roots[-1])
+
+
+def _with_secret_folder(paths: list[str], tool_input: dict, cwd: str | None) -> list[str]:
+    """`.ssh` as the session folder, a folder under it, or a link to it names nothing.
+    The folder takes the place of the path that led there: one reason, not two."""
+    roots = _search_roots(tool_input, cwd)
+    found = None if _one_file(roots) else next(filter(None, map(secret_files.secret_folder, roots)), None)
+    if found is None:
+        return paths
+    path = tool_input.get("path")
+    return [p for p in paths if not isinstance(path, str) or p != path.strip()] + [found]
 
 
 def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dict | None:
@@ -54,11 +72,11 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     if tool != "Grep":
         return None
     roots = _search_roots(tool_input, cwd)
-    if len(roots) > 1 and os.path.isfile(roots[-1]):
+    if _one_file(roots):
         return None
     glob = tool_input.get("glob")
     excludes = " ".join(secret_files.search_excludes(*roots))
-    if isinstance(glob, str) and excludes in glob:  # sent back as we changed it
+    if isinstance(glob, str) and glob.endswith(excludes):  # sent back as we changed it; the last glob wins
         return None
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -73,11 +91,9 @@ def decide(payload: dict) -> dict | None:
     tool_input = payload.get("tool_input") or {}
     if tool in _FILE_TOOLS:
         paths = [tool_input.get(k) for k in _FILE_TOOLS[tool]]
-        paths = [g for p in paths if isinstance(p, str) for g in _globs(p)]
-        if tool == "Grep" and not any(secret_files.is_secret(p, glob_matches_dots=True) for p in paths):
-            # `.ssh` as the session folder, a folder under it, or a link to it names nothing
-            found = map(secret_files.secret_folder, _search_roots(tool_input, payload.get("cwd")))
-            paths += [f for f in found if f][:1]
+        paths = [g for p in paths if isinstance(p, str) for g in _globs(p.strip())]
+        if tool == "Grep":
+            paths = _with_secret_folder(paths, tool_input, payload.get("cwd"))
         if not paths:
             return _search_without_secrets(tool, tool_input, payload.get("cwd"))
     elif tool not in ("Bash", "PowerShell"):
