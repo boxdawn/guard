@@ -5,7 +5,7 @@ fields a guard expects, so a new field there would make every guard already
 installed refuse the bundle and lose the org's own rules.
 
 By name only. This is not a sandbox: a path built at run time, a recursive
-search, or a secret in a file with an ordinary name is not seen.
+shell search, or a secret in a file with an ordinary name is not seen.
 """
 from __future__ import annotations
 
@@ -22,6 +22,36 @@ _ENV_EXAMPLES = (".example", ".sample", ".template", ".dist")
 _SSH_NOT_SECRET = frozenset({"config", "authorized_keys"})
 _PRIVATE_KEY = re.compile(r"id_(rsa|ed25519|ecdsa|dsa)(\..+)?")
 _KEY_STORES = (".p12", ".pfx")
+
+
+def _any_case(glob: str) -> str:
+    """`is_secret` ignores case and a ripgrep glob does not: `.PFX` is common on Windows."""
+    return re.sub(r"[a-z]", lambda m: f"[{m[0]}{m[0].upper()}]", glob)
+
+
+# What a search leaves out when it was not told to read one of these. Wider than
+# `is_secret`: ripgrep has no way to take `.env.example` back out of `.env.*`.
+SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
+    ".env", ".env.*", *sorted(_NAMES), *(k + e for k in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa") for e in ("", ".*")),
+    *("*" + e for e in _KEY_STORES), ".ssh", *(f"**/{e}" for e in _ENDINGS),
+))
+
+
+def search_excludes(*roots: str) -> tuple[str, ...]:
+    """A ripgrep glob is matched from the folder it starts in, so `**/.kube/config`
+    misses `config` when the search starts in `.kube`."""
+    roots = tuple(r.replace("\\", "/").lower().rstrip("/") for r in roots)
+    here = tuple("!" + _any_case(e.rsplit("/", 1)[1]) for e in _ENDINGS
+                 if any(r.endswith("/" + e.rsplit("/", 1)[0]) for r in roots))
+    return SEARCH_EXCLUDES + here
+
+
+def secret_folder(root: str) -> Optional[str]:
+    """The `.ssh` or `.aws` this folder is, or is under."""
+    parts = root.replace("\\", "/").rstrip("/").split("/")
+    return next(("/".join(parts[:i + 1]) for i, p in enumerate(parts) if p.lower() in _DIRS), None)
+
+
 # What a pattern is tried against.
 _GLOB_TRIES = (".env", ".env.local", ".netrc", ".pypirc", ".npmrc", ".git-credentials", "_netrc",
                "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "credentials", "config", "config.json",

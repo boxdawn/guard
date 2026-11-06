@@ -3,6 +3,7 @@ gets no decision. The attack rows were written before the rules, from the bypass
 shapes other guards have published; the ordinary rows come from real sessions."""
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import os
@@ -302,14 +303,153 @@ def test_file_tools_ask_on_a_secret_file(p):
 @pytest.mark.parametrize("p", [
     payload("Read", file_path="/work/proj/README.md"),
     payload("Read", file_path="/work/proj/.env.example"),
-    payload("Grep", pattern="KEY", path="/work/proj/src"),
-    payload("Grep", pattern=".env"),
     payload("Read"),
     payload("Write", file_path="/work/proj/.env"),
     payload("Edit", file_path="/work/proj/.env"),
 ])
 def test_file_tools_get_no_decision_otherwise(p):
     assert command_hook.decide(p) is None
+
+
+@pytest.mark.parametrize("p", [
+    payload("Grep", pattern="KEY"),
+    payload("Grep", pattern=".env"),
+    payload("Grep", pattern="KEY", path="/work/proj/src"),
+    payload("Grep", pattern="KEY", glob="*.ts"),
+    payload("Grep", pattern="KEY", path="src", glob="*.{ts,tsx}", output_mode="content", type="ts"),
+])
+def test_a_search_over_a_folder_leaves_the_secret_files_out(p):
+    out = command_hook.decide(p)["hookSpecificOutput"]
+    assert "permissionDecision" not in out  # the normal permission flow stays
+    changed = out["updatedInput"]
+    assert {k: v for k, v in changed.items() if k != "glob"} == {k: v for k, v in p["tool_input"].items() if k != "glob"}
+    words = changed["glob"].split(" ")
+    assert words[-len(secret_files.SEARCH_EXCLUDES):] == list(secret_files.SEARCH_EXCLUDES)
+    assert " ".join(words[:-len(secret_files.SEARCH_EXCLUDES)]) == p["tool_input"].get("glob", "")
+    assert ".env" in out["additionalContext"]
+
+
+def test_a_search_of_one_file_is_left_alone(tmp_path):
+    (tmp_path / "notes.txt").write_text("x")
+    p = {**payload("Grep", pattern="KEY", path="notes.txt"), "cwd": str(tmp_path)}
+    assert command_hook.decide(p) is None
+
+
+def excluded(name, excludes=secret_files.SEARCH_EXCLUDES):
+    """Each folder on the way counts too: ripgrep skips what is under an excluded folder."""
+    parts = name.split("/")
+    tries = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    return any(fnmatch.fnmatchcase(t, g[1:]) or fnmatch.fnmatchcase(t.rsplit("/", 1)[-1], g[1:])
+               for t in tries for g in excludes)
+
+
+@pytest.mark.parametrize("name", [
+    ".env", ".env.local", ".netrc", "_netrc", ".pypirc", ".npmrc", ".git-credentials", "id_rsa", "id_ed25519",
+    "id_ecdsa", "id_dsa", "x.p12", "x.pfx", "sub/.env", "home/.ssh/deploy", "home/.aws/credentials",
+    "home/.docker/config.json", "home/.kube/config", "home/.config/gh/hosts.yml", "home/.claude/.credentials.json",
+])
+def test_every_secret_name_has_an_exclude(name):
+    assert secret_files.is_secret(name)
+    assert excluded(name)
+    assert excluded(name.upper())
+
+
+@pytest.mark.parametrize("name", ["id_rsa_helper.py", "tools/id_dsa_parser.c", ".envrc", "infra/.aws/policy.json", "a.ts"])
+def test_an_ordinary_file_is_not_excluded(name):
+    assert not excluded(name)
+
+
+@pytest.mark.parametrize("root, name", [
+    ("/home/me/.kube", "config"),
+    ("/home/me/.docker", "config.json"),
+    ("/home/me/.config/gh", "hosts.yml"),
+    ("/home/me/.claude", ".credentials.json"),
+])
+def test_a_search_that_starts_in_the_folder_of_a_secret_file_leaves_it_out(root, name):
+    assert not excluded(name)
+    assert excluded(name, secret_files.search_excludes(root))
+
+
+def test_a_link_named_like_a_secret_folder_leaves_its_file_out(monkeypatch):
+    monkeypatch.setattr(command_hook.os.path, "realpath", lambda p: "/home/me/dotfiles/kube")
+    out = command_hook.decide(payload("Grep", pattern="KEY", path="/home/me/.kube"))["hookSpecificOutput"]
+    assert excluded("config", tuple(out["updatedInput"]["glob"].split(" ")))
+
+
+@pytest.mark.parametrize("path", ["\\\\192.0.2.1\\share\\x", "//192.0.2.1/share/x", "\\\\?\\UNC\\192.0.2.1\\share"])
+def test_a_network_path_is_never_looked_up(monkeypatch, path):
+    if os.name != "nt":
+        pytest.skip("a backslash path is a plain name here")
+    def touched(*_):
+        raise AssertionError("the guard reached for the host")
+    monkeypatch.setattr(command_hook.os.path, "realpath", touched)
+    monkeypatch.setattr(command_hook.os.path, "isfile", touched)
+    assert "updatedInput" in command_hook.decide(payload("Grep", pattern="KEY", path=path))["hookSpecificOutput"]
+
+
+@pytest.mark.parametrize("inp, cwd", [
+    ({"path": "/home/me/.aws/sub/.ssh/.."}, CWD),
+    ({"path": "/home/me/.ssh/sub/deep/.ssh/.."}, CWD),
+    ({"path": "/home/me/.aws/sub/x.pfx::/.."}, CWD),
+    ({"path": ".ssh/.."}, "/home/me/.aws/sub"),
+    ({"glob": "{*,.ssh/..}"}, "/home/me/.aws/sub"),
+    ({"path": " .env"}, CWD),
+    ({"path": ".env "}, CWD),
+])
+def test_a_path_that_only_looks_secret_does_not_hide_the_folder(inp, cwd):
+    assert decision(command_hook.decide({**payload("Grep", pattern="KEY", **inp), "cwd": cwd})) == "ask"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path forms")
+@pytest.mark.parametrize("path", ["\\\\?\\C:\\p\\jssh", "\\\\.\\C:\\p\\jssh", "/c/p/jssh", " C:\\p\\jssh"])
+def test_a_local_path_in_another_form_is_still_followed(monkeypatch, path):
+    monkeypatch.setattr(command_hook.os.path, "realpath", lambda p: "C:/home/me/.ssh")
+    assert decision(command_hook.decide(payload("Grep", pattern="KEY", path=path))) == "ask"
+
+
+@pytest.mark.parametrize("tail", [" .env", ",.env", " **"])
+def test_a_glob_cannot_hide_behind_the_excludes(tail):
+    glob = " ".join(secret_files.SEARCH_EXCLUDES) + tail
+    out = command_hook.decide(payload("Grep", pattern="KEY", glob=glob))["hookSpecificOutput"]
+    assert out["updatedInput"]["glob"].endswith(" ".join(secret_files.SEARCH_EXCLUDES))
+
+
+@pytest.mark.parametrize("name", ["config", "known_hosts"])
+def test_one_ordinary_file_in_a_secret_folder_gets_no_decision(tmp_path, name):
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / name).write_text("x")
+    p = {**payload("Grep", pattern="KEY", path=f".ssh/{name}"), "cwd": str(tmp_path)}
+    assert command_hook.decide(p) is None
+
+
+def test_a_search_sent_back_as_changed_is_not_changed_again():
+    changed = command_hook.decide(payload("Grep", pattern="KEY"))["hookSpecificOutput"]["updatedInput"]
+    assert command_hook.decide(payload("Grep", **changed)) is None
+
+
+@pytest.mark.parametrize("cwd", ["/work/.env.d", "/work/x.pfx", "/work/id_rsa.d", "/work/.npmrc"])
+def test_a_session_folder_named_like_a_secret_file_still_searches(cwd):
+    out = command_hook.decide({**payload("Grep", pattern="KEY"), "cwd": cwd})["hookSpecificOutput"]
+    assert "updatedInput" in out and "permissionDecision" not in out
+
+
+def test_a_search_named_by_its_path_gives_one_reason():
+    out = command_hook.decide(payload("Grep", pattern="KEY", path="/home/me/.ssh"))["hookSpecificOutput"]
+    assert out["permissionDecisionReason"].count("reads the secret file") == 1
+
+
+@pytest.mark.parametrize("cwd, path", [
+    ("/home/me/.ssh", None), ("/home/me/.aws", None), ("/work/proj", "/home/me/.ssh"),
+    ("/work/proj", "/home/me/.ssh/sub/deep"), ("/work/proj", "/home/me/.aws/sub"), ("/home/me/.ssh/project", None),
+])
+def test_a_search_of_a_secret_folder_asks(cwd, path):
+    p = {**(payload("Grep", pattern="KEY", path=path) if path else payload("Grep", pattern="KEY")), "cwd": cwd}
+    assert decision(command_hook.decide(p)) == "ask"
+
+
+def test_a_search_through_a_link_to_a_secret_folder_asks(monkeypatch):
+    monkeypatch.setattr(command_hook.os.path, "realpath", lambda p: "/home/me/.aws")
+    assert decision(command_hook.decide(payload("Grep", pattern="KEY", path="link"))) == "ask"
 
 
 def test_a_broken_guard_does_not_stop_file_tools(monkeypatch, capsys):
