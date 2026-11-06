@@ -19,7 +19,7 @@ import os
 import re
 import sys
 
-from boxdawn_guard import block_log, secret_files
+from boxdawn_guard import block_log, messages_ko, secret_files
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -34,6 +34,10 @@ def _globs(pattern: str) -> list[str]:
     """Grep's `{.env,.env.local}`: one level of braces is enough for a name list."""
     m = re.fullmatch(r"(.*)\{([^{}]*)\}(.*)", pattern)
     return [m.group(1) + part + m.group(3) for part in m.group(2).split(",")] if m else [pattern]
+
+
+def _korean() -> bool:
+    return os.environ.get("CLAUDE_PLUGIN_OPTION_LANGUAGE") == messages_ko.KOREAN
 
 
 def _search_roots(tool_input: dict, cwd: str | None) -> tuple[str, ...]:
@@ -81,7 +85,8 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": {**tool_input, "glob": f"{glob} {excludes}" if isinstance(glob, str) and glob else excludes},
-        "additionalContext": "Boxdawn guard keeps secret files such as .env out of folder searches, "
+        "additionalContext": messages_ko.SEARCH_NOTE if _korean() else
+                             "Boxdawn guard keeps secret files such as .env out of folder searches, "
                              "so a file may be missing here. Give a file's path to search it.",
     }}
 
@@ -123,7 +128,8 @@ def decide(payload: dict) -> dict | None:
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": verdict.decision,
-        "permissionDecisionReason": "Boxdawn guard: " + "; ".join(verdict.reasons),
+        "permissionDecisionReason": "Boxdawn guard: " + "; ".join(
+            map(messages_ko.translate, verdict.reasons) if _korean() else verdict.reasons),
     }}
 
 
@@ -143,7 +149,8 @@ def main() -> int:
         out = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": f"Boxdawn guard failed ({type(exc).__name__}); refusing",
+            "permissionDecisionReason": messages_ko.FAILED.format(type(exc).__name__) if _korean()
+            else f"Boxdawn guard failed ({type(exc).__name__}); refusing",
         }}
     if out is not None:
         sys.stdout.write(json.dumps(out))

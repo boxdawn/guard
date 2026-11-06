@@ -17,6 +17,13 @@
       "title": "Keep the block record on this machine",
       "description": "On a paid plan the guard sends its block record (tool, deny or ask, rule ids, where the target sits; never a command or a path) to Boxdawn at session start. Turn this on to keep it on this machine only.",
       "default": false
+    },
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "The language of the guard's messages.",
+      "options": ["English", "한국어"],
+      "default": "English"
     }
   }
 }
