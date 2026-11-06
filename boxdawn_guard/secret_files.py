@@ -38,12 +38,14 @@ SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
 
 
 # `grep` matches a name, never a path, so what sits at a fixed path goes with its folder.
+# Short on purpose: the person asked reads this line. Any case only where upper case
+# is common. macOS `grep` has no `--exclude-from`, and there it finds nothing at all.
 GREPS = frozenset({"grep", "egrep", "fgrep"})
 GREP_EXCLUDES = (
-    *(f"--exclude='{_any_case(g)}'" for g in (
-        ".env", ".env.*", *sorted(_NAMES), *(k + e for k in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa") for e in ("", ".*")),
-        *("*" + e for e in _KEY_STORES), ".credentials.json", "hosts.yml")),
-    *(f"--exclude-dir='{_any_case(d)}'" for d in (".ssh", ".aws", ".docker", ".kube")),
+    *(f"--exclude={n}" for n in (".env", *sorted(_NAMES), "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+                                 ".credentials.json", "hosts.yml")),
+    "--exclude='.env.*'", "--exclude='*.[pP]12'", "--exclude='*.[pP][fF][xX]'",
+    *(f"--exclude-dir={d}" for d in (".ssh", ".aws", ".docker", ".kube")),
 )
 
 

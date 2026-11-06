@@ -108,6 +108,7 @@ _TABLE = (
 _PATTERNS = tuple((re.compile("(.+?)".join(map(re.escape, en.split("{}"))) + "$", re.S), ko) for en, ko in _TABLE)
 
 SEARCH_NOTE = "Boxdawn 차단기는 .env 같은 비밀 파일을 폴더 검색에서 뺍니다. 빠진 파일이 있을 수 있습니다. 파일 하나를 검색하려면 그 경로를 주세요."
+GREP_NOTE = "Boxdawn 차단기가 비밀 파일을 빼려고 이 grep 에 --exclude 를 붙였습니다. 빠진 파일이 있을 수 있습니다."
 FAILED = "Boxdawn 차단기가 고장 나서 ({}) 막습니다"
 
 

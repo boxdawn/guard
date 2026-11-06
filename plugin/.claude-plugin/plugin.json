@@ -18,6 +18,12 @@
       "description": "On a paid plan the guard sends its block record (tool, deny or ask, rule ids, where the target sits; never a command or a path) to Boxdawn at session start. Turn this on to keep it on this machine only.",
       "default": false
     },
+    "keep_secrets_out_of_grep": {
+      "type": "boolean",
+      "title": "Keep secret files out of grep -r",
+      "description": "Adds --exclude flags to a recursive grep in Bash so it leaves secret files out. Turn this off to run the command as written.",
+      "default": true
+    },
     "language": {
       "type": "string",
       "title": "Language",

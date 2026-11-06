@@ -64,11 +64,20 @@ def test_a_command_sent_back_as_changed_is_not_changed_again():
 def test_the_real_grep_leaves_the_secrets_out(tmp_path):
     secrets = [".env", ".env.local", "CERT.PFX", "id_rsa", ".netrc", ".npmrc", "src/.env", ".ssh/key", ".aws/credentials",
                ".kube/config", ".docker/config.json", ".config/gh/hosts.yml", ".claude/.credentials.json"]
-    plain = ["notes.txt", "src/app.txt", "src/config", "id_rsa.py.txt"]
+    plain = ["notes.txt", "src/app.txt", "src/config", "id_rsa_helper.py"]
     for name in secrets + plain:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("BDXFAKE\n")
     run = subprocess.run(["sh", "-c", changed("grep -rl BDXFAKE .")], cwd=tmp_path, capture_output=True, text=True)
     found = {line[2:].replace("\\", "/") for line in run.stdout.split()}
-    assert found == set(plain) - {"id_rsa.py.txt"}
+    assert found == set(plain)
+
+
+def test_the_line_stays_short():
+    assert len(FLAGS) < 400
+
+
+def test_it_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_KEEP_SECRETS_OUT_OF_GREP", "false")
+    assert decide("grep -r K .") is None

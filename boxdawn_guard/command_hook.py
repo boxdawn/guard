@@ -96,7 +96,8 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | Non
     any later word may be the end of the options, and later commands keep their place."""
     flags = " " + " ".join(secret_files.GREP_EXCLUDES)
     command = tool_input["command"]
-    if not ends or flags in command:
+    turned_off = (os.environ.get("CLAUDE_PLUGIN_OPTION_KEEP_SECRETS_OUT_OF_GREP") or "").lower() in ("false", "0", "no")
+    if not ends or flags in command or turned_off:
         return None
     line = command.encode("utf-8")
     for end in reversed(ends):
@@ -104,7 +105,8 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | Non
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": {**tool_input, "command": line.decode("utf-8")},
-        "additionalContext": "Boxdawn guard added --exclude flags to keep secret files such as .env "
+        "additionalContext": messages_ko.GREP_NOTE if _korean() else
+                             "Boxdawn guard added --exclude flags to keep secret files such as .env "
                              "out of this grep, so a file may be missing here.",
     }}
 
