@@ -37,6 +37,30 @@ SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
 ))
 
 
+# `grep` matches a name, never a path, so what sits at a fixed path goes with its folder.
+GREPS = frozenset({"grep", "egrep", "fgrep"})
+GREP_EXCLUDES = (
+    *(f"--exclude='{_any_case(g)}'" for g in (
+        ".env", ".env.*", *sorted(_NAMES), *(k + e for k in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa") for e in ("", ".*")),
+        *("*" + e for e in _KEY_STORES), ".credentials.json", "hosts.yml")),
+    *(f"--exclude-dir='{_any_case(d)}'" for d in (".ssh", ".aws", ".docker", ".kube")),
+)
+
+
+def greps_folders(args: list) -> bool:
+    """`-r`, `-R`, `--recursive`, `--dereference-recursive` or `-d recurse`."""
+    for i, a in enumerate(args):
+        if a is None:
+            continue
+        if a in ("--recursive", "--dereference-recursive", "--directories=recurse"):
+            return True
+        if re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", a):
+            return True
+        if a in ("-d", "--directories") and i + 1 < len(args) and args[i + 1] == "recurse":
+            return True
+    return False
+
+
 def search_excludes(*roots: str) -> tuple[str, ...]:
     """A ripgrep glob is matched from the folder it starts in, so `**/.kube/config`
     misses `config` when the search starts in `.kube`."""

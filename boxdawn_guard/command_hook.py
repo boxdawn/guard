@@ -91,6 +91,24 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     }}
 
 
+def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | None:
+    """`grep -r` reads `.env` without naming it. The flags go right after the name:
+    any later word may be the end of the options, and later commands keep their place."""
+    flags = " " + " ".join(secret_files.GREP_EXCLUDES)
+    command = tool_input["command"]
+    if not ends or flags in command:
+        return None
+    line = command.encode("utf-8")
+    for end in reversed(ends):
+        line = line[:end] + flags.encode() + line[end:]
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "updatedInput": {**tool_input, "command": line.decode("utf-8")},
+        "additionalContext": "Boxdawn guard added --exclude flags to keep secret files such as .env "
+                             "out of this grep, so a file may be missing here.",
+    }}
+
+
 def decide(payload: dict) -> dict | None:
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
@@ -122,6 +140,8 @@ def decide(payload: dict) -> dict | None:
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
             tool_input["command"], known_env=known_env, **where)
     if verdict is None or verdict.decision is None:
+        if tool == "Bash":
+            return _grep_without_secrets(tool_input, verdict.grep_ends)
         return _search_without_secrets(tool, tool_input, payload.get("cwd"))
     if bundle_exp is not None:
         block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
