@@ -118,7 +118,7 @@ _SPECS: dict[str, tuple[dict, dict, tuple]] = {
     "move-item": ({**_PATHS, "destination": _V, "passthru": _S}, _PATH_ALIASES,
                   ("path", "destination")),
     "new-item": ({"path": _V, "name": _V, "itemtype": _V, "value": _V, "force": _S,
-                  "credential": _V}, {"type": "itemtype"}, ("path",)),
+                  "credential": _V}, {"type": "itemtype", "target": "value"}, ("path",)),
 }
 _DESTROYERS = frozenset({"format-volume", "clear-disk", "initialize-disk", "remove-partition"})
 # Anything of these anywhere: a variable may change unseen.
@@ -320,7 +320,10 @@ class _PowerShell:
                 dirs.append(j.home)
                 continue
             t = _native_path(targets[0])
-            dirs.append(None if t is None or _provider(t) else j._absolute(t, j.cwd))
+            if t is None or _provider(t) or re.search(r"[*?\[]", t):
+                dirs.append(None)
+            else:
+                dirs += [j._absolute(t, j.cwd), j._absolute(t, dirs[-1] or j.cwd)]
         return dirs
 
     # commands ───────────────────────────────────────────────────────────
@@ -414,7 +417,7 @@ class _PowerShell:
         else:
             self.run(code, depth + 1)
 
-    def _where(self, target: Value) -> str:
+    def _where(self, target: Value, removes_link: bool = False) -> str:
         t = _native_path(target)
         if t is None:
             return "unknown"
@@ -422,7 +425,7 @@ class _PowerShell:
             return "outside"
         if re.match(r"^[A-Za-z]:(?![\\/])", t) and len(t) > 2:
             return "unknown"  # C:file is relative to that drive's own current directory
-        return self.j._where(t)
+        return self.j._where(t, removes_link)
 
     def _writes(self, target: Value, what: str) -> None:
         j = self.j
@@ -446,8 +449,14 @@ class _PowerShell:
     def _remove_item(self, c, b, raw, depth) -> None:
         j = self.j
         hard = b.get("recurse") is True or b.get("force") is True
+        filtered = b.get("include") is not None or b.get("exclude") is not None
+        if filtered and b.get("recurse") is True:
+            # Measured on 5.1: this walks through any link below the path, not only one in it.
+            j.flag("ask", "rm.filtered_recurse", f"`{raw} -Recurse` with `-Include` or `-Exclude` follows links below the path", "unknown")
         for t in self._targets(c, b, "path", "literalpath"):
-            where = self._where(t)
+            # `-Include` and `-Exclude` delete what matches inside the link, not the link.
+            # `-Recurse` on a directory symlink is not measured (junctions only), so it is not trusted.
+            where = self._where(t, removes_link=not filtered and b.get("recurse") is not True)
             if where == "unknown":
                 j.flag("deny" if hard else "ask", "rm.runtime",
                        f"`{raw}` target is known only at run time", "unknown")
@@ -506,12 +515,17 @@ class _PowerShell:
     def _new_item(self, c, b, raw, depth) -> None:
         """`New-Item -Force` replaces a file (or registry key) already there;
         a directory already there is kept."""
+        kind = (b.get("itemtype") or ["File"])[0]
+        names = b.get("name")
+        if kind and ("symboliclink".startswith(kind.lower()) or "junction".startswith(kind.lower())):
+            for p in self._targets(c, b, "path") or ["."]:
+                t = _native_path(p if not names or p is None or names[0] is None else p.rstrip("/\\") + "/" + names[0])
+                if t is not None:
+                    self.j.made_links.extend(self.j._absolute(t, base or self.j.cwd) for base in self.j.workdirs)
         if b.get("force") is not True:
             return
-        kind = (b.get("itemtype") or ["File"])[0]
         if kind is not None and kind.lower() == "directory":
             return
-        names = b.get("name")
         for p in self._targets(c, b, "path") or ["."]:
             t = p
             if names:
