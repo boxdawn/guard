@@ -40,7 +40,9 @@ SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
 # `grep` matches a name, never a path, so what sits at a fixed path goes with its folder.
 # Short on purpose: the person asked reads this line. Any case only where upper case
 # is common. macOS `grep` has no `--exclude-from`, and there it finds nothing at all.
-GREPS = frozenset({"grep", "egrep", "fgrep"})
+GREPS = frozenset({"grep", "egrep", "fgrep", "rgrep"})
+GREP_FOLDERS = (".kube", ".docker")  # `--exclude-dir` misses the folder a search starts in
+_GREP_VALUE_LETTERS = "efABCmDd"
 GREP_EXCLUDES = (
     *(f"--exclude={n}" for n in (".env", *sorted(_NAMES), "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
                                  ".credentials.json", "hosts.yml")),
@@ -49,18 +51,71 @@ GREP_EXCLUDES = (
 )
 
 
+def _long_is(flag: str, name: str, shortest: int) -> bool:
+    """`grep` takes any unambiguous start of a long option."""
+    return len(flag) >= shortest and name.startswith(flag)
+
+
 def greps_folders(args: list) -> bool:
-    """`-r`, `-R`, `--recursive`, `--dereference-recursive` or `-d recurse`."""
-    for i, a in enumerate(args):
+    """Read like `grep` reads them: bundles (`-rA2`, `-nd recurse`), shortened long
+    options, and a flag's value is not a flag."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a is None or not a.startswith("-") or a == "-":
+            continue
+        if a == "--":
+            return False
+        if a.startswith("--"):
+            flag, _, value = a.partition("=")
+            if _long_is(flag, "--recursive", 5) or _long_is(flag, "--dereference-recursive", 5):
+                return True
+            if _long_is(flag, "--directories", 5):
+                value = value or (args[i] if i < len(args) and args[i] else "")
+                if "recurse".startswith(value) and value:
+                    return True
+            if not value and any(_long_is(flag, n, 5) for n in ("--regexp", "--file", "--max-count", "--context",
+                                                                "--after-context", "--before-context", "--devices")):
+                i += 1
+            continue
+        for at, letter in enumerate(a[1:], 1):
+            if letter in "rR":
+                return True
+            if letter in _GREP_VALUE_LETTERS:
+                value = a[at + 1:]
+                if not value:
+                    value = args[i] if i < len(args) and args[i] else ""
+                    i += 1
+                if letter == "d" and value and "recurse".startswith(value):
+                    return True
+                break
+    return False
+
+
+def grep_must_stay(args: list) -> bool:
+    """`--include` changes how `grep` reads every `--exclude` before it: its filter
+    falls away. And `--exclude` also drops a file named on the line. Leave these alone."""
+    names = tuple(g.split("=", 1)[1].strip("'") for g in GREP_EXCLUDES)
+    for a in args:
         if a is None:
             continue
-        if a in ("--recursive", "--dereference-recursive", "--directories=recurse"):
+        if a.startswith("--incl") or a == GREP_EXCLUDES[0]:
             return True
-        if re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*", a):
-            return True
-        if a in ("-d", "--directories") and i + 1 < len(args) and args[i + 1] == "recurse":
+        if not a.startswith("-") and any(fnmatch.fnmatchcase(posixpath.basename(a.rstrip("/")), n) for n in names):
             return True
     return False
+
+
+def grep_folder(args: list, cwd: str) -> Optional[str]:
+    """A `.kube` or `.docker` the search starts in or under, as named or as the session folder."""
+    for a in [cwd, *args]:
+        if a is None or a.startswith("-"):
+            continue
+        parts = a.replace("\\", "/").split("/")
+        if any(p.lower() in GREP_FOLDERS for p in parts):
+            return a
+    return None
 
 
 def search_excludes(*roots: str) -> tuple[str, ...]:

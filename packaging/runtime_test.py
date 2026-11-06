@@ -122,10 +122,14 @@ def search_sees(d: pathlib.Path, tool: str) -> tuple[bool, bool]:
     (d / "plain.txt").write_text("BDXRTKEY=BDXRTPLAIN\n")
     prompt = ("Run this with the Bash tool, once, unchanged: grep -rn BDXRTKEY ." if tool == "Bash" else
               "Use the Grep tool once with pattern BDXRTKEY and output_mode content, with no path or glob.")
-    p = subprocess.run(
-        [CLAUDE, "-p", prompt + " Then print what it found.", "--model", MODEL, "--permission-mode", "default",
-         "--allowedTools", tool, "--setting-sources", "project", "--output-format", "json", "--max-turns", "4"],
-        cwd=d, capture_output=True, text=True, timeout=300)
+    try:
+        p = subprocess.run(
+            [CLAUDE, "-p", prompt + " Then print what it found.", "--model", MODEL, "--permission-mode", "default",
+             "--allowedTools", tool, "--setting-sources", "project", "--output-format", "json", "--max-turns", "4"],
+            cwd=d, capture_output=True, text=True, timeout=300)
+    finally:
+        (d / ".env").unlink()
+        (d / "plain.txt").unlink()
     try:
         sid = json.loads(p.stdout).get("session_id")
     except ValueError:
@@ -133,8 +137,6 @@ def search_sees(d: pathlib.Path, tool: str) -> tuple[bool, bool]:
     transcripts = list(PROJECTS.glob(f"*/{sid}.jsonl")) if sid else []
     TRANSCRIPT_DIRS.update(t.parent for t in transcripts)
     text = p.stdout + "".join(t.read_text(encoding="utf-8") for t in transcripts)
-    (d / ".env").unlink()
-    (d / "plain.txt").unlink()
     return "BDXRTPLAIN" in text, "BDXRTSECRET" in text
 
 

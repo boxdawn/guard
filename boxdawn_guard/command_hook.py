@@ -97,7 +97,7 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | Non
     flags = " " + " ".join(secret_files.GREP_EXCLUDES)
     command = tool_input["command"]
     turned_off = (os.environ.get("CLAUDE_PLUGIN_OPTION_KEEP_SECRETS_OUT_OF_GREP") or "").lower() in ("false", "0", "no")
-    if not ends or flags in command or turned_off:
+    if not ends or turned_off:
         return None
     line = command.encode("utf-8")
     for end in reversed(ends):
