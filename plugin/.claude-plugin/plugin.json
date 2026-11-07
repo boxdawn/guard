@@ -21,7 +21,7 @@
     "keep_secrets_out_of_grep": {
       "type": "boolean",
       "title": "Keep secret files out of grep -r",
-      "description": "Adds --exclude flags to a recursive grep in Bash so it leaves secret files out. Turn this off to run the command as written.",
+      "description": "Adds --exclude flags to a recursive grep in Bash so it leaves secret files out. Turn this off and no flags are added; a search that starts in a credentials folder still asks.",
       "default": true
     },
     "language": {

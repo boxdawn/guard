@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 
 from boxdawn_guard import block_log, messages_ko, secret_files
@@ -91,13 +92,19 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     }}
 
 
+def _busybox_grep() -> bool:
+    """BusyBox `grep` may refuse these flags, and a search that fails is worse than one that reads."""
+    found = shutil.which("grep")
+    return found is not None and os.path.basename(os.path.realpath(found)).startswith("busybox")
+
+
 def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | None:
     """`grep -r` reads `.env` without naming it. The flags go right after the name:
     any later word may be the end of the options, and later commands keep their place."""
     flags = " " + " ".join(secret_files.GREP_EXCLUDES)
     command = tool_input["command"]
     turned_off = (os.environ.get("CLAUDE_PLUGIN_OPTION_KEEP_SECRETS_OUT_OF_GREP") or "").lower() in ("false", "0", "no")
-    if not ends or turned_off:
+    if not ends or turned_off or _busybox_grep():
         return None
     line = command.encode("utf-8")
     for end in reversed(ends):

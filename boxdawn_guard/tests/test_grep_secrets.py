@@ -111,3 +111,48 @@ def test_the_line_stays_short():
 def test_it_can_be_turned_off(monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_KEEP_SECRETS_OUT_OF_GREP", "false")
     assert decide("grep -r K .") is None
+
+
+def verdict(command, cwd="/work/proj"):
+    out = decide(command, cwd)
+    return out and out["hookSpecificOutput"]
+
+
+@pytest.mark.parametrize("command", [
+    "grep -r .docker .", "grep -rn '\\.docker' src", "grep -r KEY . --exclude-dir .kube",
+    "grep -rni .env .", "grep -r -e KEY -e .env .", "grep -rs KEY . hosts.yml", "grep -rn hosts.yml .",
+    "grep -r id_rsa src", "grep -r --exclude=.env KEY .", "grep --di=recurse KEY .", "GREP -r KEY .",
+])
+def test_found_in_review_the_flags_go_in(command):
+    assert "updatedInput" in verdict(command)
+
+
+@pytest.mark.parametrize("command", ["grep --inc='*' -r KEY .", "grep --inc '*.py' -r KEY ."])
+def test_any_start_of_include_stays(command):
+    assert decide(command) is None
+
+
+@pytest.mark.parametrize("command, cwd", [
+    ("cd .kube && grep -r KEY .", "/work/proj"), ("cd .docker; grep -r KEY", "/work/proj"),
+    ("grep -r KEY .ku*/", "/work/proj"), ("grep -r KEY ./.d*/", "/work/proj"), ("grep -r KEY .aw*/", "/work/proj"),
+    ("grep -r KEY", "/home/me/.aws"), ("grep -r KEY", "/home/me/.ssh"), ("grep -r KEY .", "/home/me/.docker/app"),
+])
+def test_a_search_that_starts_in_a_credentials_folder_asks(command, cwd):
+    assert verdict(command, cwd)["permissionDecision"] == "ask"
+
+
+def test_a_plain_glob_is_no_credentials_folder():
+    assert "updatedInput" in verdict("grep -r KEY *")
+
+
+def test_a_line_with_every_flag_is_left_alone():
+    assert decide(f"grep {FLAGS} -r KEY .") is None
+
+
+def test_named_files_only_stay():
+    assert "updatedInput" in verdict("grep -r KEY src hosts.yml")
+
+
+def test_busybox_grep_is_left_alone(monkeypatch):
+    monkeypatch.setattr(command_hook, "_busybox_grep", lambda: True)
+    assert decide("grep -r KEY .") is None

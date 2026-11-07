@@ -656,13 +656,15 @@ class _Judge:
             return
         fed, text = self._stdin(node)
         self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
-        if depth == 0 and posixpath.basename(name) in secret_files.GREPS \
-                and (posixpath.basename(name) == "rgrep" or secret_files.greps_folders(args)):
-            start = secret_files.grep_folder(args, self.cwd)
-            if start is not None:
-                self.flag("ask", "secret.read", f"`{name}` reads the secret file `{start}`", self._where(start))
-            elif not secret_files.grep_must_stay(args):
-                self.grep_ends.append(node.child_by_field_name("name").end_byte)
+        grep = posixpath.basename(name).lower()
+        if depth == 0 and grep in secret_files.GREPS:
+            recursive, paths, includes = secret_files.grep_reads(args)
+            if grep == "rgrep" or recursive:
+                start = secret_files.grep_folder(paths, self.workdirs)
+                if start is not None:
+                    self.flag("ask", "secret.read", f"`{name}` reads the secret file `{start}`", self._where(start))
+                elif not secret_files.grep_must_stay(args, paths, includes):
+                    self.grep_ends.append(node.child_by_field_name("name").end_byte)
         final = self._final(name, args)[0]
         if final and final.lower() in secret_files.SENDERS:
             for n in _walk(node):  # `curl -d "$(cat .env)"`

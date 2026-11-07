@@ -41,14 +41,18 @@ SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
 # Short on purpose: the person asked reads this line. Any case only where upper case
 # is common. macOS `grep` has no `--exclude-from`, and there it finds nothing at all.
 GREPS = frozenset({"grep", "egrep", "fgrep", "rgrep"})
-GREP_FOLDERS = (".kube", ".docker")  # `--exclude-dir` misses the folder a search starts in
+GREP_FOLDERS = (".ssh", ".aws", ".kube", ".docker")
 _GREP_VALUE_LETTERS = "efABCmDd"
+_GREP_LONG_VALUES = ("--regexp", "--file", "--max-count", "--context", "--after-context", "--before-context",
+                     "--devices", "--include", "--exclude", "--exclude-dir", "--exclude-from", "--label",
+                     "--binary-files")
 GREP_EXCLUDES = (
     *(f"--exclude={n}" for n in (".env", *sorted(_NAMES), "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
                                  ".credentials.json", "hosts.yml")),
     "--exclude='.env.*'", "--exclude='*.[pP]12'", "--exclude='*.[pP][fF][xX]'",
     *(f"--exclude-dir={d}" for d in (".ssh", ".aws", ".docker", ".kube")),
 )
+_GREP_FLAGS_AS_READ = frozenset(g.replace("'", "") for g in GREP_EXCLUDES)
 
 
 def _long_is(flag: str, name: str, shortest: int) -> bool:
@@ -56,65 +60,69 @@ def _long_is(flag: str, name: str, shortest: int) -> bool:
     return len(flag) >= shortest and name.startswith(flag)
 
 
-def greps_folders(args: list) -> bool:
-    """Read like `grep` reads them: bundles (`-rA2`, `-nd recurse`), shortened long
-    options, and a flag's value is not a flag."""
+def grep_reads(args: list) -> tuple[bool, list, bool]:
+    """(searches folders, the paths it is given, has `--include`), read like `grep` reads
+    them: bundles (`-rA2`, `-nd recurse`), shortened long options, a flag's value is not
+    a flag, and the first word is the pattern unless `-e` or `-f` gave one."""
+    recursive = includes = patterned = False
+    words: list = []
     i = 0
     while i < len(args):
         a = args[i]
         i += 1
         if a is None or not a.startswith("-") or a == "-":
-            continue
-        if a == "--":
-            return False
-        if a.startswith("--"):
-            flag, _, value = a.partition("=")
-            if _long_is(flag, "--recursive", 5) or _long_is(flag, "--dereference-recursive", 5):
-                return True
-            if _long_is(flag, "--directories", 5):
+            words.append(a)
+        elif a == "--":
+            words += args[i:]
+            break
+        elif a.startswith("--"):
+            flag, equals, value = a.partition("=")
+            takes = not equals and any(_long_is(flag, n, 5) for n in _GREP_LONG_VALUES)
+            if _long_is(flag, "--directories", 4):
                 value = value or (args[i] if i < len(args) and args[i] else "")
-                if "recurse".startswith(value) and value:
-                    return True
-            if not value and any(_long_is(flag, n, 5) for n in ("--regexp", "--file", "--max-count", "--context",
-                                                                "--after-context", "--before-context", "--devices")):
-                i += 1
-            continue
-        for at, letter in enumerate(a[1:], 1):
-            if letter in "rR":
-                return True
-            if letter in _GREP_VALUE_LETTERS:
-                value = a[at + 1:]
-                if not value:
-                    value = args[i] if i < len(args) and args[i] else ""
-                    i += 1
-                if letter == "d" and value and "recurse".startswith(value):
-                    return True
-                break
-    return False
+                takes = not equals
+                recursive = recursive or bool(value and "recurse".startswith(value))
+            recursive = recursive or _long_is(flag, "--recursive", 5) or _long_is(flag, "--dereference-recursive", 5)
+            includes = includes or _long_is(flag, "--include", 5)
+            patterned = patterned or _long_is(flag, "--regexp", 5) or _long_is(flag, "--file", 5)
+            i += 1 if takes else 0
+        else:
+            for at, letter in enumerate(a[1:], 1):
+                recursive = recursive or letter in "rR"
+                if letter in _GREP_VALUE_LETTERS:
+                    patterned = patterned or letter in "ef"
+                    value = a[at + 1:]
+                    if not value:
+                        value = args[i] if i < len(args) and args[i] else ""
+                        i += 1
+                    recursive = recursive or (letter == "d" and bool(value) and "recurse".startswith(value))
+                    break
+    return recursive, words if patterned else words[1:], includes
 
 
-def grep_must_stay(args: list) -> bool:
-    """`--include` changes how `grep` reads every `--exclude` before it: its filter
-    falls away. And `--exclude` also drops a file named on the line. Leave these alone."""
+def grep_must_stay(args: list, paths: list, includes: bool) -> bool:
+    """`--include` changes how `grep` reads every `--exclude` before it: its filter falls
+    away. `--exclude` also drops a file named on the line, so a search of named files only
+    stays. A line that already has every flag needs none."""
+    if includes or _GREP_FLAGS_AS_READ <= set(args):
+        return True
     names = tuple(g.split("=", 1)[1].strip("'") for g in GREP_EXCLUDES)
-    for a in args:
+    return bool(paths) and all(
+        a is not None and any(fnmatch.fnmatchcase(posixpath.basename(a.rstrip("/")), n) for n in names)
+        for a in paths)
+
+
+def grep_folder(paths: list, workdirs: list) -> Optional[str]:
+    """A credentials folder the search starts in or under, as named, as a glob, or as a
+    directory the line is in. `--exclude-dir` misses the folder a search starts in."""
+    for a in [*workdirs, *paths]:
         if a is None:
             continue
-        if a.startswith("--incl") or a == GREP_EXCLUDES[0]:
-            return True
-        if not a.startswith("-") and any(fnmatch.fnmatchcase(posixpath.basename(a.rstrip("/")), n) for n in names):
-            return True
-    return False
-
-
-def grep_folder(args: list, cwd: str) -> Optional[str]:
-    """A `.kube` or `.docker` the search starts in or under, as named or as the session folder."""
-    for a in [cwd, *args]:
-        if a is None or a.startswith("-"):
-            continue
-        parts = a.replace("\\", "/").split("/")
-        if any(p.lower() in GREP_FOLDERS for p in parts):
-            return a
+        for part in a.replace("\\", "/").split("/"):
+            part = part.lower()
+            if part in GREP_FOLDERS or (part.startswith(".") and any(c in part for c in "*?[")
+                                        and any(fnmatch.fnmatchcase(f, part) for f in GREP_FOLDERS)):
+                return a
     return None
 
 
