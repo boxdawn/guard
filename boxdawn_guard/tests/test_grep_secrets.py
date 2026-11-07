@@ -120,7 +120,7 @@ def verdict(command, cwd="/work/proj"):
 
 @pytest.mark.parametrize("command", [
     "grep -r .docker .", "grep -rn '\\.docker' src", "grep -r KEY . --exclude-dir .kube",
-    "grep -rni .env .", "grep -r -e KEY -e .env .", "grep -rs KEY . hosts.yml", "grep -rn hosts.yml .",
+    "grep -rni .env .", "grep -r -e KEY -e .env .", "grep -rn hosts.yml .",
     "grep -r id_rsa src", "grep -r --exclude=.env KEY .", "grep --di=recurse KEY .", "GREP -r KEY .",
 ])
 def test_found_in_review_the_flags_go_in(command):
@@ -150,9 +150,23 @@ def test_a_line_with_every_flag_is_left_alone():
 
 
 def test_named_files_only_stay():
-    assert "updatedInput" in verdict("grep -r KEY src hosts.yml")
+    assert decide("grep -r KEY .env.example src") is None
+    assert decide("grep -r KEY src inventory/hosts.yml") is None
+    assert verdict("grep -r KEY src inventory/.env.prod")["permissionDecision"] == "ask"
 
 
 def test_busybox_grep_is_left_alone(monkeypatch):
     monkeypatch.setattr(command_hook, "_busybox_grep", lambda: True)
     assert decide("grep -r KEY .") is None
+
+
+@pytest.mark.parametrize("command", [
+    "grep -r --group-separator XX .docker docs", "grep -r --m 1 .docker docs", "grep -r --a 2 .docker docs",
+    "grep -r --be 2 .docker docs", "grep -r --la x .docker docs", "grep -r --gr x .docker docs",
+])
+def test_an_option_value_is_no_path(command):
+    assert "updatedInput" in verdict(command)
+
+
+def test_an_ambiguous_start_of_an_option_is_no_option():
+    assert secret_files.grep_reads(["--e", "x", "-r", "KEY", "."])[0] is True

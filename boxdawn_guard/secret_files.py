@@ -45,7 +45,7 @@ GREP_FOLDERS = (".ssh", ".aws", ".kube", ".docker")
 _GREP_VALUE_LETTERS = "efABCmDd"
 _GREP_LONG_VALUES = ("--regexp", "--file", "--max-count", "--context", "--after-context", "--before-context",
                      "--devices", "--include", "--exclude", "--exclude-dir", "--exclude-from", "--label",
-                     "--binary-files")
+                     "--binary-files", "--group-separator")
 GREP_EXCLUDES = (
     *(f"--exclude={n}" for n in (".env", *sorted(_NAMES), "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
                                  ".credentials.json", "hosts.yml")),
@@ -55,9 +55,23 @@ GREP_EXCLUDES = (
 _GREP_FLAGS_AS_READ = frozenset(g.replace("'", "") for g in GREP_EXCLUDES)
 
 
-def _long_is(flag: str, name: str, shortest: int) -> bool:
-    """`grep` takes any unambiguous start of a long option."""
-    return len(flag) >= shortest and name.startswith(flag)
+# GNU grep's long options: it takes any start of one that fits no other.
+_GREP_LONG = (
+    "--extended-regexp", "--fixed-strings", "--basic-regexp", "--perl-regexp", "--regexp", "--file",
+    "--ignore-case", "--no-ignore-case", "--word-regexp", "--line-regexp", "--null-data", "--no-messages",
+    "--invert-match", "--version", "--help", "--max-count", "--byte-offset", "--line-number", "--no-line-number",
+    "--line-buffered", "--with-filename", "--no-filename", "--label", "--only-matching", "--quiet", "--silent",
+    "--binary-files", "--text", "--directories", "--devices", "--recursive", "--dereference-recursive",
+    "--include", "--exclude", "--exclude-from", "--exclude-dir", "--files-without-match", "--files-with-matches",
+    "--count", "--initial-tab", "--null", "--before-context", "--after-context", "--context",
+    "--group-separator", "--no-group-separator", "--color", "--colour", "--binary",
+)
+
+
+def _long_is(flag: str, name: str, shortest: int = 0) -> bool:
+    """`flag` is `name` as `grep` reads it: the whole name, or a start that fits no other."""
+    fits = [n for n in _GREP_LONG if n.startswith(flag)]
+    return flag == name or (len(flag) > 2 and fits == [name])
 
 
 def grep_reads(args: list) -> tuple[bool, list, bool]:
@@ -103,11 +117,11 @@ def grep_reads(args: list) -> tuple[bool, list, bool]:
 def grep_must_stay(args: list, paths: list, includes: bool) -> bool:
     """`--include` changes how `grep` reads every `--exclude` before it: its filter falls
     away. `--exclude` also drops a file named on the line, so a search of named files only
-    stays. A line that already has every flag needs none."""
+    stays: one named on the line would be left out. A line that already has every flag needs none."""
     if includes or _GREP_FLAGS_AS_READ <= set(args):
         return True
     names = tuple(g.split("=", 1)[1].strip("'") for g in GREP_EXCLUDES)
-    return bool(paths) and all(
+    return any(
         a is not None and any(fnmatch.fnmatchcase(posixpath.basename(a.rstrip("/")), n) for n in names)
         for a in paths)
 
