@@ -65,6 +65,7 @@ _ALIASES = {
     "pushd": "push-location",
     "cp": "copy-item", "copy": "copy-item", "cpi": "copy-item",
     "mv": "move-item", "move": "move-item", "mi": "move-item", "ni": "new-item",
+    "ren": "rename-item", "rni": "rename-item",
 }
 
 _V, _S = True, False  # takes a value / is a switch
@@ -117,6 +118,7 @@ _SPECS: dict[str, tuple[dict, dict, tuple]] = {
                    "fromsession": _V, "tosession": _V}, _PATH_ALIASES, ("path", "destination")),
     "move-item": ({**_PATHS, "destination": _V, "passthru": _S}, _PATH_ALIASES,
                   ("path", "destination")),
+    "rename-item": ({**_PATHS, "newname": _V, "passthru": _S}, _PATH_ALIASES, ("path", "newname")),
     "new-item": ({"path": _V, "name": _V, "itemtype": _V, "value": _V, "force": _S,
                   "credential": _V}, {"type": "itemtype", "target": "value"}, ("path",)),
 }
@@ -129,6 +131,10 @@ _ITEMS = frozenset({"new-item", "set-item", "remove-item", "clear-item", "rename
                     "copy-item", "move-item"})
 _SELF = frozenset({"powershell", "pwsh"})
 _HARMLESS = frozenset({"nul", "$null"})
+_DOTNET = re.compile(r"(?i)\[\s*(?:system\.)?io\.(?:file|directory)\s*\]\s*::\s*"
+                     r"(delete|move|replace|copy|create|openwrite|write\w*)\s*\(")
+_LITERAL = re.compile(r"""'([^']*)'|"([^"]*)\"""")
+_HERE = re.compile(r"(?i)^\$(?:pwd|\(pwd\)|\(get-location\))[\\/]")
 
 
 # ── evaluate ────────────────────────────────────────────────────────────────
@@ -172,7 +178,7 @@ class _PowerShell:
         outer = (self.env, j.workdirs)
         commands = tree["commands"]
         self.env = self._collect_env(tree)
-        j.workdirs = self._collect_workdirs(commands)
+        j.workdirs = self._collect_workdirs(commands, depth)
         try:
             fed_a_secret = listed_a_secret = False
             for c in commands:
@@ -190,6 +196,7 @@ class _PowerShell:
                 fed_a_secret = fed_a_secret or bool(j._named_secrets(name, args))
                 listed_a_secret = listed_a_secret or (name in secret_files.METADATA_ONLY and any(
                     a is not None and not a.startswith("-") and j._is_secret(a) for a in args))
+            self._dotnet(text)
             for w in tree["writes"]:
                 if not w["append"]:
                     self._writes(self._value(w["to"], w["start"]), "output")
@@ -307,9 +314,9 @@ class _PowerShell:
                     bound[slot] = group
         return bound
 
-    def _collect_workdirs(self, commands: list) -> list:
+    def _collect_workdirs(self, commands: list, depth: int = 0) -> list:
         j = self.j
-        dirs = [j.cwd]
+        dirs = list(j.workdirs) if depth and j.workdirs else [j.cwd]
         for c in commands:
             name = _canonical(c["name"])
             if name not in ("set-location", "push-location"):
@@ -427,6 +434,20 @@ class _PowerShell:
             return "unknown"  # C:file is relative to that drive's own current directory
         return self.j._where(t, removes_link)
 
+    def _dotnet(self, text: str) -> None:
+        """`[IO.File]::Delete(...)` is no command, so the reader lists nothing: the text is
+        read here. A write to a path in a variable gets no decision: scripts do that a lot."""
+        code = _code_only(text)
+        for m in _DOTNET.finditer(code):
+            verb = m.group(1)
+            writes = verb.lower().startswith(("write", "create", "openwrite"))
+            paths = _dotnet_paths(text, code, m.end(), writes or verb.lower() == "delete")
+            for t in paths[1:] if verb.lower() == "copy" else paths:  # Copy only reads its source
+                where = self._where(t)
+                if where == "outside" or (where == "unknown" and not writes):
+                    said = "a path known only at run time" if t is None else f"`{t}` outside the project"
+                    self.j.flag("ask", "dotnet.outside", f"the .NET call `{verb}` changes {said}", where)
+
     def _writes(self, target: Value, what: str) -> None:
         j = self.j
         if target is not None and target.lower() in _HARMLESS:
@@ -501,6 +522,13 @@ class _PowerShell:
         if b.get("force") is True:  # without -Force it refuses to replace a file
             self._replaces(b, raw, "mv.outside")
 
+    def _rename_item(self, c, b, raw, depth) -> None:
+        # Piped items are renamed where they are, which is what `-NewName {...}` is used for.
+        for t in (b.get("path") or []) + (b.get("literalpath") or []):
+            if (where := self._where(t)) in ("outside", "unknown"):
+                said = "a path known only at run time" if t is None else f"`{t}` outside the project"
+                self.j.flag("ask", "mv.outside", f"`{raw}` takes away {said}", where)
+
     def _replaces(self, b, raw, rule: str) -> None:
         j = self.j
         for t in b.get("destination") or ["."]:
@@ -566,6 +594,49 @@ class _PowerShell:
         pass  # read by _collect_workdirs
 
     _push_location = _set_location
+
+
+def _code_only(text: str) -> str:
+    """`text` with strings and comments blanked, same length: what is left is code."""
+    out = list(text)
+    quote = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            out[i] = " "
+            if quote == '"' and ch == "`" and i + 1 < len(text):
+                i += 1
+                out[i] = " "
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            out[i] = " "
+        elif ch == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";(|{"):
+            while i < len(text) and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _dotnet_paths(text: str, code: str, start: int, first_only: bool) -> list[Value]:
+    """The paths in the call whose `(` ends at `start`: a literal, or None for anything else."""
+    depth, end = 1, start
+    while end < len(code) and depth:
+        depth += {"(": 1, ")": -1}.get(code[end], 0)
+        end += 1
+    call = text[start:end - 1 if depth == 0 else end]
+    paths: list[Value] = []
+    for m in _LITERAL.finditer(call):
+        single = m.group(1) is not None
+        value = m.group(1) if single else _HERE.sub("", m.group(2))
+        paths.append(value if single or "$" not in value else None)
+    if not re.match(r"[\s(]*['\"]", call):
+        paths.insert(0, None)  # the first argument is not a literal
+    return paths[:1] if first_only else paths
 
 
 def _canonical(name: Optional[str]) -> Optional[str]:
