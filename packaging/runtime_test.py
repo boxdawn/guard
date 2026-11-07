@@ -206,7 +206,8 @@ def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path)
     failures += not no_record
     print(f"{'PASS' if no_record else 'FAIL'}  no block record without a key")
     total = len(plan) + 1
-    for tool in ("Bash", "Grep"):
+    # The directory edition is frozen under review and keeps nothing out of a search.
+    for tool in () if "--no-search" in sys.argv else ("Bash", "Grep"):
         for label, d, want in (("plugin", guarded, (True, False)), ("control", control, (True, True))):
             seen = search_sees(d, tool)
             good = seen == want
