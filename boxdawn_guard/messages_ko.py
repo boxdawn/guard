@@ -73,6 +73,11 @@ _TABLE = (
     ("`{}` removes the whole project directory", "`{0}`: 프로젝트 폴더 전체를 지웁니다"),
     ("`{} -Recurse` with `-Include` or `-Exclude` follows links below the path",
      "`{0} -Recurse`: `-Include`·`-Exclude` 를 쓰면 아래 링크를 따라갑니다"),
+    ("`rsync --delete` removes files under a path known only at run time", "`rsync --delete`: 실행해야만 알 수 있는 경로 아래를 지웁니다"),
+    ("`rsync --delete` removes files under `{}` outside the project", "`rsync --delete`: 프로젝트 밖 파일을 지웁니다: `{0}`"),
+    ("`rsync --delete` removes files on another machine: `{}`", "`rsync --delete`: 다른 컴퓨터의 파일을 지웁니다: `{0}`"),
+    ("the .NET call `{}` changes a path known only at run time", ".NET 호출 `{0}`: 실행해야만 알 수 있는 경로를 바꿉니다"),
+    ("the .NET call `{}` changes `{}` outside the project", ".NET 호출 `{0}`: 프로젝트 밖 파일을 바꿉니다: `{1}`"),
     ("`find -delete` under `{}`", "`find -delete`: 이 아래를 지웁니다: `{0}`"),
     ("`find -delete` removes files in bulk", "`find -delete`: 파일을 한꺼번에 지웁니다"),
     # links
