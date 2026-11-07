@@ -189,3 +189,43 @@ def test_powershell_dotnet_found_in_review(command):
 ])
 def test_powershell_no_decision_found_in_review(command):
     assert ps(command) is None
+
+
+@pytest.mark.parametrize("command, want", [
+    ("env -uCC rm -rf /etc", "deny"), ("env -uPATHS rm -rf /etc", "deny"), ("env -uCC cat ~/.ssh/id_rsa", "ask"),
+    ("cp -g a /etc/x", "ask"), ("mv -m a /etc/x", "ask"), ("install -oroot a /etc/x", "ask"),
+    ("install -groot a /etc/x", "ask"), ("rsync -a --delete own/ /etc/ --max-delete 5", "deny"),
+    ("rsync -a --delete -f'- node_modules' own/ /etc/", "deny"),
+    ("rsync -a --delete -e'ssh -o StrictHostKeyChecking=no' own/ /etc/", "deny"),
+    ("env -iS 'rm -rf /etc'", "deny"), ("env -S 'rm -rf' /etc", "deny"), ("env -C /etc -S 'rm -rf sub'", "deny"),
+    ("cp -t/etc a", "ask"), ("mv -t/etc a", "ask"), ("tar -xf a.tar --one-top-level=/etc", "ask"),
+])
+def test_found_in_second_review(command, want):
+    assert decision(command) == want
+
+
+@pytest.mark.parametrize("command", [
+    "unzip a.zip -dbuild", "unzip a.zip -dbuild/out", "tar -xzf a.tgz -C /tmp", "unzip a.zip -d /tmp",
+    "cd /tmp && unzip -l a.zip", "cp -gx a b", "unzip -l /etc/a.zip",
+])
+def test_no_decision_found_in_second_review(command):
+    assert decision(command) is None
+
+
+@pytest.mark.parametrize("command", [
+    "rm -rf /etc/" + "{a,b}" * 9 + "{" * 1990, "rm -rf " + "{a," * 680,
+])
+def test_brace_words_take_no_time(command):
+    import time
+    began = time.monotonic()
+    decision(command)
+    assert time.monotonic() - began < 5
+
+
+@pytest.mark.parametrize("command", [
+    "[IO.File]::Move('a', $b)", "[IO.File]::Copy('a', $b)", "[IO.File]::CreateText('/etc/x')",
+    "$s = @'\ndon't\n'@\n[IO.File]::Delete('/etc/x')", "<# it's #> [IO.File]::Delete('/etc/x')",
+    "Write-Host it`'s; [IO.File]::Delete('/etc/x')",
+])
+def test_powershell_found_in_second_review(command):
+    assert ps(command) == "ask"

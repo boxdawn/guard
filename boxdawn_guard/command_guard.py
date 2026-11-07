@@ -755,16 +755,21 @@ class _Judge:
     def _env(self, args: list[Value], rest: list[Value], depth: int, fed: bool, text: Value) -> None:
         """`env -C dir` moves the one command it runs, so the rest of the line stays."""
         options = args[:len(args) - len(rest)]
-        for code in _option_values(options, ("-S", "--split-string")):
-            if code is None:
-                self.flag("ask", "code.runtime", "`env` runs code known only at run time")
-            else:
-                self.run(code, depth + 1)
         outer = self.workdirs
         for d in _env_dirs(options):
             self.workdirs = [None if d is None else self._absolute(d, base or self.cwd) for base in self.workdirs]
         try:
-            if rest:
+            split = False
+            for i, a in enumerate(options):
+                m = re.fullmatch(r"-[iv0]*S(.*)|--split-string(?:=(.*))?", a or "")
+                if m:
+                    split = True
+                    code = m.group(1) or m.group(2) or (options[i + 1] if i + 1 < len(options) else None)
+                    if code is None or None in rest:
+                        self.flag("ask", "code.runtime", "`env` runs code known only at run time")
+                    else:
+                        self.run(" ".join([code, *rest]), depth + 1)  # the words after it are its arguments
+            if rest and not split:
                 self._judge(rest[0], rest[1:], depth, stdin_fed=fed, stdin_text=text)
         finally:
             self.workdirs = outer
@@ -972,9 +977,10 @@ class _Judge:
         source away from where it was, so a source outside counts too."""
         target_dir: Value = None
         has_target_dir = False
-        bundled = {a for a in args if a and re.fullmatch(r"-[A-Za-z]+t", a)}  # `-rt dir`
         # install's `-g bin`, `-gbin`: letters of a value are no options
-        flags = _short_flags([a for a in args if name != "install" or not (a and re.match(r"-[gomSt]", a))])
+        own = [a for a in args if name != "install" or not (a and re.match(r"-[gomS]", a))]
+        flags = _short_flags([a for a in own if not (a and re.match(r"-[A-Za-z]*t.", a))])
+        bundled = {a for a in own if a and re.fullmatch(r"-[A-Za-z]+t", a)}  # `-rt dir`
         for i, a in enumerate(args):
             if a in ("-t", "--target-directory") or a in bundled:
                 has_target_dir = True
@@ -982,10 +988,13 @@ class _Judge:
             elif a is not None and a.startswith("--target-directory="):
                 has_target_dir = True
                 target_dir = a.split("=", 1)[1]
+            elif a in own and a is not None and (m := re.fullmatch(r"-[A-Za-z]*t(.+)", a)):
+                has_target_dir = True
+                target_dir = m.group(1)
         if name == "install" and "d" in flags:
             return  # makes directories, replaces nothing
-        operands = _operands(args, takes_value={"-t", "--target-directory", "-S", "--suffix", "-m", "--mode",
-                                                "-o", "--owner", "-g", "--group"} | bundled)
+        values = {"-m", "--mode", "-o", "--owner", "-g", "--group"} if name == "install" else set()
+        operands = _operands(args, takes_value={"-t", "--target-directory", "-S", "--suffix"} | values | bundled)
         if has_target_dir:
             dests, sources = [target_dir], operands
         elif len(operands) >= 2:
@@ -1021,8 +1030,9 @@ class _Judge:
         letters = {letter for letter, _ in short}
         dests: list[Value] = []
         if "x" in letters or "--extract" in args or "--get" in args:
-            dests = [v for letter, v in short if letter == "C"] + _option_values(args, ("--directory", "--dir"))
-            dests = dests or ["."]
+            dests = [v for letter, v in short if letter == "C"] + _option_values(
+                args, ("--directory", "--dir", "--one-top-level"))
+            dests = [v and v.rstrip("/") + "/x" for v in dests or ["."]]
         elif letters & {"c", "r", "u", "A"} or {"--create", "--append", "--update"} & set(args):
             dests = [v for letter, v in short if letter == "f"] + _option_values(args, ("--file",))
         for dest in dests:
@@ -1033,9 +1043,11 @@ class _Judge:
     def _unzip(self, name: str, args: list[Value], depth: int) -> None:
         dests: list[Value] = []
         for i, a in enumerate(args):
-            if a is not None and (m := re.fullmatch(r"-[A-Za-z]*d(.*)", a)):
+            if a is not None and (m := re.fullmatch(r"-[A-Za-z]*?d(.*)", a)):
                 dests.append(m.group(1) or (args[i + 1] if i + 1 < len(args) else None))
-        for dest in dests or ["."]:
+        if not dests and any(a and re.fullmatch(r"-[a-ce-zA-Z]*[ltpvZ][a-ce-zA-Z]*", a) for a in args):
+            return  # lists or tests, writes nothing
+        for dest in [v and v.rstrip("/") + "/x" for v in dests or ["."]]:
             if (where := self._where(dest)) in ("outside", "unknown"):
                 said = "a path known only at run time" if dest is None else f"`{dest}` outside the project"
                 self.flag("ask", "unzip.outside", f"`unzip` writes over {said}", where)
@@ -1044,7 +1056,8 @@ class _Judge:
         """`--delete` empties the destination of what the source lacks, so outside
         the project it is `rm -rf`. A remote destination cannot be looked at."""
         operands = _operands(args, takes_value=_RSYNC_VALUES)
-        if len(operands) < 2 or "n" in _short_flags(args) or "--dry-run" in args:
+        dry = "--dry-run" in args or any(a and re.fullmatch(r"-(?![efBTM])[A-Za-z]*n[A-Za-z]*", a) for a in args)
+        if len(operands) < 2 or dry:
             return
         dest = operands[-1]
         deletes = any(a is not None and (a == "--del" or a.startswith("--delete")) for a in args)
@@ -1215,31 +1228,32 @@ _RSYNC_VALUES = frozenset({"-e", "--rsh", "--exclude", "--include", "--filter", 
                            "--backup-dir", "--compare-dest", "--link-dest", "--copy-dest", "--chmod",
                            "--chown", "--max-size", "--min-size", "--out-format", "--info", "--debug",
                            "--suffix", "--block-size", "--log-file-format", "--iconv", "--sockopts",
-                           "--contimeout", "--address", "--skip-compress", "--compress-choice"})
+                           "--contimeout", "--address", "--skip-compress", "--compress-choice", "--max-delete",
+                           "--modify-window", "-B", "--stop-after", "--stop-at", "--max-alloc", "-M",
+                           "--remote-option", "--checksum-choice", "--compress-level", "--groupmap",
+                           "--usermap", "--write-batch", "--only-write-batch", "--read-batch",
+                           "--protocol", "--early-input"})
 _MAX_BRACE_WORDS = 1024
 _MAX_BRACE_LENGTH = 2048
 _TAR_VALUE_LETTERS = "fCTXbKNFgHILV"
 
 
 def _brace_split(word: str) -> Optional[list[str]]:
-    """The words one `{a,b}` in `word` makes, or None when it has no such brace."""
-    for start, ch in enumerate(word):
-        if ch != "{":
-            continue
-        depth, cuts = 0, [start]
-        for i in range(start, len(word)):
-            if word[i] == "{":
-                depth += 1
-            elif word[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    if len(cuts) == 1:
-                        break  # `{x}` stays as it is
-                    cuts.append(i)
-                    return [word[:start] + word[a + 1:b] + word[i + 1:] for a, b in zip(cuts, cuts[1:])]
-            elif word[i] == "," and depth == 1:
-                cuts.append(i)
-    return None
+    """The words the first `{a,b}` in `word` makes, or None when it has no such brace."""
+    open_braces: list[list[int]] = []
+    best: Optional[list[int]] = None
+    for i, ch in enumerate(word):
+        if ch == "{":
+            open_braces.append([i])
+        elif ch == "," and open_braces:
+            open_braces[-1].append(i)
+        elif ch == "}" and open_braces:
+            cuts = open_braces.pop()
+            if len(cuts) > 1 and (best is None or cuts[0] < best[0]):
+                best = cuts + [i]
+    if best is None:
+        return None
+    return [word[:best[0]] + word[a + 1:b] + word[best[-1] + 1:] for a, b in zip(best, best[1:])]
 
 
 def _braces(word: str) -> list[Value]:
@@ -1266,7 +1280,7 @@ def _env_dirs(options: list[Value]) -> list[Value]:
     for i, a in enumerate(options):
         if a is None:
             continue
-        m = re.fullmatch(r"-[A-Za-z0]*C(.*)|--chdir(?:=(.*))?", a)
+        m = re.fullmatch(r"-[iv0]*C(.*)|--chdir(?:=(.*))?", a)
         if m:
             given = m.group(1) or m.group(2)
             out.append(given or (options[i + 1] if i + 1 < len(options) else None))
@@ -1356,7 +1370,7 @@ def _unwrap(name: str, args: list[Value]) -> list[Value]:
     if name == "env":
         i = 0
         while i < len(args) and args[i] is not None and (args[i].startswith("-") or "=" in args[i]):
-            i += 2 if args[i] in ("--chdir", "--unset") or re.fullmatch(r"-[A-Za-z0]*[uCS]", args[i]) else 1
+            i += 2 if args[i] in ("--chdir", "--unset") or re.fullmatch(r"-[iv0]*[uCS]", args[i]) else 1
         return args[i:]
     if name == "nice":
         return _strip_options(args, {"-n", "--adjustment"})

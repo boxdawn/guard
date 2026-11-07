@@ -132,7 +132,7 @@ _ITEMS = frozenset({"new-item", "set-item", "remove-item", "clear-item", "rename
 _SELF = frozenset({"powershell", "pwsh"})
 _HARMLESS = frozenset({"nul", "$null"})
 _DOTNET = re.compile(r"(?i)\[\s*(?:system\.)?io\.(?:file|directory)\s*\]\s*::\s*"
-                     r"(delete|move|replace|copy|create|openwrite|write\w*)\s*\(")
+                     r"(delete|move|replace|copy|create\w*|openwrite|write\w*)\s*\(")
 _LITERAL = re.compile(r"""'([^']*)'|"([^"]*)\"""")
 _HERE = re.compile(r"(?i)^\$(?:pwd|\(pwd\)|\(get-location\))[\\/]")
 
@@ -441,8 +441,12 @@ class _PowerShell:
         for m in _DOTNET.finditer(code):
             verb = m.group(1)
             writes = verb.lower().startswith(("write", "create", "openwrite"))
-            paths = _dotnet_paths(text, code, m.end(), writes or verb.lower() == "delete")
-            for t in paths[1:] if verb.lower() == "copy" else paths:  # Copy only reads its source
+            paths = _dotnet_paths(text, code, m.end())
+            if verb.lower() == "copy":
+                paths = paths[1:2]  # its source is only read
+            elif writes or verb.lower() == "delete":
+                paths = paths[:1]
+            for t in paths:
                 where = self._where(t)
                 if where == "outside" or (where == "unknown" and not writes):
                     said = "a path known only at run time" if t is None else f"`{t}` outside the project"
@@ -599,44 +603,65 @@ class _PowerShell:
 def _code_only(text: str) -> str:
     """`text` with strings and comments blanked, same length: what is left is code."""
     out = list(text)
-    quote = None
+
+    def blank(i: int, until: int) -> int:
+        out[i:until] = " " * (until - i)
+        return until
+
     i = 0
+    quote = None
     while i < len(text):
         ch = text[i]
         if quote:
+            if quote == '"' and ch == "`":
+                i = blank(i, min(i + 2, len(text)))
+                continue
             out[i] = " "
-            if quote == '"' and ch == "`" and i + 1 < len(text):
-                i += 1
-                out[i] = " "
-            elif ch == quote:
+            if ch == quote:
                 quote = None
+        elif ch == "`":
+            i += 2
+            continue
+        elif text.startswith(("@'", '@"'), i):
+            close = text.find(text[i + 1] + "@", i + 2)
+            i = blank(i, len(text) if close < 0 else close + 2)
+            continue
+        elif text.startswith("<#", i):
+            close = text.find("#>", i + 2)
+            i = blank(i, len(text) if close < 0 else close + 2)
+            continue
         elif ch in "'\"":
             quote = ch
             out[i] = " "
         elif ch == "#" and (i == 0 or text[i - 1].isspace() or text[i - 1] in ";(|{"):
-            while i < len(text) and text[i] != "\n":
-                out[i] = " "
-                i += 1
+            close = text.find("\n", i)
+            i = blank(i, len(text) if close < 0 else close)
             continue
         i += 1
     return "".join(out)
 
 
-def _dotnet_paths(text: str, code: str, start: int, first_only: bool) -> list[Value]:
-    """The paths in the call whose `(` ends at `start`: a literal, or None for anything else."""
-    depth, end = 1, start
+def _dotnet_paths(text: str, code: str, start: int) -> list[Value]:
+    """Each argument of the call whose `(` ends at `start`: a literal, or None for anything else."""
+    depth, cuts, end = 1, [start - 1], start
     while end < len(code) and depth:
         depth += {"(": 1, ")": -1}.get(code[end], 0)
+        if code[end] == "," and depth == 1:
+            cuts.append(end)
         end += 1
-    call = text[start:end - 1 if depth == 0 else end]
+    cuts.append(end - 1 if depth == 0 else end)
     paths: list[Value] = []
-    for m in _LITERAL.finditer(call):
-        single = m.group(1) is not None
-        value = m.group(1) if single else _HERE.sub("", m.group(2))
-        paths.append(value if single or "$" not in value else None)
-    if not re.match(r"[\s(]*['\"]", call):
-        paths.insert(0, None)  # the first argument is not a literal
-    return paths[:1] if first_only else paths
+    for a, b in zip(cuts, cuts[1:]):
+        arg = text[a + 1:b].strip(" \t\r\n()")
+        m = _LITERAL.fullmatch(arg)
+        if m is None:
+            paths.append(None)
+        elif m.group(1) is not None:
+            paths.append(m.group(1))
+        else:
+            value = _HERE.sub("", m.group(2))
+            paths.append(None if "$" in value else value)
+    return paths
 
 
 def _canonical(name: Optional[str]) -> Optional[str]:
