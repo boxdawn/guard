@@ -114,6 +114,7 @@ RULE_IDS = frozenset({
     "db.destructive", "db.runtime", "db.file",
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
     "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
+    "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -325,7 +326,7 @@ class _Judge:
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
         outer = (self.env, self.workdirs)
         self.env = self._collect_env(root)
-        self._collect_workdirs(root)
+        self._collect_workdirs(root, depth)
         try:
             for node in _walk(root):
                 if node.type == "command":
@@ -428,10 +429,11 @@ class _Judge:
                 return
 
     # paths ──────────────────────────────────────────────────────────────
-    def _collect_workdirs(self, root: Node) -> None:
+    def _collect_workdirs(self, root: Node, depth: int = 0) -> None:
         """`cd` moves where relative paths point. Order is not tracked, so a
-        relative path is judged against every directory the line may be in."""
-        self.workdirs = [self.cwd]
+        relative path is judged against every directory the line may be in.
+        Code nested in `bash -c` or `eval` starts where the line around it is."""
+        self.workdirs = list(dict.fromkeys(self.workdirs)) if depth and self.workdirs else [self.cwd]
         for node in _walk(root):
             if node.type != "command":
                 continue
@@ -638,11 +640,18 @@ class _Judge:
             return "", []
         inner = name_node.named_children[0] if name_node.named_children else name_node
         name = _value(inner, self.env)
+        extra: list[Value] = []
+        if name is not None and inner.type not in ("string", "raw_string"):
+            name, *extra = _braces(name)
         if name is not None:
             name = posixpath.basename(name.replace("\\", "/"))
             if name.lower().endswith(".exe"):
                 name = name[:-4]
-        args = [_value(a, self.env) for a in node.children_by_field_name("argument")]
+        args = extra
+        for a in node.children_by_field_name("argument"):
+            value = _value(a, self.env)
+            unquoted = a.type == "concatenation" and any(c.type == "word" and b"{" in c.text for c in a.children)
+            args.extend(_braces(value) if value is not None and unquoted else [value])
         return name, args
 
     def _command(self, node: Node, depth: int) -> None:
@@ -688,6 +697,9 @@ class _Judge:
 
         if name in r.wrappers:
             rest = _unwrap(name, args)
+            if name == "env":
+                self._env(args, rest, depth, stdin_fed, stdin_text)
+                return
             if name == "xargs":
                 if rest:
                     self._judge(rest[0], rest[1:] + [None], depth)
@@ -740,6 +752,28 @@ class _Judge:
         elif name in r.db_clients:
             self._db(name, args)
 
+    def _env(self, args: list[Value], rest: list[Value], depth: int, fed: bool, text: Value) -> None:
+        """`env -C dir` moves the one command it runs, so the rest of the line stays."""
+        options = args[:len(args) - len(rest)]
+        outer = self.workdirs
+        for d in _env_dirs(options):
+            self.workdirs = [None if d is None else self._absolute(d, base or self.cwd) for base in self.workdirs]
+        try:
+            split = False
+            for i, a in enumerate(options):
+                m = re.fullmatch(r"-[iv0]*S(.*)|--split-string(?:=(.*))?", a or "")
+                if m:
+                    split = True
+                    code = m.group(1) or m.group(2) or (options[i + 1] if i + 1 < len(options) else None)
+                    if code is None or None in rest:
+                        self.flag("ask", "code.runtime", "`env` runs code known only at run time")
+                    else:
+                        self.run(" ".join([code, *rest]), depth + 1)  # the words after it are its arguments
+            if rest and not split:
+                self._judge(rest[0], rest[1:], depth, stdin_fed=fed, stdin_text=text)
+        finally:
+            self.workdirs = outer
+
     def _custom(self, name: str, args: list[Value]) -> None:
         """The org's rules on this one command. Judged here, so a rule meets
         the command inside sudo, env, xargs, `bash -c` and eval as well. The
@@ -768,7 +802,9 @@ class _Judge:
             return
         if "&" in op and dest_node.type == "number":
             return  # 2>&1
-        dest = _value(dest_node, self.env)
+        self._output(_value(dest_node, self.env), appends=">>" in op)
+
+    def _output(self, dest: Value, appends: bool) -> None:
         if dest is None:
             self.flag("ask", "redirect.runtime", "output is written to a path known only at run time", "unknown")
             return
@@ -777,7 +813,7 @@ class _Judge:
         if dest.startswith(self.rules.devices):
             self.flag("deny", "redirect.disk_device", f"output overwrites the disk device `{dest}`", "disk_device")
             return
-        if self._where(dest) == "outside" and ">>" not in op:
+        if self._where(dest) == "outside" and not appends:
             self.flag("ask", "redirect.outside", f"output is written to `{dest}` outside the project", "outside")
 
     def _redirect_reads_secret(self, node: Node) -> bool:
@@ -865,7 +901,9 @@ class _Judge:
 
     def _find(self, name: str, args: list[Value], depth: int) -> None:
         roots: list[Value] = []
-        for a in args:
+        lead = next((i for i, a in enumerate(args) if a not in ("-H", "-L", "-P")), len(args))
+        follows = "-L" in args[:lead] or "-H" in args[:lead] or "-follow" in args
+        for a in args[lead:]:
             if a is not None and (a.startswith("-") or a in ("(", "!")):
                 break
             roots.append(a)
@@ -885,7 +923,12 @@ class _Judge:
                     continue
                 found = self._find_secret(args)
                 for root in roots:
-                    filled = [(found or root) if s == "{}" else s for s in sub]
+                    each = found or root
+                    if follows and each is not None:
+                        each = each.rstrip("/") + "/"  # what `-L` reaches is behind the link
+                    filled = [each if s == "{}" else
+                              s.replace("{}", each) if s is not None and each is not None else
+                              None if s is not None and "{}" in s else s for s in sub]
                     self._judge(filled[0], filled[1:], depth)
 
     def _dd(self, name: str, args: list[Value], depth: int) -> None:
@@ -934,21 +977,31 @@ class _Judge:
         source away from where it was, so a source outside counts too."""
         target_dir: Value = None
         has_target_dir = False
+        # install's `-g bin`, `-gbin`: letters of a value are no options
+        own = [a for a in args if name != "install" or not (a and re.match(r"-[gomS]", a))]
+        flags = _short_flags([a for a in own if not (a and re.match(r"-[A-Za-z]*t.", a))])
+        bundled = {a for a in own if a and re.fullmatch(r"-[A-Za-z]+t", a)}  # `-rt dir`
         for i, a in enumerate(args):
-            if a in ("-t", "--target-directory"):
+            if a in ("-t", "--target-directory") or a in bundled:
                 has_target_dir = True
                 target_dir = args[i + 1] if i + 1 < len(args) else None
             elif a is not None and a.startswith("--target-directory="):
                 has_target_dir = True
                 target_dir = a.split("=", 1)[1]
-        operands = _operands(args, takes_value={"-t", "--target-directory", "-S", "--suffix"})
+            elif a in own and a is not None and (m := re.fullmatch(r"-[A-Za-z]*t(.+)", a)):
+                has_target_dir = True
+                target_dir = m.group(1)
+        if name == "install" and "d" in flags:
+            return  # makes directories, replaces nothing
+        values = {"-m", "--mode", "-o", "--owner", "-g", "--group"} if name == "install" else set()
+        operands = _operands(args, takes_value={"-t", "--target-directory", "-S", "--suffix"} | values | bundled)
         if has_target_dir:
             dests, sources = [target_dir], operands
         elif len(operands) >= 2:
             dests, sources = operands[-1:], operands[:-1]
         else:
             return
-        keeps_old = bool(_short_flags(args) & {"n", "b"}) or any(
+        keeps_old = bool(flags & {"n", "b"}) or any(
             a is not None and (a in ("--no-clobber", "--update=none") or a.startswith("--backup"))
             for a in args)
         if not keeps_old:
@@ -957,8 +1010,8 @@ class _Judge:
                 if where not in ("outside", "unknown"):
                     continue
                 said = "a path known only at run time" if dest is None else f"`{dest}` outside the project"
-                if name == "cp":
-                    self.flag("ask", "cp.outside", f"`cp` writes over {said}", where)
+                if name != "mv":
+                    self.flag("ask", "cp.outside", f"`{name}` writes over {said}", where)
                 else:
                     self.flag("ask", "mv.outside", f"`mv` writes over {said}", where)
         if name == "mv":
@@ -966,6 +1019,67 @@ class _Judge:
                 if (where := self._where(source, removes_link=True)) in ("outside", "unknown"):
                     said = "a path known only at run time" if source is None else f"`{source}` outside the project"
                     self.flag("ask", "mv.outside", f"`mv` takes away {said}", where)
+
+    def _tee(self, name: str, args: list[Value], depth: int) -> None:
+        appends = "a" in _short_flags(args) or "--append" in args
+        for dest in _operands(args):
+            self._output(dest, appends)
+
+    def _tar(self, name: str, args: list[Value], depth: int) -> None:
+        short = _tar_short(args)
+        letters = {letter for letter, _ in short}
+        dests: list[Value] = []
+        if "x" in letters or "--extract" in args or "--get" in args:
+            dests = [v for letter, v in short if letter == "C"] + _option_values(
+                args, ("--directory", "--dir", "--one-top-level"))
+            dests = [v and v.rstrip("/") + "/x" for v in dests or ["."]]
+        elif letters & {"c", "r", "u", "A"} or {"--create", "--append", "--update"} & set(args):
+            dests = [v for letter, v in short if letter == "f"] + _option_values(args, ("--file",))
+        for dest in dests:
+            if dest != "-" and (where := self._where(dest)) in ("outside", "unknown"):
+                said = "a path known only at run time" if dest is None else f"`{dest}` outside the project"
+                self.flag("ask", "tar.outside", f"`tar` writes over {said}", where)
+
+    def _unzip(self, name: str, args: list[Value], depth: int) -> None:
+        dests: list[Value] = []
+        for i, a in enumerate(args):
+            if a is not None and (m := re.fullmatch(r"-[A-Za-z]*?d(.*)", a)):
+                dests.append(m.group(1) or (args[i + 1] if i + 1 < len(args) else None))
+        if not dests and any(a and re.fullmatch(r"-[a-ce-zA-Z]*[ltpvZ][a-ce-zA-Z]*", a) for a in args):
+            return  # lists or tests, writes nothing
+        for dest in [v and v.rstrip("/") + "/x" for v in dests or ["."]]:
+            if (where := self._where(dest)) in ("outside", "unknown"):
+                said = "a path known only at run time" if dest is None else f"`{dest}` outside the project"
+                self.flag("ask", "unzip.outside", f"`unzip` writes over {said}", where)
+
+    def _rsync(self, name: str, args: list[Value], depth: int) -> None:
+        """`--delete` empties the destination of what the source lacks, so outside
+        the project it is `rm -rf`. A remote destination cannot be looked at."""
+        operands = _operands(args, takes_value=_RSYNC_VALUES)
+        dry = "--dry-run" in args or any(a and re.fullmatch(r"-(?![efBTM])[A-Za-z]*n[A-Za-z]*", a) for a in args)
+        if len(operands) < 2 or dry:
+            return
+        dest = operands[-1]
+        deletes = any(a is not None and (a == "--del" or a.startswith("--delete")) for a in args)
+        if "--remove-source-files" in args:
+            for source in operands[:-1]:
+                if (where := self._where(source)) in ("outside", "unknown"):
+                    said = "a path known only at run time" if source is None else f"`{source}` outside the project"
+                    self.flag("ask", "rsync.outside", f"`rsync` takes away {said}", where)
+        if dest is not None and re.match(r"^(rsync://|[^/\\:]{2,}:)", dest):
+            if deletes:
+                self.flag("ask", "rsync.delete", f"`rsync --delete` removes files on another machine: `{dest}`")
+            return
+        where = self._where(dest)
+        if where not in ("outside", "unknown"):
+            return
+        said = "a path known only at run time" if dest is None else f"`{dest}` outside the project"
+        if deletes:
+            # a run-time destination may be another machine (`deploy@$HOST:/srv`)
+            self.flag("deny" if where == "outside" else "ask", "rsync.delete",
+                      f"`rsync --delete` removes files under {said}", where)
+        else:
+            self.flag("ask", "rsync.outside", f"`rsync` writes over {said}", where)
 
     def _git(self, name: str, args: list[Value], depth: int) -> None:
         i = 0
@@ -1045,7 +1159,9 @@ _HANDLERS = {
     "rm": _Judge._rm, "rmdir": _Judge._rm, "unlink": _Judge._rm, "ln": _Judge._ln,
     "find": _Judge._find, "dd": _Judge._dd, "truncate": _Judge._truncate,
     "chmod": _Judge._chmod, "chown": _Judge._chmod, "chgrp": _Judge._chmod,
-    "sed": _Judge._sed, "cp": _Judge._cp_mv, "mv": _Judge._cp_mv, "git": _Judge._git,
+    "sed": _Judge._sed, "cp": _Judge._cp_mv, "mv": _Judge._cp_mv, "install": _Judge._cp_mv,
+    "git": _Judge._git, "tee": _Judge._tee, "tar": _Judge._tar, "unzip": _Judge._unzip,
+    "rsync": _Judge._rsync,
     "terraform": _Judge._infra, "tofu": _Judge._infra, "pulumi": _Judge._infra,
     "kubectl": _Judge._infra, "helm": _Judge._infra, "aws": _Judge._infra,
     "gcloud": _Judge._infra, "az": _Judge._infra, "docker": _Judge._infra,
@@ -1106,6 +1222,111 @@ def _walk(node: Node):
         stack.extend(reversed(n.children))
 
 
+_RSYNC_VALUES = frozenset({"-e", "--rsh", "--exclude", "--include", "--filter", "-f", "--files-from",
+                           "--exclude-from", "--include-from", "--port", "--password-file", "--rsync-path",
+                           "--log-file", "--bwlimit", "--timeout", "-T", "--temp-dir", "--partial-dir",
+                           "--backup-dir", "--compare-dest", "--link-dest", "--copy-dest", "--chmod",
+                           "--chown", "--max-size", "--min-size", "--out-format", "--info", "--debug",
+                           "--suffix", "--block-size", "--log-file-format", "--iconv", "--sockopts",
+                           "--contimeout", "--address", "--skip-compress", "--compress-choice", "--max-delete",
+                           "--modify-window", "-B", "--stop-after", "--stop-at", "--max-alloc", "-M",
+                           "--remote-option", "--checksum-choice", "--compress-level", "--groupmap",
+                           "--usermap", "--write-batch", "--only-write-batch", "--read-batch",
+                           "--protocol", "--early-input"})
+_MAX_BRACE_WORDS = 1024
+_MAX_BRACE_LENGTH = 2048
+_TAR_VALUE_LETTERS = "fCTXbKNFgHILV"
+
+
+def _brace_split(word: str) -> Optional[list[str]]:
+    """The words the first `{a,b}` in `word` makes, or None when it has no such brace."""
+    open_braces: list[list[int]] = []
+    best: Optional[list[int]] = None
+    for i, ch in enumerate(word):
+        if ch == "{":
+            open_braces.append([i])
+        elif ch == "," and open_braces:
+            open_braces[-1].append(i)
+        elif ch == "}" and open_braces:
+            cuts = open_braces.pop()
+            if len(cuts) > 1 and (best is None or cuts[0] < best[0]):
+                best = cuts + [i]
+    if best is None:
+        return None
+    return [word[:best[0]] + word[a + 1:b] + word[best[-1] + 1:] for a, b in zip(best, best[1:])]
+
+
+def _braces(word: str) -> list[Value]:
+    """What the shell makes of an unquoted word. Too many words is a path not known."""
+    if "{" in word and len(word) > _MAX_BRACE_LENGTH:
+        return [None]
+    done: list[Value] = []
+    todo = [word]
+    while todo:
+        if len(done) + len(todo) > _MAX_BRACE_WORDS:
+            return [None]
+        current = todo.pop()
+        split = _brace_split(current)
+        if split is None:
+            done.append(current)
+        else:
+            todo.extend(reversed(split))
+    return done
+
+
+def _env_dirs(options: list[Value]) -> list[Value]:
+    """Each directory `env` moves to, in order: `-C d`, `-iC d`, `-Cd`, `--chdir d`, `--chdir=d`."""
+    out: list[Value] = []
+    for i, a in enumerate(options):
+        if a is None:
+            continue
+        m = re.fullmatch(r"-[iv0]*C(.*)|--chdir(?:=(.*))?", a)
+        if m:
+            given = m.group(1) or m.group(2)
+            out.append(given or (options[i + 1] if i + 1 < len(options) else None))
+    return out
+
+
+def _tar_short(args: list[Value]) -> list[tuple[str, Value]]:
+    """Each short option of `tar` with its value: `-xC dir`, `-Cdir`, `-czfa.tgz`, and the
+    old form with no dash, where the values follow in order (`xfC a.tar dir`)."""
+    out: list[tuple[str, Value]] = []
+    taken: set[int] = set()
+    for i, a in enumerate(args):
+        dashed = a is not None and a.startswith("-") and not a.startswith("--") and a != "-"
+        if i in taken or a is None or not (dashed or (i == 0 and not a.startswith("-"))):
+            continue
+        word = a[1:] if dashed else a
+        following = i + 1
+        for k, letter in enumerate(word):
+            if letter not in _TAR_VALUE_LETTERS:
+                out.append((letter, None))
+            elif dashed and word[k + 1:]:
+                out.append((letter, word[k + 1:]))
+                break
+            else:
+                out.append((letter, args[following] if following < len(args) else None))
+                taken.add(following)
+                following += 1
+                if dashed:
+                    break
+    return out
+
+
+def _option_values(args: list[Value], names: tuple[str, ...]) -> list[Value]:
+    """The values of an option: `-C dir`, `-Cdir`, `--directory dir`, `--directory=dir`."""
+    out: list[Value] = []
+    for i, a in enumerate(args):
+        if a is None:
+            continue
+        for n in names:
+            if a == n:
+                out.append(args[i + 1] if i + 1 < len(args) else None)
+            elif a.startswith(n + "=") if n.startswith("--") else a.startswith(n):
+                out.append(a[len(n) + n.startswith("--"):])
+    return out
+
+
 def _operands(args: list[Value], takes_value: frozenset[str] | set[str] = frozenset()) -> list[Value]:
     out: list[Value] = []
     skip = False
@@ -1149,7 +1370,7 @@ def _unwrap(name: str, args: list[Value]) -> list[Value]:
     if name == "env":
         i = 0
         while i < len(args) and args[i] is not None and (args[i].startswith("-") or "=" in args[i]):
-            i += 2 if args[i] in ("-u", "-C", "-S") else 1
+            i += 2 if args[i] in ("--chdir", "--unset") or re.fullmatch(r"-[iv0]*[uCS]", args[i]) else 1
         return args[i:]
     if name == "nice":
         return _strip_options(args, {"-n", "--adjustment"})
