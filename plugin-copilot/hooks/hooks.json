@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "sh \"$CLAUDE_PLUGIN_ROOT/scripts/place.sh\"",
+        "powershell": "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\scripts\\place.ps1\"",
+        "timeoutSec": 60
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "\"$CLAUDE_PLUGIN_DATA/current/bdxguard.exe\" copilot-hook",
+        "powershell": "& \"$env:CLAUDE_PLUGIN_DATA\\current\\bdxguard.exe\" copilot-hook",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}

@@ -96,6 +96,19 @@ jobs:
           (cd plugin && zip -qr ../boxdawn-guard-plugin.zip .)
           sha256sum boxdawn-guard-plugin.zip | tee boxdawn-guard-plugin.zip.sha256
           ls -la boxdawn-guard-plugin.zip
+      # The GitHub Copilot CLI plugin: the same builds and place scripts under
+      # plugin-copilot's own manifest and hooks. Copilot installs from a git
+      # ref, not a zip, so the release pushes this tree to boxdawn/guard-copilot.
+      - name: assemble the Copilot plugin
+        run: |
+          set -eu
+          rm -rf copilot && mkdir copilot
+          cp -R plugin-copilot/. copilot/
+          cp -R plugin/scripts copilot/scripts
+          cp -R plugin/dist copilot/dist
+          chmod +x copilot/dist/*/bdxguard copilot/dist/*/bdxguard.exe copilot/scripts/place.sh
+          tar -czf boxdawn-guard-copilot.tar.gz -C copilot .
+          ls -la boxdawn-guard-copilot.tar.gz
       # One archive per OS for the directory plugin (boxdawn/guard-plugin),
       # which downloads only its own machine's build at session start. tar.gz
       # everywhere: Windows 10+ ships tar.exe, minimal Linux may lack unzip.
@@ -122,6 +135,11 @@ jobs:
         with:
           name: bdxguard-archives
           path: archives
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boxdawn-guard-copilot
+          path: boxdawn-guard-copilot.tar.gz
           retention-days: 7
 
   # Real Claude Code sessions against the installed plugin. Costs API calls
@@ -219,6 +237,9 @@ jobs:
         with:
           name: bdxguard-archives
           path: archives
+      - uses: actions/download-artifact@v4
+        with:
+          name: boxdawn-guard-copilot
       - name: tag matches the plugin version
         run: |
           v=$(python3 -c "import json; print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])")
@@ -228,6 +249,44 @@ jobs:
           esac
           sha256sum -c boxdawn-guard-plugin.zip.sha256
           (cd archives && sha256sum -c bdxguard-archives.sha256)
+      # The Copilot plugin goes to its own public repository, one tag per
+      # release, so this repository (which Claude Code clones for the
+      # marketplace) does not grow by every build. Without the deploy key the
+      # Claude release goes on alone.
+      - name: Copilot plugin repository
+        id: copilot
+        env:
+          KEY: ${{ secrets.COPILOT_DIST_DEPLOY_KEY }}
+        run: |
+          set -eu
+          if [ -z "$KEY" ]; then
+            echo "::warning::COPILOT_DIST_DEPLOY_KEY is not set: no Copilot build for $GITHUB_REF_NAME"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          v=$(python3 -c "import json; print(json.load(open('plugin-copilot/plugin.json'))['version'])")
+          case "$GITHUB_REF_NAME" in
+            "v$v"|"v$v"-rc.*) ;;
+            *) echo "::error::tag $GITHUB_REF_NAME does not match the Copilot plugin version $v"; exit 1 ;;
+          esac
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/copilot_dist
+          chmod 600 ~/.ssh/copilot_dist
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/copilot_dist -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q git@github.com:boxdawn/guard-copilot.git dist-repo
+          find dist-repo -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          mkdir dist-repo/plugin
+          tar -xzf boxdawn-guard-copilot.tar.gz -C dist-repo/plugin
+          cp LICENSE.md dist-repo/
+          printf '%s\n' "# Boxdawn guard for GitHub Copilot CLI" "" \
+            "Built files only. Source, install steps and limits: https://github.com/boxdawn/guard" \
+            "" "This build: $GITHUB_REF_NAME, from boxdawn/guard $GITHUB_SHA." > dist-repo/README.md
+          git -C dist-repo add -A
+          git -C dist-repo -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -qm "boxdawn-guard $GITHUB_REF_NAME, built from boxdawn/guard $GITHUB_SHA"
+          git -C dist-repo tag "$GITHUB_REF_NAME"
+          git -C dist-repo push -q origin HEAD:main "refs/tags/$GITHUB_REF_NAME"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -238,6 +297,8 @@ jobs:
             $pre --title "boxdawn-guard $GITHUB_REF_NAME" \
             --notes "Built from $GITHUB_SHA. sha256: $(cut -d' ' -f1 boxdawn-guard-plugin.zip.sha256)"
       - name: marketplace branch
+        env:
+          COPILOT_PUSHED: ${{ steps.copilot.outputs.pushed }}
         run: |
           git fetch -q origin main
           git switch -q -c "release/$GITHUB_REF_NAME" origin/main
@@ -256,9 +317,22 @@ jobs:
           with open(path, "w") as f:
               json.dump(m, f, indent=2)
               f.write("\n")
+          # Copilot reads .github/plugin/marketplace.json when there is one.
+          if os.environ.get("COPILOT_PUSHED") == "true":
+              v = json.load(open("plugin-copilot/plugin.json"))["version"]
+              os.makedirs(".github/plugin", exist_ok=True)
+              with open(".github/plugin/marketplace.json", "w") as f:
+                  json.dump({"name": m["name"], "owner": m["owner"], "plugins": [{
+                      "name": "boxdawn-guard", "version": v,
+                      "description": "Judges each shell command before GitHub Copilot CLI runs it: deny, ask, or no decision.",
+                      "source": {"source": "github", "repo": "boxdawn/guard-copilot", "ref": tag, "path": "plugin"},
+                  }]}, f, indent=2)
+                  f.write("\n")
           PY
-          git diff
+          git add -A .claude-plugin
+          if [ -d .github/plugin ]; then git add -A .github/plugin; fi
+          git diff --cached
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -qam "release: point the marketplace at $GITHUB_REF_NAME"
+            commit -qm "release: point the marketplace at $GITHUB_REF_NAME"
           git push -q origin "release/$GITHUB_REF_NAME"
           echo "Open a PR: https://github.com/$GITHUB_REPOSITORY/compare/main...release/$GITHUB_REF_NAME"

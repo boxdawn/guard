@@ -18,6 +18,9 @@ if sys.argv[1:2] == ["fetch-rules"]:
         print(f"boxdawn guard block record: {sent}", file=sys.stderr)
     sys.exit(0)
 
-from boxdawn_guard.command_hook import main
+if sys.argv[1:2] == ["copilot-hook"]:
+    from boxdawn_guard.copilot_hook import main
+else:
+    from boxdawn_guard.command_hook import main
 
 sys.exit(main())
