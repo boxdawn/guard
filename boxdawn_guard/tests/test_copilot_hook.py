@@ -110,3 +110,13 @@ def test_the_plugin_manifest_has_no_schema():
     path = os.path.join(os.path.dirname(__file__), "..", "..", "plugin-copilot", "plugin.json")
     with open(path, encoding="utf-8") as f:
         assert "$schema" not in json.load(f)
+
+
+def test_the_copilot_plugin_carries_the_same_version():
+    """The release checks its tag against both manifests; a bump that misses one fails there."""
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    with open(os.path.join(root, "plugin-copilot", "plugin.json"), encoding="utf-8") as f:
+        copilot = json.load(f)["version"]
+    with open(os.path.join(root, "plugin", ".claude-plugin", "plugin.json"), encoding="utf-8") as f:
+        claude = json.load(f)["version"]
+    assert copilot == claude
