@@ -37,6 +37,109 @@ SEARCH_EXCLUDES = tuple("!" + _any_case(g) for g in (
 ))
 
 
+# `grep` matches a name, never a path, so what sits at a fixed path goes with its folder.
+# Short on purpose: the person asked reads this line. Any case only where upper case
+# is common. macOS `grep` has no `--exclude-from`, and there it finds nothing at all.
+GREPS = frozenset({"grep", "egrep", "fgrep", "rgrep"})
+GREP_FOLDERS = (".ssh", ".aws", ".kube", ".docker")
+_GREP_VALUE_LETTERS = "efABCmDd"
+_GREP_LONG_VALUES = ("--regexp", "--file", "--max-count", "--context", "--after-context", "--before-context",
+                     "--devices", "--include", "--exclude", "--exclude-dir", "--exclude-from", "--label",
+                     "--binary-files", "--group-separator")
+GREP_EXCLUDES = (
+    *(f"--exclude={n}" for n in (".env", *sorted(_NAMES), "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+                                 ".credentials.json", "hosts.yml")),
+    "--exclude='.env.*'", "--exclude='*.[pP]12'", "--exclude='*.[pP][fF][xX]'",
+    *(f"--exclude-dir={d}" for d in (".ssh", ".aws", ".docker", ".kube")),
+)
+_GREP_FLAGS_AS_READ = frozenset(g.replace("'", "") for g in GREP_EXCLUDES)
+
+
+# GNU grep's long options: it takes any start of one that fits no other.
+_GREP_LONG = (
+    "--extended-regexp", "--fixed-strings", "--basic-regexp", "--perl-regexp", "--regexp", "--file",
+    "--ignore-case", "--no-ignore-case", "--word-regexp", "--line-regexp", "--null-data", "--no-messages",
+    "--invert-match", "--version", "--help", "--max-count", "--byte-offset", "--line-number", "--no-line-number",
+    "--line-buffered", "--with-filename", "--no-filename", "--label", "--only-matching", "--quiet", "--silent",
+    "--binary-files", "--text", "--directories", "--devices", "--recursive", "--dereference-recursive",
+    "--include", "--exclude", "--exclude-from", "--exclude-dir", "--files-without-match", "--files-with-matches",
+    "--count", "--initial-tab", "--null", "--before-context", "--after-context", "--context",
+    "--group-separator", "--no-group-separator", "--color", "--colour", "--binary",
+)
+
+
+def _long_is(flag: str, name: str, shortest: int = 0) -> bool:
+    """`flag` is `name` as `grep` reads it: the whole name, or a start that fits no other."""
+    fits = [n for n in _GREP_LONG if n.startswith(flag)]
+    return flag == name or (len(flag) > 2 and fits == [name])
+
+
+def grep_reads(args: list) -> tuple[bool, list, bool]:
+    """(searches folders, the paths it is given, has `--include`), read like `grep` reads
+    them: bundles (`-rA2`, `-nd recurse`), shortened long options, a flag's value is not
+    a flag, and the first word is the pattern unless `-e` or `-f` gave one."""
+    recursive = includes = patterned = False
+    words: list = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a is None or not a.startswith("-") or a == "-":
+            words.append(a)
+        elif a == "--":
+            words += args[i:]
+            break
+        elif a.startswith("--"):
+            flag, equals, value = a.partition("=")
+            takes = not equals and any(_long_is(flag, n, 5) for n in _GREP_LONG_VALUES)
+            if _long_is(flag, "--directories", 4):
+                value = value or (args[i] if i < len(args) and args[i] else "")
+                takes = not equals
+                recursive = recursive or bool(value and "recurse".startswith(value))
+            recursive = recursive or _long_is(flag, "--recursive", 5) or _long_is(flag, "--dereference-recursive", 5)
+            includes = includes or _long_is(flag, "--include", 5)
+            patterned = patterned or _long_is(flag, "--regexp", 5) or _long_is(flag, "--file", 5)
+            i += 1 if takes else 0
+        else:
+            for at, letter in enumerate(a[1:], 1):
+                recursive = recursive or letter in "rR"
+                if letter in _GREP_VALUE_LETTERS:
+                    patterned = patterned or letter in "ef"
+                    value = a[at + 1:]
+                    if not value:
+                        value = args[i] if i < len(args) and args[i] else ""
+                        i += 1
+                    recursive = recursive or (letter == "d" and bool(value) and "recurse".startswith(value))
+                    break
+    return recursive, words if patterned else words[1:], includes
+
+
+def grep_must_stay(args: list, paths: list, includes: bool) -> bool:
+    """`--include` changes how `grep` reads every `--exclude` before it: its filter falls
+    away. `--exclude` also drops a file named on the line, so a search of named files only
+    stays: one named on the line would be left out. A line that already has every flag needs none."""
+    if includes or _GREP_FLAGS_AS_READ <= set(args):
+        return True
+    names = tuple(g.split("=", 1)[1].strip("'") for g in GREP_EXCLUDES)
+    return any(
+        a is not None and any(fnmatch.fnmatchcase(posixpath.basename(a.rstrip("/")), n) for n in names)
+        for a in paths)
+
+
+def grep_folder(paths: list, workdirs: list) -> Optional[str]:
+    """A credentials folder the search starts in or under, as named, as a glob, or as a
+    directory the line is in. `--exclude-dir` misses the folder a search starts in."""
+    for a in [*workdirs, *paths]:
+        if a is None:
+            continue
+        for part in a.replace("\\", "/").split("/"):
+            part = part.lower()
+            if part in GREP_FOLDERS or (part.startswith(".") and any(c in part for c in "*?[")
+                                        and any(fnmatch.fnmatchcase(f, part) for f in GREP_FOLDERS)):
+                return a
+    return None
+
+
 def search_excludes(*roots: str) -> tuple[str, ...]:
     """A ripgrep glob is matched from the folder it starts in, so `**/.kube/config`
     misses `config` when the search starts in `.kube`."""

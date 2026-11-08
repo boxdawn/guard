@@ -96,6 +96,7 @@ class Verdict:
     reasons: tuple[str, ...]
     findings: tuple[Finding, ...] = ()
     escalated: bool = False    # an "ask" became "deny" because nobody is present
+    grep_ends: tuple[int, ...] = ()  # where a recursive `grep` name ends, in bytes of the line
 
 
 # Stable ids (SARIF: rule ids SHALL be stable). Retire an id, never reuse it.
@@ -145,7 +146,7 @@ def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
     if escalated:
         decision = "deny"
         judge.reasons.append("nobody is present to approve it")
-    return Verdict(decision, tuple(judge.reasons), tuple(judge.findings), escalated)
+    return Verdict(decision, tuple(judge.reasons), tuple(judge.findings), escalated, tuple(sorted(set(judge.grep_ends))))
 
 
 def evaluate_file_tool(tool: str, paths: list[str], *, cwd: str, home: str, rules: CommandRules,
@@ -287,6 +288,7 @@ class _Judge:
     known_env: dict = field(default_factory=dict)
     made_links: list[str] = field(default_factory=list)  # by this same command: not on disk yet
     reals: dict = field(default_factory=dict)
+    grep_ends: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -663,6 +665,15 @@ class _Judge:
             return
         fed, text = self._stdin(node)
         self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
+        grep = posixpath.basename(name).lower()
+        if depth == 0 and grep in secret_files.GREPS:
+            recursive, paths, includes = secret_files.grep_reads(args)
+            if grep == "rgrep" or recursive:
+                start = secret_files.grep_folder(paths, self.workdirs)
+                if start is not None:
+                    self.flag("ask", "secret.read", f"`{name}` reads the secret file `{start}`", self._where(start))
+                elif not secret_files.grep_must_stay(args, paths, includes):
+                    self.grep_ends.append(node.child_by_field_name("name").end_byte)
         final = self._final(name, args)[0]
         if final and final.lower() in secret_files.SENDERS:
             for n in _walk(node):  # `curl -d "$(cat .env)"`

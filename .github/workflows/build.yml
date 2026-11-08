@@ -196,7 +196,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           test -n "$ANTHROPIC_API_KEY" || { echo "::error::ANTHROPIC_API_KEY secret is not set"; exit 1; }
-          python packaging/runtime_test.py guard-plugin
+          python packaging/runtime_test.py guard-plugin --no-search
 
   # A tag v<version> (or v<version>-rc.N) publishes, after the real-session
   # test above passed on every OS: the zip and its sha256 become a GitHub
