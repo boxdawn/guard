@@ -11,6 +11,8 @@ import pytest
 from boxdawn_guard import command_hook, secret_files
 
 FLAGS = " ".join(secret_files.GREP_EXCLUDES)
+BACK = " ".join(secret_files.GREP_EXAMPLES_BACK)
+TAKES_BACK = command_hook._grep_takes_examples_back  # this machine's grep, before the tests pin it
 
 
 def decide(command, cwd="/work/proj"):
@@ -300,3 +302,99 @@ def test_many_stars_take_no_time(rule):
 ])
 def test_how_a_rule_is_read(rule, line, hit):
     assert command_hook._rule_matches(rule, line) is hit
+
+
+
+def test_gnu_grep_takes_the_examples_back(monkeypatch):
+    monkeypatch.setattr(command_hook, "_grep_takes_examples_back", lambda: True)
+    assert changed("grep -rn KEY .") == f"grep {FLAGS} {BACK} -rn KEY ."
+    assert decide(changed("grep -rn KEY .")) is None  # sent back as changed
+
+
+@pytest.mark.parametrize("version, back", [
+    ("grep (GNU grep) 3.11\nCopyright", True), ("grep (GNU grep) 3.0\n", True), ("/usr/bin/grep (GNU grep) 3.4\n", True),
+    ("grep (GNU grep) 2.20\n", False), ("grep (BSD grep, GNU compatible) 2.6.0-FreeBSD\n", False),
+    ("ggrep (GNU grep) 3.11", True), ("BusyBox v1.36.1", False), ("", False),
+])
+def test_only_gnu_grep_3_takes_the_examples_back(version, back, monkeypatch):
+    monkeypatch.setattr(command_hook.sys, "platform", "linux")
+    monkeypatch.setattr(command_hook.shutil, "which", lambda name: "/bin/grep" if name == "grep" else None)
+    monkeypatch.setattr(command_hook.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=version, stderr=""))
+    assert TAKES_BACK() is back
+
+
+@pytest.mark.parametrize("error", [OSError, subprocess.TimeoutExpired(["grep"], 3)])
+def test_a_grep_that_does_not_answer_keeps_the_excludes_alone(error, monkeypatch):
+    def fail(*a, **k):
+        raise error
+    monkeypatch.setattr(command_hook.subprocess, "run", fail)
+    assert TAKES_BACK() is False
+
+
+def test_no_grep_keeps_the_excludes_alone(monkeypatch):
+    monkeypatch.setattr(command_hook.shutil, "which", lambda name: None)
+    assert TAKES_BACK() is False
+
+
+@pytest.mark.skipif(shutil.which("grep") is None or shutil.which("sh") is None, reason="needs grep")
+def test_the_real_grep_keeps_the_examples_only_when_it_can(tmp_path, monkeypatch):
+    """Runs on every platform in CI: macOS has BSD grep, where `--include` would mean "only these"."""
+    secrets = [".env", ".env.local", ".env.prod", ".env.myexample", "src/.env", "id_rsa", ".ssh/x.example"]
+    examples = [".env.example", ".env.local.example", ".env.sample", ".env.template", ".env.dist", "src/.env.example"]
+    plain = ["notes.txt", "src/app.txt"]
+    for name in secrets + examples + plain:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("BDXFAKE\n")
+    back = TAKES_BACK()
+    monkeypatch.setattr(command_hook, "_grep_takes_examples_back", lambda: back)
+    run = subprocess.run(["sh", "-c", changed("grep -rl BDXFAKE .")], cwd=tmp_path, capture_output=True, text=True)
+    found = {line[2:].replace("\\", "/") for line in run.stdout.split()}
+    assert found == set(plain) | (set(examples) if back else set())
+
+
+
+def test_macos_never_takes_the_examples_back(monkeypatch):
+    """The shell there may run BSD `grep` even when the one found here is GNU."""
+    monkeypatch.setattr(command_hook.sys, "platform", "darwin")
+    monkeypatch.setattr(command_hook.shutil, "which", lambda name: "/opt/homebrew/opt/grep/libexec/gnubin/grep")
+    monkeypatch.setattr(command_hook.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="grep (GNU grep) 3.11\n", stderr=""))
+    assert TAKES_BACK() is False
+
+
+@pytest.mark.skipif(command_hook.os.name != "nt" or shutil.which("git") is None, reason="Windows with Git")
+def test_on_windows_the_grep_of_git_is_found(monkeypatch):
+    """The path that ships there: Claude Code's Bash is Git's, whose `grep` this process may not have on PATH."""
+    real_which = shutil.which
+    monkeypatch.setattr(command_hook.shutil, "which", lambda name: None if name == "grep" else real_which(name))
+    assert TAKES_BACK() is True
+
+
+@pytest.mark.skipif(shutil.which("grep") is None or shutil.which("sh") is None, reason="needs grep")
+@pytest.mark.parametrize("command, more", [
+    ("grep -rl BDXFAKE .", set()),
+    ("grep -rl BDXFAKE . --exclude=.env.example", {"drop .env.example"}),
+    ("grep -Rl BDXFAKE .", set()),
+    ("grep -rl BDXFAKE src", {"only src"}),
+])
+def test_the_real_grep_with_the_examples_back(tmp_path, monkeypatch, command, more):
+    if not TAKES_BACK():
+        pytest.skip("this grep takes nothing back")
+    monkeypatch.setattr(command_hook, "_grep_takes_examples_back", lambda: True)
+    secrets = [".env", ".env.local", ".env.example.local", ".env.local.example.bak", "src/.env",
+               ".env.sample/id_rsa", ".ssh/a.example"]
+    examples = [".env.example", ".env.local.example", "src/.env.dist"]
+    for name in secrets + examples + ["notes.txt"]:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("BDXFAKE\n")
+    run = subprocess.run(["sh", "-c", changed(command)], cwd=tmp_path, capture_output=True, text=True)
+    found = {line.removeprefix("./").replace("\\", "/") for line in run.stdout.split()}
+    want = set(examples) | {"notes.txt"}
+    if "drop .env.example" in more:
+        want.discard(".env.example")  # the person's own later exclude still wins
+    if "only src" in more:
+        want = {"src/.env.dist"}
+    assert found == want

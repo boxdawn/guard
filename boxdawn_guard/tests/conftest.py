@@ -12,3 +12,5 @@ def _no_settings_of_this_machine(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(place / "config"))
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(place / "project"))
     monkeypatch.setattr(command_hook, "_MANAGED_SETTINGS", str(place / "managed-settings.json"))
+    # Whether `.env.example` comes back depends on this machine's grep; tests that want it say so.
+    monkeypatch.setattr(command_hook, "_grep_takes_examples_back", lambda: False)

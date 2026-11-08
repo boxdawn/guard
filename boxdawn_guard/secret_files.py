@@ -53,6 +53,9 @@ GREP_EXCLUDES = (
     *(f"--exclude-dir={d}" for d in (".ssh", ".aws", ".docker", ".kube")),
 )
 _GREP_FLAGS_AS_READ = frozenset(g.replace("'", "") for g in GREP_EXCLUDES)
+# After the excludes, GNU grep 3 lets the last matching option win: these take
+# `.env.example` and the like back, the names `is_secret` does not count.
+GREP_EXAMPLES_BACK = tuple(f"--include='.env*{e}'" for e in _ENV_EXAMPLES)
 
 
 # GNU grep's long options: it takes any start of one that fits no other.
@@ -115,8 +118,8 @@ def grep_reads(args: list) -> tuple[bool, list, bool]:
 
 
 def grep_must_stay(args: list, paths: list, includes: bool) -> bool:
-    """`--include` changes how `grep` reads every `--exclude` before it: its filter falls
-    away. `--exclude` also drops a file named on the line, so a search of named files only
+    """A person's `--include` changes how `grep` reads the excludes: BSD `grep` takes it
+    as "only these", and on GNU `grep` which option wins depends on their order. `--exclude` also drops a file named on the line, so a search of named files only
     stays: one named on the line would be left out. A line that already has every flag needs none."""
     if includes or _GREP_FLAGS_AS_READ <= set(args):
         return True

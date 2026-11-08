@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 
 from boxdawn_guard import block_log, messages_ko, secret_files
@@ -182,6 +183,31 @@ def _busybox_grep() -> bool:
     return found is not None and os.path.basename(os.path.realpath(found)).startswith("busybox")
 
 
+def _grep_takes_examples_back() -> bool:
+    """GNU grep 3 and later, measured: a later `--include` wins over an `--exclude`.
+    BSD `grep` reads `--include` as "only these", and the `grep` found here may not
+    be the one the shell runs, so on macOS, where BSD `grep` is the system one, the
+    excludes stay alone. Older ones were not measured. On Windows the shell's `grep`
+    is Git's, which may not be on this process's PATH."""
+    if sys.platform == "darwin":
+        return False
+    found = shutil.which("grep")
+    git = shutil.which("git") if found is None and os.name == "nt" else None
+    for top in (os.path.dirname(os.path.dirname(git)), os.path.dirname(os.path.dirname(os.path.dirname(git)))) if git else ():
+        if os.path.isfile(os.path.join(top, "usr", "bin", "grep.exe")):  # Git/cmd/git.exe or Git/mingw64/bin/git.exe
+            found = os.path.join(top, "usr", "bin", "grep.exe")
+            break
+    if found is None:
+        return False
+    try:
+        out = subprocess.run([found, "--version"], capture_output=True, text=True, errors="replace", timeout=3,
+                             stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    m = re.match(r"\S*grep \(GNU grep\) (\d+)\.", out)
+    return m is not None and int(m.group(1)) >= 3
+
+
 def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...], cwd: str | None) -> dict | None:
     """`grep -r` reads `.env` without naming it. The flags go right after the name:
     any later word may be the end of the options, and later commands keep their place."""
@@ -190,6 +216,8 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...], cwd: str | No
     turned_off = (os.environ.get("CLAUDE_PLUGIN_OPTION_KEEP_SECRETS_OUT_OF_GREP") or "").lower() in ("false", "0", "no")
     if not ends or turned_off or _busybox_grep():
         return None
+    if _grep_takes_examples_back():
+        flags += " " + " ".join(secret_files.GREP_EXAMPLES_BACK)
     line = command.encode("utf-8")
     for end in reversed(ends):
         line = line[:end] + flags.encode() + line[end:]
