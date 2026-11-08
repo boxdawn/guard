@@ -1,6 +1,8 @@
 """`grep -r` in Bash: flags go in after the name, and the search really leaves the files out."""
 from __future__ import annotations
 
+import json
+import pathlib
 import shutil
 import subprocess
 
@@ -170,3 +172,131 @@ def test_an_option_value_is_no_path(command):
 
 def test_an_ambiguous_start_of_an_option_is_no_option():
     assert secret_files.grep_reads(["--e", "x", "-r", "KEY", "."])[0] is True
+
+
+
+
+def _rules(where, permissions):
+    path = pathlib.Path(command_hook._settings_files(None)[where])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"permissions": permissions}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("where", ["managed", "user", "project", "local"])
+@pytest.mark.parametrize("command, permissions", [
+    ("grep -rn KEY .", {"deny": ["Bash(grep -rn:*)"]}),
+    ("grep -rn KEY .", {"ask": ["Bash(grep -r*)"]}),
+    ("grep -rn KEY .", {"deny": ["Read", "Bash(rm:*)", "Bash(cd src && grep -rn *)", "Bash(grep -rn KEY .)"]}),
+    ("cd src && grep -rn KEY . | head", {"ask": ["Bash(grep -rn:*)"]}),
+    ("egrep --recursive KEY src", {"ask": ["Bash(egrep --recursive *)"]}),
+    ("grep.exe -rn KEY .", {"deny": ["Bash(grep.exe -rn:*)"]}),
+    ("GREP -rn KEY .", {"deny": ["Bash(GREP -rn:*)"]}),
+    ("\\grep -rn KEY .", {"deny": ["Bash(\\grep -rn:*)"]}),
+    ("/usr/bin/grep -r KEY .", {"deny": [" Bash(/usr/bin/grep -r:*) "]}),
+])
+def test_a_rule_the_flags_would_undo_keeps_the_command_as_written(where, command, permissions):
+    """Claude Code matches its rules to the changed command, so the flags would undo the person's rule."""
+    assert "updatedInput" in verdict(command)  # the flags go in without the rule
+    _rules(where, permissions)
+    assert decide(command) is None
+
+
+@pytest.mark.parametrize("permissions", [
+    {"allow": ["Bash(grep -rn:*)"]}, {"deny": ["Bash(rm:*)"], "ask": ["Bash(git push:*)"]}, {"deny": []}, {},
+    {"deny": ["Bash(grep:*)"]}, {"ask": ["Bash(grep *)", "Bash(grep*)", "Bash"]},  # still match the changed command
+    {"ask": ["Bash(git grep:*)", "Bash(git  grep -rn KEY .)"]},
+    {"deny": ["Bash(pgrep -f x)", "Bash(ps aux | grep -v grep:*)", "Bash(grep -rn KEY /etc:*)"]},
+    {"deny": ["Grep(.env)", "Read(grep -rn KEY .)", 3, None]},
+])
+def test_other_rules_still_get_the_flags(permissions):
+    _rules("project", permissions)
+    assert changed("grep -rn KEY .") == f"grep {FLAGS} -rn KEY ."
+
+
+@pytest.mark.parametrize("text", [
+    "{not json", '{"permissions": ["deny"]}', '{"permissions": {"deny": 3}}', "[]",
+    '{"permissions": {"deny": "Bash(grep -rn:*)"}}', "[" * 100000, "\xff\xfe",
+])
+def test_a_file_claude_code_could_not_read_holds_no_rule(text):
+    path = pathlib.Path(command_hook._settings_files(None)["user"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="latin-1")
+    assert changed("grep -rn KEY .") == f"grep {FLAGS} -rn KEY ."
+
+
+def test_a_folder_where_a_settings_file_would_be_holds_no_rule():
+    pathlib.Path(command_hook._settings_files(None)["project"]).mkdir(parents=True)
+    assert changed("grep -rn KEY .") == f"grep {FLAGS} -rn KEY ."
+
+
+def test_without_the_project_variable_the_session_folder_counts(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"deny": ["Bash(grep -rn:*)"]}}))
+    assert decide("grep -rn KEY .", cwd=str(tmp_path)) is None
+    assert "updatedInput" in verdict("grep -rn KEY .", str(tmp_path / "sub"))  # Claude Code reads no folder above
+
+
+def test_without_the_config_variable_the_home_folder_counts(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    _rules("user", {"deny": ["Bash(grep -rn:*)"]})
+    assert command_hook._settings_files(None)["user"] == str(tmp_path / ".claude" / "settings.json")
+    assert decide("grep -rn KEY .") is None
+
+
+def test_a_settings_file_with_a_byte_order_mark_is_read():
+    path = pathlib.Path(command_hook._settings_files(None)["project"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps({"permissions": {"ask": ["Bash(grep -rn:*)"]}}).encode())
+    assert decide("grep -rn KEY .") is None
+
+
+def test_a_decision_on_another_tool_does_not_read_the_rules(monkeypatch):
+    monkeypatch.setattr(command_hook, "_deny_and_ask_rules", lambda cwd: 1 / 0)
+    assert decide("grep -n KEY notes.txt") is None
+    out = command_hook.decide({"tool_name": "PowerShell", "tool_input": {"command": "Get-ChildItem -Recurse"},
+                               "cwd": "/work/proj", "permission_mode": "default"})
+    assert "updatedInput" not in (out or {}).get("hookSpecificOutput", {})
+
+
+
+@pytest.mark.parametrize("command", [
+    "if grep -rn KEY .; then echo y; fi", "! grep -rn KEY .", "grep  -rn KEY .", "grep\t-rn KEY .",
+    "FOO=1 grep -rn KEY .", "LC_ALL=C grep -rn KEY .", "(grep -rn KEY .)", "{ grep -rn KEY .; }",
+    "grep -rn KEY . & wait", "grep -rn KEY . 2>/dev/null", "echo a && grep -rn KEY . | head", "echo $(grep -rn KEY .)",
+    "grep -r A . ; grep -rn B .",
+])
+def test_the_forms_claude_code_catches_with_a_rule_keep_the_command_as_written(command):
+    """Measured: each of these meets a deny `Bash(grep -rn:*)` in Claude Code 2.1.318 when run as written."""
+    assert "updatedInput" in verdict(command)
+    _rules("project", {"deny": ["Bash(grep -rn:*)"]})
+    assert decide(command) is None
+
+
+@pytest.mark.parametrize("command", ["grep -rnw KEY .", "grep -rl KEY ."])
+def test_a_rule_is_matched_by_words(command):
+    """Measured: `Bash(grep -rn:*)` does not catch `grep -rnw` in Claude Code."""
+    _rules("project", {"deny": ["Bash(grep -rn:*)"], "ask": [" Bash( grep  -rn :*) "]})
+    assert "updatedInput" in verdict(command)
+
+
+@pytest.mark.parametrize("rule", ["Bash(* * * * * * .env)", "Bash(" + "*a" * 12 + "b)", "Bash(*" + "-" * 30 + "*)"])
+def test_many_stars_take_no_time(rule):
+    import time
+    _rules("project", {"deny": [rule] * 50})
+    command = "grep -rn " + " ".join(f"w{i}" for i in range(400)) + " ."
+    start = time.perf_counter()
+    decide(command)
+    assert time.perf_counter() - start < 1
+
+
+@pytest.mark.parametrize("rule, line, hit", [
+    ("grep -rn:*", "grep -rn KEY .", True), ("grep -rn:*", "grep -rn", True), ("grep -rn:*", "grep -rnw K .", False),
+    ("grep -rn *", "grep -rn KEY .", True), ("grep*", "grep -rn KEY .", True), ("*-rn*", "x=1 grep -rn K", True),
+    ("grep -rn KEY .", "cd a && grep -rn KEY .", True), ("grep -rn KEY .", "grep -rn KEY .x", False),
+    ("a*b*c", "abc", True), ("a*b*c", "acb", False), ("ab*ba", "aba", False),
+])
+def test_how_a_rule_is_read(rule, line, hit):
+    assert command_hook._rule_matches(rule, line) is hit

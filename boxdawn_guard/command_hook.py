@@ -92,13 +92,97 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     }}
 
 
+# The settings files that can hold permission rules. Rules that reach Claude Code
+# another way (`--settings`, an SDK caller, a policy from the registry, MDM or a
+# server) are not in these files and cannot be seen here.
+_MANAGED_SETTINGS = {"win32": r"C:\Program Files\ClaudeCode\managed-settings.json",
+                     "darwin": "/Library/Application Support/ClaudeCode/managed-settings.json"}.get(
+    sys.platform, "/etc/claude-code/managed-settings.json")
+
+
+def _settings_files(cwd: str | None) -> dict[str, str]:
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or cwd or ""
+    files = {"managed": _MANAGED_SETTINGS, "user": os.path.join(config, "settings.json")}
+    if project:
+        files["project"] = os.path.join(project, ".claude", "settings.json")
+        files["local"] = os.path.join(project, ".claude", "settings.local.json")
+    return files
+
+
+def _deny_and_ask_rules(cwd: str | None) -> list[str]:
+    """What is inside `Bash(...)` in deny and ask. A file Claude Code could not read
+    either, or a part of it in the wrong shape, holds no rule."""
+    found = []
+    for path in _settings_files(cwd).values():
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                permissions = json.load(f).get("permissions")
+        except (OSError, ValueError, AttributeError, RecursionError):
+            continue
+        for kind in ("deny", "ask"):
+            rules = permissions.get(kind) if isinstance(permissions, dict) else None
+            for rule in rules if isinstance(rules, list) else []:
+                m = re.fullmatch(r"\s*Bash\((.*)\)\s*", rule, re.S) if isinstance(rule, str) else None
+                if m:
+                    found.append(m.group(1))
+    return found
+
+
+# Where one command ends and the next starts, and what goes before a command's name.
+_COMMAND_ENDS = re.compile(r"&&|\|\||\$\(|[;|&\n()`{}]")
+_BEFORE_NAME = re.compile(r"^(?:(?:[A-Za-z_]\w*=\S*|!|if|then|elif|else|do|while|until|time)\s+)*")
+
+
+def _commands(line: str) -> list[str]:
+    """The line and each command in it, with the spaces Claude Code sees, measured:
+    `if grep -rn`, `! grep -rn`, `FOO=1 grep -rn`, `(grep -rn)` and `grep  -rn` all meet
+    a deny rule `Bash(grep -rn:*)`. More pieces than the shell has only cost the flags."""
+    words = (" ".join(p.split()) for p in [line, *_COMMAND_ENDS.split(line)])
+    return [w for w in (_BEFORE_NAME.sub("", w) for w in words) if w]
+
+
+def _wildcard(rule: str, command: str) -> bool:
+    """`*` for anything, without a pattern that can take minutes on many stars."""
+    first, *middle, last = rule.split("*")
+    if len(command) < len(first) + len(last) or not (command.startswith(first) and command.endswith(last)):
+        return False
+    at, stop = len(first), len(command) - len(last)
+    for piece in middle:
+        at = command.find(piece, at, stop)
+        if at < 0:
+            return False
+        at += len(piece)
+    return True
+
+
+def _rule_matches(rule: str, line: str) -> bool:
+    """Close to how Claude Code reads a rule: `x:*` is `x` and any words after it,
+    `*` stands for anything, else the command is the rule. A miss here only means
+    the flags go in."""
+    rule = " ".join(rule.split())
+    if rule.endswith(":*"):
+        head = rule[:-2].rstrip()
+        return any(c == head or c.startswith(head + " ") for c in _commands(line))
+    if "*" in rule:
+        return any(_wildcard(rule, c) for c in _commands(line))
+    return rule in _commands(line)
+
+
+def _breaks_a_rule(command: str, changed: str, cwd: str | None) -> bool:
+    """Claude Code matches its rules to the command as changed: with the flags after
+    the name, a deny or ask rule like `Bash(grep -rn:*)` would no longer catch it,
+    and the person's own rule would stop working. Such a rule keeps the command as written."""
+    return any(_rule_matches(r, command) and not _rule_matches(r, changed) for r in _deny_and_ask_rules(cwd))
+
+
 def _busybox_grep() -> bool:
     """BusyBox `grep` may refuse these flags, and a search that fails is worse than one that reads."""
     found = shutil.which("grep")
     return found is not None and os.path.basename(os.path.realpath(found)).startswith("busybox")
 
 
-def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | None:
+def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...], cwd: str | None) -> dict | None:
     """`grep -r` reads `.env` without naming it. The flags go right after the name:
     any later word may be the end of the options, and later commands keep their place."""
     flags = " " + " ".join(secret_files.GREP_EXCLUDES)
@@ -109,6 +193,8 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...]) -> dict | Non
     line = command.encode("utf-8")
     for end in reversed(ends):
         line = line[:end] + flags.encode() + line[end:]
+    if _breaks_a_rule(command, line.decode("utf-8"), cwd):
+        return None
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": {**tool_input, "command": line.decode("utf-8")},
@@ -150,7 +236,7 @@ def decide(payload: dict) -> dict | None:
             tool_input["command"], known_env=known_env, **where)
     if verdict is None or verdict.decision is None:
         if tool == "Bash":
-            return _grep_without_secrets(tool_input, verdict.grep_ends)
+            return _grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd"))
         return _search_without_secrets(tool, tool_input, payload.get("cwd"))
     if bundle_exp is not None:
         block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
