@@ -1,7 +1,7 @@
 {
   "name": "boxdawn-guard",
   "displayName": "Boxdawn guard",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Judges each shell command before GitHub Copilot CLI runs it: deny, ask, or no decision.",
   "author": { "name": "Boxdawn" },
   "license": "FSL-1.1-ALv2"
