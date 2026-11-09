@@ -116,6 +116,7 @@ RULE_IDS = frozenset({
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
     "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
+    "device.app_data", "device.wipe", "device.flash",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -586,6 +587,9 @@ class _Judge:
         skip = secret_files.flag_values_to_skip(lowered, args)
         code = self.rules.code_flags.get(name, ())
         skip |= {i + 1 for i, a in enumerate(args) if a in code}
+        found = _code_on_line(name, args, self.rules)
+        if found is not None and found[1] is not None and found[1] in args[found[0] + 1:]:
+            skip.add(args.index(found[1], found[0] + 1))
         rest = [a for i, a in enumerate(args) if i not in skip]
         if secret_files.pattern_is_first(lowered, args):
             operands = _operands(rest)
@@ -733,17 +737,16 @@ class _Judge:
         self._secret_args(name, args)
 
         if name in r.code_flags:
-            flags = r.code_flags[name]
-            for i, a in enumerate(args):
-                if a in flags:
-                    code = args[i + 1] if i + 1 < len(args) else None
-                    if code is None:
-                        self.flag("ask", "code.runtime", f"`{name}` runs code known only at run time")
-                    elif name in r.shells:
-                        self.run(code, depth + 1)
-                    else:
-                        self._scan_code(name, code)
-                    return
+            found = _code_on_line(name, args, r)
+            if found is not None:
+                code = found[1]
+                if code is None:
+                    self.flag("ask", "code.runtime", f"`{name}` runs code known only at run time")
+                elif name in r.shells:
+                    self.run(code, depth + 1)
+                else:
+                    self._scan_code(name, code)
+                return
             if stdin_fed and name in r.interpreters and not _positional(args):
                 if stdin_text is None:
                     self.flag("ask", "code.stdin_runtime", f"text known only at run time is fed into `{name}` as code")
@@ -1165,6 +1168,32 @@ class _Judge:
                                                   ["volume", "rm"], ["image", "prune"])):
             self.flag("ask", "docker.prune", "`docker` prune removes data")
 
+    def _device(self, name: str, args: list[Value], depth: int) -> None:
+        """A phone or other device on the end of `adb` / `fastboot`: its data
+        is not in the project, and a wipe there has no undo."""
+        if name == "fastboot" and "-w" in args:
+            self.flag("deny", "device.wipe", "`fastboot -w` wipes data on the device")
+            return
+        words = _strip_options(args, takes_value={"-s", "-t", "-H", "-P", "-L", "--one-device"})
+        if not words or words[0] is None:
+            return
+        op, rest = words[0], words[1:]
+        if name == "fastboot":
+            if op in ("erase", "format", "wipe-super") or (
+                    op in ("flashing", "oem") and rest[:1] in (["unlock"], ["unlock_critical"])):
+                self.flag("deny", "device.wipe", f"`fastboot {op}` wipes data on the device")
+            elif op in ("flash", "flashall", "update"):
+                self.flag("ask", "device.flash", f"`fastboot {op}` overwrites a partition on the device")
+            return
+        if op == "uninstall":
+            self.flag("ask", "device.app_data", "`adb uninstall` removes an app and its data from the device")
+        elif op == "shell":
+            text = " ".join("?" if a is None else a for a in rest)
+            if re.search(r"\b(pm|cmd\s+package)\s+(clear|uninstall)\b", text):
+                self.flag("ask", "device.app_data", "`adb shell` clears or removes an app's data on the device")
+            elif re.search(r"(^|[;&|]\s*)(rm|recovery|wipe)\b", text.strip()):
+                self.flag("ask", "device.app_data", "`adb shell` deletes or wipes data on the device")
+
 
 _HANDLERS = {
     "rm": _Judge._rm, "rmdir": _Judge._rm, "unlink": _Judge._rm, "ln": _Judge._ln,
@@ -1176,6 +1205,7 @@ _HANDLERS = {
     "terraform": _Judge._infra, "tofu": _Judge._infra, "pulumi": _Judge._infra,
     "kubectl": _Judge._infra, "helm": _Judge._infra, "aws": _Judge._infra,
     "gcloud": _Judge._infra, "az": _Judge._infra, "docker": _Judge._infra,
+    "adb": _Judge._device, "fastboot": _Judge._device,
 }
 
 
@@ -1364,9 +1394,59 @@ def _positional(args: list[Value]) -> list[Value]:
 
 def _code_or_file(name: str, args: list[Value], rules: CommandRules) -> bool:
     """True when the interpreter is told what to run, so stdin is data."""
-    if any(a in rules.code_flags.get(name, frozenset()) for a in args):
+    if _code_on_line(name, args, rules) is not None:
         return True
     return bool(_positional(args))
+
+
+# Short flags run together (`bash -lc`, `perl -le`, `python -Ic`). A shell
+# takes its code from the first argument after its options; these take it
+# from the rest of the cluster, or the next argument. Letters that take a
+# value before the code letter make the rest that value, not code.
+_CLUSTERED = {"python": "WXmc", "python3": "WXmc", "perl": "iIMmxCFdD0", "ruby": "IrCEFKTWxi0"}
+_SHELL_VALUE_FLAGS = frozenset({"-o", "+o", "-O", "+O"})
+
+
+def _code_on_line(name: str, args: list[Value], rules: CommandRules) -> Optional[tuple[int, Value]]:
+    """(the code flag's index, the code) when this interpreter is given code
+    on the line, the code None when it is known only at run time; None when
+    no code flag is there."""
+    flags = rules.code_flags.get(name)
+    if not flags:
+        return None
+    letters = [f[1] for f in flags if len(f) == 2 and f[0] == "-" and f[1].isalpha()]
+    for i, a in enumerate(args):
+        if a is None:
+            continue
+        attached = ""
+        if a not in flags:
+            m = re.fullmatch(r"-([A-Za-z]{2,})", a)
+            if m is None:
+                continue
+            cluster = m.group(1)
+            if name in rules.shells:
+                if not any(x in cluster for x in letters):
+                    continue
+                if "o" in cluster or "O" in cluster:
+                    return i, None  # `-eo pipefail`: which argument is the code is not worth guessing
+            elif name in _CLUSTERED:
+                at = min((cluster.index(x) for x in letters if x in cluster), default=None)
+                if at is None or any(x in _CLUSTERED[name] for x in cluster[:at]):
+                    continue
+                attached = cluster[at + 1:]
+            else:
+                continue
+        if attached:
+            return i, attached
+        if name in rules.shells:
+            j = i + 1
+            while j < len(args) and args[j] is not None and args[j][:1] in "-+":
+                j += 2 if args[j] in _SHELL_VALUE_FLAGS else 1
+                if args[j - 1] == "--":
+                    break
+            return i, args[j] if j < len(args) else None
+        return i, args[i + 1] if i + 1 < len(args) else None
+    return None
 
 
 def _strip_options(args: list[Value], takes_value: set[str]) -> list[Value]:

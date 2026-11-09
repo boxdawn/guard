@@ -170,6 +170,24 @@ NONE = [
 # a known variable reassigned on the line is no longer the known value
 DENY += ['TEMP=/; rm -rf "$TEMP"', 'read TEMP; rm -rf "$TEMP/x"', 'rm -rf "$TEMP"']
 
+# short flags run together still hand over code (#97660 ran `bash -lc`)
+DENY += ['bash -lc "rm -rf /"', "sh -ec 'rm -rf ~'", "zsh -fc 'rm -rf /'",
+         'bash -c -e "rm -rf /"', 'bash -c -- "rm -rf /"', 'bash -xec "rm -rf /etc"']
+ASK += ['bash -lc "$PAYLOAD"', "bash -ceo pipefail 'rm -rf /'", "perl -le 'unlink q(a)'",
+        'python -Ic "import shutil; shutil.rmtree(1)"', "python3 -Bc 'import os; os.system(1)'"]
+NONE += ['bash -lc "ls -la"', "sh -ec 'make test'", "perl -lne 'print'",
+         'python -Ic "print(1)"', "ruby -ne 'puts $_'", "bash -eo pipefail -c 'ls'"]
+
+# phones and other devices (#64365 ran `adb shell pm clear`)
+DENY += ["fastboot -w", "fastboot erase userdata", "fastboot format userdata",
+         "fastboot flashing unlock", "fastboot -s X oem unlock"]
+ASK += ["adb shell pm clear com.offercomp.app", "adb -s emulator-5554 shell pm clear com.x",
+        "adb shell cmd package uninstall com.x", "adb uninstall com.x",
+        "adb shell rm -rf /sdcard/x", "adb shell 'rm -rf /sdcard/x'", "fastboot flash boot boot.img"]
+NONE += ["adb devices", "adb logcat", "adb install app.apk", "adb shell ls /sdcard",
+         "adb shell am start -n com.x/.Main", "adb shell getprop ro.product.model",
+         "fastboot devices", "adb shell pm list packages"]
+
 
 @pytest.mark.parametrize("command", DENY)
 def test_destructive_commands_are_denied(command):
@@ -263,4 +281,4 @@ def test_a_memory_folder_is_scratch_but_not_its_root(command, decision):
 
 def test_a_fully_bypassed_suite_has_this_many_cases():
     """The suite cannot quietly shrink."""
-    assert len(DENY) >= 104 and len(ASK) >= 42 and len(NONE) >= 38
+    assert len(DENY) >= 115 and len(ASK) >= 54 and len(NONE) >= 52
