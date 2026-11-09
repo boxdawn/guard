@@ -199,6 +199,30 @@ DENY += ["setsid rm -rf /", "unbuffer rm -rf ~", "strace -f -o t.txt rm -rf /", 
          "tmux new-window 'git push --force origin main'", "screen -dm sh -c 'rm -rf /'",
          "screen -dmS x rm -rf /", "wsl -- rm -rf /", "wsl -e sh -c 'rm -rf /'",
          "wsl.exe bash -lc 'rm -rf /'", "wsl --unregister Ubuntu"]
+# verbatim (or with placeholders filled) from anthropics/claude-code incident
+# reports, 2026-11-09: tools that wipe a database, work thrown away inside
+# the project, deletes on a server
+ASK += ["npx prisma migrate reset --force", "pnpm prisma migrate reset --force",
+        "npx prisma db push --force-reset", "prisma db push --accept-data-loss", "drizzle-kit push --force",
+        "php artisan migrate:fresh", "./vendor/bin/sail artisan migrate:fresh --env=testing",
+        "php artisan db:wipe", "npx supabase db reset", "supabase db reset",
+        "cd backend && .venv/bin/python -m alembic downgrade base", "php bin/console doctrine:fixtures:load -n",
+        "bin/rails db:reset", "rake db:drop", "python manage.py flush --noinput", "dropdb genesis_master",
+        "git checkout -- .", "git checkout HEAD -- src/", "git checkout -- $(git diff --name-only)", "git checkout main -- .", "git restore .",
+        "git checkout -f main", "git stash drop", "git stash clear", "git rm -rf . --quiet",
+        "rm -rf .git", "rm -rf sub/.git", "rm -rf .claude/worktrees", "rm -rf .claude/worktrees/feat-x",
+        "docker compose down -v", "docker-compose down --volumes", "terraform apply -auto-approve",
+        "robocopy 'L:\\' 'F:\\' /MIR", "robocopy src dst /PURGE", "lftp -e 'mirror --reverse --delete dist/ /' ftp.x",
+        "gh api repos/a/b --method DELETE", "gh api -X DELETE repos/a/b/releases/1",
+        "firebase hosting:disable --project p --force"]
+DENY += ["gh repo delete a/b --yes"]
+NONE += ["npx prisma migrate dev", "npx prisma generate", "npx prisma db push", "php artisan migrate",
+         "python manage.py migrate", "alembic upgrade head", "git checkout main", "git checkout -b feat",
+         "git restore --staged a.py", "git checkout -- src/a.py", "git restore a.py b.py", "git stash", "git stash pop", "git rm --cached -r .",
+         "git rm old.txt", "rm .gitignore", "rm -rf node_modules", "docker compose down",
+         "terraform apply", "terraform plan", "gh api repos/a/b", "gh pr list", "robocopy src dst /E",
+         "git commit -m 'prisma migrate reset'", "firebase deploy"]
+
 ASK += ["awk 'BEGIN{system(\"rm -rf /\")}'", "awk '{print | \"sh\"}' x", "gawk 'BEGIN{\"date\" | getline d}'"]
 
 NONE += ["adb devices", "adb logcat", "adb install app.apk", "adb shell ls /sdcard",
@@ -298,4 +322,4 @@ def test_a_memory_folder_is_scratch_but_not_its_root(command, decision):
 
 def test_a_fully_bypassed_suite_has_this_many_cases():
     """The suite cannot quietly shrink."""
-    assert len(DENY) >= 135 and len(ASK) >= 57 and len(NONE) >= 68
+    assert len(DENY) >= 136 and len(ASK) >= 95 and len(NONE) >= 94
