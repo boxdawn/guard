@@ -30,17 +30,17 @@ def judge(command, rules=RULES, unattended=False):
 
 
 @pytest.mark.parametrize("command, decision, rules", [
-    ("terraform apply -auto-approve", "deny", ["custom.r1"]),
+    ("terraform apply -auto-approve", "deny", ["custom.r1", "iac.auto_approve"]),
     ("terraform apply -auto-approve=true", "deny", ["custom.r1"]),
     ("TERRAFORM.EXE apply -auto-approve", "deny", ["custom.r1"]),
-    ("terraform -chdir=infra apply -auto-approve", "deny", ["custom.r1"]),
+    ("terraform -chdir=infra apply -auto-approve", "deny", ["custom.r1", "iac.auto_approve"]),
     ("terraform apply", None, []),
     ("terraform plan -auto-approve", None, []),
     ("echo terraform apply -auto-approve", None, []),
     # the command inside sudo, env, bash -c and eval meets the rule too
-    ("sudo env terraform apply -auto-approve", "deny", ["privilege.elevated", "custom.r1"]),
-    ("bash -c 'terraform apply -auto-approve'", "deny", ["custom.r1"]),
-    ("eval 'terraform apply -auto-approve'", "deny", ["custom.r1"]),
+    ("sudo env terraform apply -auto-approve", "deny", ["privilege.elevated", "custom.r1", "iac.auto_approve"]),
+    ("bash -c 'terraform apply -auto-approve'", "deny", ["custom.r1", "iac.auto_approve"]),
+    ("eval 'terraform apply -auto-approve'", "deny", ["custom.r1", "iac.auto_approve"]),
     # C: a value known only at run time that could complete the match asks
     ('terraform apply "$FLAGS"', "ask", ["custom.r1"]),
     ('terraform "$CMD" -auto-approve', "ask", ["custom.r1"]),
@@ -53,7 +53,7 @@ def judge(command, rules=RULES, unattended=False):
     # ours still applies, and the stronger decision wins
     ("kubectl scale deploy web --replicas=0 && kubectl delete ns staging", "deny",
      ["custom.r2", "k8s.delete"]),
-    ("gh repo delete boxdawn/x --yes", "deny", ["custom.r3"]),
+    ("gh repo delete boxdawn/x --yes", "deny", ["custom.r3", "gh.delete"]),
     ("gh repo view boxdawn/x", None, []),
 ])
 def test_team_rules(command, decision, rules):
@@ -62,12 +62,13 @@ def test_team_rules(command, decision, rules):
 
 
 def test_without_team_rules_nothing_changes():
-    assert judge("terraform apply -auto-approve", rules=default_command_rules()).decision is None
+    assert judge("kubectl -n prod scale deploy web --replicas=0", rules=default_command_rules()).decision is None
 
 
 def test_the_reason_carries_the_orgs_note():
     v = judge("terraform apply -auto-approve")
-    assert v.reasons == ("team rule r1: review prod applies first",)
+    assert v.reasons == ("team rule r1: review prod applies first",
+                         "`terraform apply -auto-approve` changes infrastructure without a review")
 
 
 def test_with_nobody_to_ask_a_team_ask_is_a_deny():
@@ -81,7 +82,7 @@ def test_a_native_command_from_powershell_meets_the_rule():
     v = powershell_guard.evaluate_powershell(
         "cd C:\\work\\proj; terraform apply -auto-approve", cwd="C:\\work\\proj",
         home="C:\\Users\\me", rules=RULES)
-    assert (v.decision, [f.rule for f in v.findings]) == ("deny", ["custom.r1"])
+    assert (v.decision, [f.rule for f in v.findings]) == ("deny", ["custom.r1", "iac.auto_approve"])
 
 
 # ── from the bundle ────────────────────────────────────────────────────────
@@ -134,7 +135,8 @@ def test_more_than_the_servers_limit_is_refused():
 def test_a_team_rule_is_recorded_by_its_id_only():
     v = judge("terraform apply -auto-approve")
     line = block_log.entry(v, tool="Bash", exp=NOW + 60, build=None, now=NOW)
-    assert line["findings"] == [{"rule": "custom.r1", "level": "deny", "target": None}]
+    assert line["findings"] == [{"rule": "custom.r1", "level": "deny", "target": None},
+                                {"rule": "iac.auto_approve", "level": "ask", "target": None}]
     assert "terraform" not in json.dumps(line) and "review" not in json.dumps(line)
     assert block_send._line_ok(line)
 

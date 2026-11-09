@@ -61,6 +61,8 @@ def default_command_rules() -> CommandRules:
         wrappers=frozenset({
             "env", "nice", "nohup", "time", "timeout", "command", "builtin", "exec",
             "stdbuf", "xargs", "ionice", "caffeinate",
+            "setsid", "unbuffer", "strace", "ltrace", "systemd-run", "chroot", "flock",
+            "screen", "watch", "script", "tmux",
         }),
         privilege=frozenset({"sudo", "doas", "pkexec", "su", "runas", "gsudo"}),
         source=frozenset({"source", "."}),

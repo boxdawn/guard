@@ -116,7 +116,9 @@ RULE_IDS = frozenset({
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
     "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
-    "device.app_data", "device.wipe", "device.flash",
+    "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
+    "db.reset", "git.discard_changes", "git.stash_drop", "rm.history", "iac.auto_approve",
+    "mirror.delete", "gh.delete",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -736,6 +738,11 @@ class _Judge:
 
         self._secret_args(name, args)
 
+        if name in _DB_RESET_NAMES:
+            line = " ".join([name] + ["?" if a is None else a for a in args])
+            if any(re.search(p, line) for p in _DB_RESETS):
+                self.flag("ask", "db.reset", f"`{name}` resets or drops a database")
+
         if name in r.code_flags:
             found = _code_on_line(name, args, r)
             if found is not None:
@@ -900,6 +907,10 @@ class _Judge:
                           f"`rm` reaches outside the project: `{target}`", "outside")
             elif where == "cwd" and (recursive or force):
                 self.flag("ask", "rm.project_root", "`rm` removes the whole project directory", "project_root")
+            elif recursive and target is not None and _HISTORY.search(target.replace("\\", "/")):
+                # Inside the project, but not rebuilt by any install: history, or a
+                # worktree holding uncommitted work (#70687, #75861).
+                self.flag("ask", "rm.history", f"`rm` removes `{target}`, which no build makes again", where)
 
     def _ln(self, name: str, args: list[Value], depth: int) -> None:
         operands = _operands(args)
@@ -1129,6 +1140,17 @@ class _Judge:
             self.flag("ask", "git.branch_delete", "`git branch -D` deletes an unmerged branch")
         elif sub in ("filter-branch", "filter-repo"):
             self.flag("ask", "git.rewrite_history", f"`git {sub}` rewrites history")
+        elif (sub == "checkout" and "--" in rest and _broad_paths(rest[rest.index("--") + 1:])) or (
+                sub == "restore" and not {"--staged", "-S"} & set(rest) and _broad_paths(_operands(rest))) or (
+                sub == "checkout" and {"-f", "--force"} & set(rest)):
+            # `git checkout -- .` / `git restore .` overwrite edits the way `reset --hard` does.
+            # One named file (`git checkout -- a.py`) is how an agent undoes its own edit: no decision.
+            self.flag("ask", "git.discard_changes", f"`git {sub}` overwrites uncommitted changes")
+        elif sub == "rm" and ("r" in flags or "-r" in rest) and any(
+                o in (".", "./", "*", ":/") for o in _operands(rest)) and "--cached" not in rest:
+            self.flag("ask", "git.discard_changes", "`git rm -r .` deletes every tracked file")
+        elif sub == "stash" and rest[:1] in (["drop"], ["clear"]):
+            self.flag("ask", "git.stash_drop", f"`git stash {rest[0]}` deletes stashed work")
 
     def _db(self, name: str, args: list[Value]) -> None:
         r = self.rules
@@ -1167,6 +1189,75 @@ class _Judge:
         elif name == "docker" and (words[:2] in (["system", "prune"], ["volume", "prune"],
                                                   ["volume", "rm"], ["image", "prune"])):
             self.flag("ask", "docker.prune", "`docker` prune removes data")
+        elif (name == "docker-compose" or (name == "docker" and words[:1] == ["compose"])) and "down" in words and (
+                "-v" in words or "--volumes" in words):
+            # #63644: the database lived in the volume
+            self.flag("ask", "docker.prune", "`docker compose down -v` deletes the project's volumes")
+        if name in ("terraform", "tofu") and "apply" in words and any(
+                w in ("-auto-approve", "--auto-approve") for w in words) and "-destroy" not in words:
+            self.flag("ask", "iac.auto_approve", f"`{name} apply -auto-approve` changes infrastructure without a review")
+
+    def _awk(self, name: str, args: list[Value], depth: int) -> None:
+        """An awk program that runs commands (`system()`, `| getline`, `print | "…"`)."""
+        rest = _strip_options(args, {"-F", "-v", "-f", "--field-separator", "--assign", "--file"})
+        if "-f" in args or "--file" in args or not rest:
+            return  # a program file: what it runs is not on the line
+        program = rest[0]
+        if program is None:
+            self.flag("ask", "code.runtime", f"`{name}` runs a program known only at run time")
+        # String literals become S, so a `|` inside one (`print $2" | "$3`) is not a pipe.
+        elif re.search(r"\bsystem\s*\(|\|\s*getline|\|\s*S", re.sub(r'"(\\.|[^"\\])*"', "S", program)):
+            self.flag("ask", "code.inline_risky", f"`{name}` program runs other commands")
+
+    def _mirror(self, name: str, args: list[Value], depth: int) -> None:
+        """Copies that delete what the source lacks, like `rsync --delete`."""
+        words = [a.lower() for a in args if a is not None]
+        if name == "robocopy" and ({"/mir", "/purge"} & set(words)):
+            self.flag("ask", "mirror.delete", "`robocopy /MIR` deletes files the source does not have")
+        elif name == "lftp" and any("mirror" in w for w in words) and any("--delete" in w for w in words):
+            # `lftp mirror --delete …` or the same inside `lftp -e "…"`
+            self.flag("ask", "mirror.delete", "`lftp mirror --delete` deletes files the source does not have")
+
+    def _gh(self, name: str, args: list[Value], depth: int) -> None:
+        words = [a for a in args if a is not None]
+        if words[:2] == ["repo", "delete"]:
+            self.flag("deny", "gh.delete", "`gh repo delete` deletes a repository")
+        elif words[:1] == ["api"] and any(
+                (w in ("-X", "--method") and i + 1 < len(words) and words[i + 1].upper() == "DELETE")
+                or w.upper() in ("-XDELETE", "--METHOD=DELETE") for i, w in enumerate(words)):
+            self.flag("ask", "gh.delete", "`gh api` sends a DELETE")
+
+    def _firebase(self, name: str, args: list[Value], depth: int) -> None:
+        op = next((a for a in args if a is not None and not a.startswith("-")), "")
+        if re.fullmatch(r"(hosting:disable|firestore:delete|database:remove|functions:delete|"
+                        r"hosting:channel:delete|apps:delete|projects:delete)", op):
+            self.flag("ask", "cloud.delete", f"`firebase {op}` deletes or takes down cloud resources")
+
+    def _wsl(self, name: str, args: list[Value], depth: int) -> None:
+        """`wsl` runs a Linux command: after `-e`/`--exec` as given, after `--`
+        or on its own through the distro's shell."""
+        i = 0
+        while i < len(args) and args[i] is not None and args[i].startswith("-"):
+            a = args[i]
+            if a in ("--unregister",):
+                self.flag("deny", "wsl.unregister", "`wsl --unregister` deletes the distro and every file in it")
+                return
+            if a in ("-e", "--exec"):
+                rest = args[i + 1:]
+                if rest:
+                    self._judge(rest[0], rest[1:], depth)
+                return
+            if a == "--":
+                i += 1
+                break
+            i += 2 if a in ("-d", "--distribution", "-u", "--user", "--cd", "--shell-type") else 1
+        rest = args[i:]
+        if rest:
+            # The words reach the distro's shell as one line, with the quoting
+            # they had on this side: read them both as a command and as that line.
+            self._judge(rest[0], rest[1:], depth)
+            if any(w is None or re.search(r"[;&|<>`$()]", w) for w in rest):
+                self._judge("sh", ["-c", None if any(w is None for w in rest) else " ".join(rest)], depth)
 
     def _device(self, name: str, args: list[Value], depth: int) -> None:
         """A phone or other device on the end of `adb` / `fastboot`: its data
@@ -1206,6 +1297,9 @@ _HANDLERS = {
     "kubectl": _Judge._infra, "helm": _Judge._infra, "aws": _Judge._infra,
     "gcloud": _Judge._infra, "az": _Judge._infra, "docker": _Judge._infra,
     "adb": _Judge._device, "fastboot": _Judge._device,
+    "awk": _Judge._awk, "gawk": _Judge._awk, "mawk": _Judge._awk, "nawk": _Judge._awk,
+    "wsl": _Judge._wsl, "docker-compose": _Judge._infra,
+    "robocopy": _Judge._mirror, "lftp": _Judge._mirror, "gh": _Judge._gh, "firebase": _Judge._firebase,
 }
 
 
@@ -1472,4 +1566,87 @@ def _unwrap(name: str, args: list[Value]) -> list[Value]:
         return _strip_options(args, {"-I", "-i", "-n", "-P", "-L", "-s", "-d", "-E", "-a"})
     if name == "stdbuf":
         return _strip_options(args, {"-i", "-o", "-e"})
+    if name == "exec":
+        return _strip_options(args, {"-a"})
+    if name in ("strace", "ltrace"):
+        return _strip_options(args, {"-o", "-e", "-p", "-s", "-u", "-E", "-a", "-b", "-I", "-O", "-P", "-S", "-X", "-n"})
+    if name == "systemd-run":
+        return _strip_options(args, {"-p", "--property", "-u", "--unit", "--uid", "--gid", "-E", "--setenv",
+                                     "--working-directory", "-M", "--machine", "-H", "--host",
+                                     "--description", "--slice", "--on-calendar", "--on-active"})
+    if name == "chroot":
+        return _strip_options(args, set())[1:]  # the new root
+    if name == "screen":
+        i = 0
+        while i < len(args) and args[i] is not None and args[i].startswith("-"):
+            # `-dmS name`: a cluster ending in a letter that takes a value takes the next word
+            i += 2 if args[i] == "-Logfile" or args[i][-1:] in "Scehpst" else 1
+        return args[i:]
+    # These hand their command to a shell as one string.
+    if name == "flock":
+        rest = _strip_options(args, {"-w", "--wait", "--timeout", "-E", "--conflict-exit-code"})[1:]  # the lock
+        if rest[:1] in (["-c"], ["--command"]):
+            return ["sh", "-c", rest[1] if len(rest) > 1 else None]
+        return rest
+    if name == "watch":
+        return _as_shell_code(_strip_options(args, {"-n", "--interval", "-d", "-q", "--equexit"}))
+    if name == "script":
+        for i, a in enumerate(args):
+            if a in ("-c", "--command") or (a and re.fullmatch(r"-[a-zA-Z]*c", a)):
+                return ["sh", "-c", args[i + 1] if i + 1 < len(args) else None]
+        return []  # an interactive shell: what it runs is typed later
+    if name == "tmux":
+        return _tmux_command(args)
     return _strip_options(args, set())
+
+
+# Tools that wipe a database by design. Matched on the words of the line when
+# it starts with one of these names (directly, or through npx / pnpm / sail …),
+# so `git commit -m "prisma migrate reset"` is not a match.
+_DB_RESET_NAMES = frozenset({
+    "npx", "pnpx", "bunx", "pnpm", "yarn", "npm", "bun", "prisma", "drizzle-kit", "php", "artisan", "sail",
+    "supabase", "alembic", "python", "python3", "rails", "rake", "console", "symfony", "knex", "sequelize",
+    "typeorm", "dropdb",
+})
+_DB_RESETS = (
+    r"\bprisma\s+migrate\s+reset\b", r"\bprisma\s+db\s+push\b.*--(force-reset|accept-data-loss)\b",
+    r"\bdrizzle-kit\s+(push\b.*--force\b|drop\b)",
+    r"\bartisan\s+(migrate:(fresh|reset|refresh)|db:wipe)\b",
+    r"\bsupabase\s+db\s+reset\b",
+    r"\balembic\s+downgrade\s+base\b",
+    r"\bdoctrine:(fixtures:load(?!.*--append)|database:drop|schema:drop)\b",
+    r"\b(rails|rake)\s+db:(drop|reset|purge|schema:load)\b",
+    r"\bmanage\.py\s+(flush|reset_db)\b",
+    r"\bknex\s+migrate:rollback\b.*--all\b", r"\bsequelize(-cli)?\s+db:drop\b", r"\btypeorm\s+schema:drop\b",
+    r"^dropdb\b",
+)
+
+
+def _broad_paths(paths: list[Value]) -> bool:
+    """A pathspec that reaches every file or a whole folder: `.`, `*`, `:/`,
+    `src/`, or one known only at run time."""
+    return any(p is None or p.rstrip("/") in ("", ".", "*", ":", ":/*", "./*") or p.startswith(":/")
+               or p.endswith("/") or p in ("..", "../") for p in paths)
+
+
+_HISTORY = re.compile(r"(^|/)\.git/?$|(^|/)\.claude/worktrees(/|$)|(^|/)\.git/(objects|refs)(/|$)")
+
+
+def _as_shell_code(words: list[Value]) -> list[Value]:
+    """`sh -c` with the words joined, as `watch` and `tmux` run them."""
+    if not words:
+        return []
+    return ["sh", "-c", None if any(w is None for w in words) else " ".join(words)]
+
+
+_TMUX_RUNS = frozenset({"new", "new-session", "new-window", "neww", "split-window", "splitw",
+                        "run-shell", "run", "respawn-pane", "respawnp", "respawn-window", "respawnw"})
+
+
+def _tmux_command(args: list[Value]) -> list[Value]:
+    """The shell command a tmux subcommand starts, if one is on the line."""
+    rest = _strip_options(args, {"-L", "-S", "-f", "-T"})
+    if not rest or rest[0] not in _TMUX_RUNS:
+        return []
+    words = _strip_options(rest[1:], {"-s", "-n", "-c", "-t", "-x", "-y", "-e", "-F", "-l", "-b"})
+    return _as_shell_code(words)

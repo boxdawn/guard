@@ -184,6 +184,47 @@ DENY += ["fastboot -w", "fastboot erase userdata", "fastboot format userdata",
 ASK += ["adb shell pm clear com.offercomp.app", "adb -s emulator-5554 shell pm clear com.x",
         "adb shell cmd package uninstall com.x", "adb uninstall com.x",
         "adb shell rm -rf /sdcard/x", "adb shell 'rm -rf /sdcard/x'", "fastboot flash boot boot.img"]
+NONE += ["watch -n 2 kubectl get pods", "tmux new -s dev -d", "tmux ls", "tmux new -d 'npm run dev'",
+         "screen -dmS srv python app.py", "flock /tmp/l make build", "script -q out.log",
+         "strace -o t.txt ls", "setsid npm start", "awk '{print $1}' f.txt",
+         "awk -F, '{s+=$2} END{print s}' a.csv", "systemd-run --user --unit x sleep 5",
+         "exec -a x ls", "awk -F'\\t' '{print $2\" | \"$3}' log", "wsl ls -la", "wsl -d Ubuntu -- make test", "wsl --shutdown"]
+
+# launchers that run the command they are given (found by wrapping known
+# destructive commands in each, 2026-11-09)
+DENY += ["setsid rm -rf /", "unbuffer rm -rf ~", "strace -f -o t.txt rm -rf /", "ltrace rm -rf /",
+         "systemd-run --user rm -rf /", "chroot / rm -rf /", "exec -a x rm -rf /",
+         "flock /tmp/l rm -rf /", "flock /tmp/l -c 'rm -rf /'", "setsid sh -c 'rm -rf /'",
+         "watch -n1 'rm -rf /'", "script -qc 'rm -rf /' /dev/null", "tmux new -d 'rm -rf /'",
+         "tmux new-window 'git push --force origin main'", "screen -dm sh -c 'rm -rf /'",
+         "screen -dmS x rm -rf /", "wsl -- rm -rf /", "wsl -e sh -c 'rm -rf /'",
+         "wsl.exe bash -lc 'rm -rf /'", "wsl --unregister Ubuntu"]
+# verbatim (or with placeholders filled) from anthropics/claude-code incident
+# reports, 2026-11-09: tools that wipe a database, work thrown away inside
+# the project, deletes on a server
+ASK += ["npx prisma migrate reset --force", "pnpm prisma migrate reset --force",
+        "npx prisma db push --force-reset", "prisma db push --accept-data-loss", "drizzle-kit push --force",
+        "php artisan migrate:fresh", "./vendor/bin/sail artisan migrate:fresh --env=testing",
+        "php artisan db:wipe", "npx supabase db reset", "supabase db reset",
+        "cd backend && .venv/bin/python -m alembic downgrade base", "php bin/console doctrine:fixtures:load -n",
+        "bin/rails db:reset", "rake db:drop", "python manage.py flush --noinput", "dropdb genesis_master",
+        "git checkout -- .", "git checkout HEAD -- src/", "git checkout -- $(git diff --name-only)", "git checkout main -- .", "git restore .",
+        "git checkout -f main", "git stash drop", "git stash clear", "git rm -rf . --quiet",
+        "rm -rf .git", "rm -rf sub/.git", "rm -rf .claude/worktrees", "rm -rf .claude/worktrees/feat-x",
+        "docker compose down -v", "docker-compose down --volumes", "terraform apply -auto-approve",
+        "robocopy 'L:\\' 'F:\\' /MIR", "robocopy src dst /PURGE", "lftp -e 'mirror --reverse --delete dist/ /' ftp.x",
+        "gh api repos/a/b --method DELETE", "gh api -X DELETE repos/a/b/releases/1",
+        "firebase hosting:disable --project p --force"]
+DENY += ["gh repo delete a/b --yes"]
+NONE += ["npx prisma migrate dev", "npx prisma generate", "npx prisma db push", "php artisan migrate",
+         "python manage.py migrate", "alembic upgrade head", "git checkout main", "git checkout -b feat",
+         "git restore --staged a.py", "git checkout -- src/a.py", "git restore a.py b.py", "git stash", "git stash pop", "git rm --cached -r .",
+         "git rm old.txt", "rm .gitignore", "rm -rf node_modules", "docker compose down",
+         "terraform apply", "terraform plan", "gh api repos/a/b", "gh pr list", "robocopy src dst /E",
+         "git commit -m 'prisma migrate reset'", "firebase deploy"]
+
+ASK += ["awk 'BEGIN{system(\"rm -rf /\")}'", "awk '{print | \"sh\"}' x", "gawk 'BEGIN{\"date\" | getline d}'"]
+
 NONE += ["adb devices", "adb logcat", "adb install app.apk", "adb shell ls /sdcard",
          "adb shell am start -n com.x/.Main", "adb shell getprop ro.product.model",
          "fastboot devices", "adb shell pm list packages"]
@@ -281,4 +322,4 @@ def test_a_memory_folder_is_scratch_but_not_its_root(command, decision):
 
 def test_a_fully_bypassed_suite_has_this_many_cases():
     """The suite cannot quietly shrink."""
-    assert len(DENY) >= 115 and len(ASK) >= 54 and len(NONE) >= 52
+    assert len(DENY) >= 136 and len(ASK) >= 95 and len(NONE) >= 94
