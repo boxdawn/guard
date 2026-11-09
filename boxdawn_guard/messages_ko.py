@@ -104,6 +104,9 @@ _TABLE = (
     ("`aws {} {}` deletes cloud resources", "`aws {0} {1}`: 클라우드 자원을 지웁니다"),
     ("`{} … delete` deletes cloud resources", "`{0} … delete`: 클라우드 자원을 지웁니다"),
     ("`docker` prune removes data", "`docker` prune: 데이터를 지웁니다"),
+    ("`{}` runs a program known only at run time", "`{0}`: 실행해야만 알 수 있는 프로그램을 실행합니다"),
+    ("`{}` program runs other commands", "`{0}`: 프로그램이 다른 명령을 실행합니다"),
+    ("`wsl --unregister` deletes the distro and every file in it", "`wsl --unregister`: 배포판과 그 안의 파일 전부를 지웁니다"),
     # phones and other devices
     ("`fastboot {}` wipes data on the device", "`fastboot {0}`: 기기의 데이터를 지웁니다"),
     ("`fastboot {}` overwrites a partition on the device", "`fastboot {0}`: 기기의 파티션을 덮어씁니다"),

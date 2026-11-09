@@ -81,6 +81,10 @@ CASES = [
     # #97660: PowerShell fills `$GNUPGHOME` (empty) before bash sees the text
     (r'bash -lc "export GNUPGHOME=$(mktemp -d); rm -rf \$GNUPGHOME"', "ask", ["code.runtime"]),
     (r"adb shell pm clear com.x", "ask", ["device.app_data"]),
+    (r"wsl -- rm -rf /", "deny", ["rm.outside"]),
+    (r"wsl.exe bash -lc 'rm -rf /'", "deny", ["rm.outside"]),
+    (r"wsl --unregister Ubuntu", "deny", ["wsl.unregister"]),
+    (r"wsl ls -la", None, []),
     (r"""python -c "import shutil; shutil.rmtree('x')" """, "ask", ["code.inline_risky"]),
     ("@'\nimport os\nos.remove('x')\n'@ | python -", "ask", ["code.inline_risky"]),
     (r"Get-Content x.py | python", "ask", ["pipe.into_interpreter"]),

@@ -116,7 +116,7 @@ RULE_IDS = frozenset({
     "iac.destroy", "k8s.delete", "helm.uninstall", "s3.rm", "s3.rb", "cloud.delete",
     "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
-    "device.app_data", "device.wipe", "device.flash",
+    "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -1168,6 +1168,44 @@ class _Judge:
                                                   ["volume", "rm"], ["image", "prune"])):
             self.flag("ask", "docker.prune", "`docker` prune removes data")
 
+    def _awk(self, name: str, args: list[Value], depth: int) -> None:
+        """An awk program that runs commands (`system()`, `| getline`, `print | "…"`)."""
+        rest = _strip_options(args, {"-F", "-v", "-f", "--field-separator", "--assign", "--file"})
+        if "-f" in args or "--file" in args or not rest:
+            return  # a program file: what it runs is not on the line
+        program = rest[0]
+        if program is None:
+            self.flag("ask", "code.runtime", f"`{name}` runs a program known only at run time")
+        # String literals become S, so a `|` inside one (`print $2" | "$3`) is not a pipe.
+        elif re.search(r"\bsystem\s*\(|\|\s*getline|\|\s*S", re.sub(r'"(\\.|[^"\\])*"', "S", program)):
+            self.flag("ask", "code.inline_risky", f"`{name}` program runs other commands")
+
+    def _wsl(self, name: str, args: list[Value], depth: int) -> None:
+        """`wsl` runs a Linux command: after `-e`/`--exec` as given, after `--`
+        or on its own through the distro's shell."""
+        i = 0
+        while i < len(args) and args[i] is not None and args[i].startswith("-"):
+            a = args[i]
+            if a in ("--unregister",):
+                self.flag("deny", "wsl.unregister", "`wsl --unregister` deletes the distro and every file in it")
+                return
+            if a in ("-e", "--exec"):
+                rest = args[i + 1:]
+                if rest:
+                    self._judge(rest[0], rest[1:], depth)
+                return
+            if a == "--":
+                i += 1
+                break
+            i += 2 if a in ("-d", "--distribution", "-u", "--user", "--cd", "--shell-type") else 1
+        rest = args[i:]
+        if rest:
+            # The words reach the distro's shell as one line, with the quoting
+            # they had on this side: read them both as a command and as that line.
+            self._judge(rest[0], rest[1:], depth)
+            if any(w is None or re.search(r"[;&|<>`$()]", w) for w in rest):
+                self._judge("sh", ["-c", None if any(w is None for w in rest) else " ".join(rest)], depth)
+
     def _device(self, name: str, args: list[Value], depth: int) -> None:
         """A phone or other device on the end of `adb` / `fastboot`: its data
         is not in the project, and a wipe there has no undo."""
@@ -1206,6 +1244,8 @@ _HANDLERS = {
     "kubectl": _Judge._infra, "helm": _Judge._infra, "aws": _Judge._infra,
     "gcloud": _Judge._infra, "az": _Judge._infra, "docker": _Judge._infra,
     "adb": _Judge._device, "fastboot": _Judge._device,
+    "awk": _Judge._awk, "gawk": _Judge._awk, "mawk": _Judge._awk, "nawk": _Judge._awk,
+    "wsl": _Judge._wsl,
 }
 
 
@@ -1472,4 +1512,55 @@ def _unwrap(name: str, args: list[Value]) -> list[Value]:
         return _strip_options(args, {"-I", "-i", "-n", "-P", "-L", "-s", "-d", "-E", "-a"})
     if name == "stdbuf":
         return _strip_options(args, {"-i", "-o", "-e"})
+    if name == "exec":
+        return _strip_options(args, {"-a"})
+    if name in ("strace", "ltrace"):
+        return _strip_options(args, {"-o", "-e", "-p", "-s", "-u", "-E", "-a", "-b", "-I", "-O", "-P", "-S", "-X", "-n"})
+    if name == "systemd-run":
+        return _strip_options(args, {"-p", "--property", "-u", "--unit", "--uid", "--gid", "-E", "--setenv",
+                                     "--working-directory", "-M", "--machine", "-H", "--host",
+                                     "--description", "--slice", "--on-calendar", "--on-active"})
+    if name == "chroot":
+        return _strip_options(args, set())[1:]  # the new root
+    if name == "screen":
+        i = 0
+        while i < len(args) and args[i] is not None and args[i].startswith("-"):
+            # `-dmS name`: a cluster ending in a letter that takes a value takes the next word
+            i += 2 if args[i] == "-Logfile" or args[i][-1:] in "Scehpst" else 1
+        return args[i:]
+    # These hand their command to a shell as one string.
+    if name == "flock":
+        rest = _strip_options(args, {"-w", "--wait", "--timeout", "-E", "--conflict-exit-code"})[1:]  # the lock
+        if rest[:1] in (["-c"], ["--command"]):
+            return ["sh", "-c", rest[1] if len(rest) > 1 else None]
+        return rest
+    if name == "watch":
+        return _as_shell_code(_strip_options(args, {"-n", "--interval", "-d", "-q", "--equexit"}))
+    if name == "script":
+        for i, a in enumerate(args):
+            if a in ("-c", "--command") or (a and re.fullmatch(r"-[a-zA-Z]*c", a)):
+                return ["sh", "-c", args[i + 1] if i + 1 < len(args) else None]
+        return []  # an interactive shell: what it runs is typed later
+    if name == "tmux":
+        return _tmux_command(args)
     return _strip_options(args, set())
+
+
+def _as_shell_code(words: list[Value]) -> list[Value]:
+    """`sh -c` with the words joined, as `watch` and `tmux` run them."""
+    if not words:
+        return []
+    return ["sh", "-c", None if any(w is None for w in words) else " ".join(words)]
+
+
+_TMUX_RUNS = frozenset({"new", "new-session", "new-window", "neww", "split-window", "splitw",
+                        "run-shell", "run", "respawn-pane", "respawnp", "respawn-window", "respawnw"})
+
+
+def _tmux_command(args: list[Value]) -> list[Value]:
+    """The shell command a tmux subcommand starts, if one is on the line."""
+    rest = _strip_options(args, {"-L", "-S", "-f", "-T"})
+    if not rest or rest[0] not in _TMUX_RUNS:
+        return []
+    words = _strip_options(rest[1:], {"-s", "-n", "-c", "-t", "-x", "-y", "-e", "-F", "-l", "-b"})
+    return _as_shell_code(words)
