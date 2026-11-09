@@ -30,6 +30,17 @@ The plugin carries builds for Windows x64, macOS (Apple silicon and Intel) and L
 
 Start a new Claude Code session after installing: a session that was already open does not pick up the guard. After uninstalling or reinstalling, restart any session that was open; until then its Bash and PowerShell calls are blocked, because the guard blocks a command whenever it cannot run.
 
+### GitHub Copilot CLI
+
+```
+copilot plugin marketplace add boxdawn/guard
+copilot plugin install boxdawn-guard@boxdawn
+```
+
+The same rules judge the commands Copilot runs with its `powershell` and `bash` tools: deny or ask with the reason, or no decision. Typing into a shell that is already running (`write_powershell`, `write_bash`) always asks. Other tools, Copilot's own file viewing and search among them, get no decision, and a recursive `grep` gets no `--exclude` flags. This edition has no settings: it uses the fixed rules, with messages in English.
+
+When the guard fails, Copilot refuses the command. When a hook runs past Copilot's time limit, Copilot lets the command through, so the guard refuses on its own after 10 seconds. Tested with Copilot CLI 1.0.106 on Windows; the macOS and Linux builds are the same as the Claude Code plugin's but have not been run under Copilot.
+
 ## What it does
 
 - **Deny or ask, never allow.** `deny` stops the command with the reason. `ask` shows Claude Code's own "run this?" prompt. No decision leaves the call to your permission settings.
