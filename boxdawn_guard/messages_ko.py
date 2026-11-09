@@ -104,6 +104,12 @@ _TABLE = (
     ("`aws {} {}` deletes cloud resources", "`aws {0} {1}`: 클라우드 자원을 지웁니다"),
     ("`{} … delete` deletes cloud resources", "`{0} … delete`: 클라우드 자원을 지웁니다"),
     ("`docker` prune removes data", "`docker` prune: 데이터를 지웁니다"),
+    # phones and other devices
+    ("`fastboot {}` wipes data on the device", "`fastboot {0}`: 기기의 데이터를 지웁니다"),
+    ("`fastboot {}` overwrites a partition on the device", "`fastboot {0}`: 기기의 파티션을 덮어씁니다"),
+    ("`adb uninstall` removes an app and its data from the device", "`adb uninstall`: 기기에서 앱과 그 데이터를 지웁니다"),
+    ("`adb shell` clears or removes an app's data on the device", "`adb shell`: 기기에서 앱 데이터를 지우거나 앱을 지웁니다"),
+    ("`adb shell` deletes or wipes data on the device", "`adb shell`: 기기의 데이터를 지웁니다"),
     # an org's own rules: the note stays as the org wrote it
     ("team rule {}: {} (a value is known only at run time)", "조직 규칙 {0}: {1} (실행해야만 값을 알 수 있습니다)"),
     ("team rule {} on `{}` (a value is known only at run time)", "조직 규칙 {0}: `{1}` (실행해야만 값을 알 수 있습니다)"),
