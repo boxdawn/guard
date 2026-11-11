@@ -358,7 +358,11 @@ class _Judge:
             if kind == "variable_assignment":
                 name = node.child_by_field_name("name")
                 ops = {c.type for c in node.children if not c.is_named}
-                if name is not None and (not _straight_line(node)[0] or "+=" in ops):
+                if name is not None and name.type == "subscript":
+                    poisoned.update(c.text.decode() for c in name.named_children[:1])  # `X[0]=…` sets X
+                elif name is not None and name.text == b"IFS":
+                    return {}  # words are split differently from here on
+                elif name is not None and (not _straight_line(node)[0] or "+=" in ops):
                     poisoned.add(name.text.decode())
             elif kind == "unset_command":
                 return {}  # its own node type, not a `command` (found by the suite)
@@ -377,6 +381,9 @@ class _Judge:
             elif kind == "command":
                 name_node = node.child_by_field_name("name")
                 word = _value(name_node.named_children[0]) if name_node is not None and name_node.named_children else ""
+                if word in ("command", "builtin"):  # `command read X` is `read X`
+                    rest = [_value(a) for a in node.children_by_field_name("argument")]
+                    word = next((a for a in rest if a is None or not a.startswith("-")), "")
                 if word is None or word in _REASSIGNS:
                     return {}  # eval, read, source …: any name may change unseen
 
@@ -883,7 +890,10 @@ class _Judge:
                 fed_a_secret = fed_a_secret or bool(self._named_secrets(name, args))
             redirects = [n for n in _walk(stage) if n.type == "file_redirect"]
             fed_a_secret = fed_a_secret or any(self._redirect_reads_secret(n) for n in redirects)
-        for stage in stages[1:]:
+        # After a heredoc start (`cat <<EOF | bash`) the grammar puts what
+        # follows the `|` in a pipeline of its own: its first stage is fed too.
+        fed = stages if node.parent is not None and node.parent.type == "heredoc_redirect" else stages[1:]
+        for stage in fed:
             command = stage if stage.type == "command" else next(
                 (c for c in stage.named_children if c.type == "command"), None)
             if command is None:
