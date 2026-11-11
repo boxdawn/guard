@@ -69,7 +69,8 @@ jobs:
           retention-days: 7
 
   # One plugin carries every OS's build; place.sh / place.ps1 pick one at
-  # session start. BUILD_ID is what they compare to skip a re-copy.
+  # session start. BUILD_ID is what they compare to skip a re-copy, VERSION
+  # what keeps an older plugin folder from replacing a newer build.
   plugin:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     needs: binary
@@ -83,6 +84,7 @@ jobs:
       - name: assemble plugin/dist
         run: |
           set -eu
+          v=$(python3 -c "import json; print(json.load(open('plugin/.claude-plugin/plugin.json'))['version'])")
           for pair in Windows-X64:windows-x64 macOS-ARM64:macos-arm64 macOS-X64:macos-x64 Linux-X64:linux-x64 Linux-ARM64:linux-arm64; do
             src="artifacts/bdxguard-${pair%%:*}"
             dst="plugin/dist/${pair##*:}"
@@ -90,6 +92,7 @@ jobs:
             mkdir -p plugin/dist
             cp -R "$src" "$dst"
             echo "$GITHUB_SHA" > "$dst/BUILD_ID"
+            echo "$v" > "$dst/VERSION"
           done
           # upload-artifact drops the executable bit
           chmod +x plugin/dist/*/bdxguard plugin/dist/*/bdxguard.exe plugin/scripts/place.sh
