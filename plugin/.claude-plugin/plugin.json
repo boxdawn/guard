@@ -27,9 +27,9 @@
     "language": {
       "type": "string",
       "title": "Language",
-      "description": "The language of the guard's messages.",
-      "options": ["English", "한국어"],
-      "default": "English"
+      "description": "The language of the guard's messages. Auto follows this machine's language.",
+      "options": ["Auto", "English", "한국어"],
+      "default": "Auto"
     }
   }
 }

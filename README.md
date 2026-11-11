@@ -37,7 +37,7 @@ copilot plugin marketplace add boxdawn/guard
 copilot plugin install boxdawn-guard@boxdawn
 ```
 
-The same rules judge the commands Copilot runs with its `powershell` and `bash` tools: deny or ask with the reason, or no decision. Typing into a shell that is already running (`write_powershell`, `write_bash`) always asks. Other tools, Copilot's own file viewing and search among them, get no decision, and a recursive `grep` gets no `--exclude` flags. This edition has no settings: it uses the fixed rules, with messages in English.
+The same rules judge the commands Copilot runs with its `powershell` and `bash` tools: deny or ask with the reason, or no decision. Typing into a shell that is already running (`write_powershell`, `write_bash`) always asks. Other tools, Copilot's own file viewing and search among them, get no decision, and a recursive `grep` gets no `--exclude` flags. This edition has no settings: it uses the fixed rules, with messages in English, or in Korean on a Korean system (Korean has not been run under Copilot yet).
 
 When the guard fails, Copilot refuses the command. When a hook runs past Copilot's time limit, Copilot lets the command through, so the guard refuses on its own after 10 seconds. Tested with Copilot CLI 1.0.106 on Windows; the macOS and Linux builds are the same as the Claude Code plugin's but have not been run under Copilot.
 
@@ -80,7 +80,7 @@ With a Boxdawn API key on a paid plan, set in the plugin's settings (`/plugin co
 
 On a paid plan, each deny or ask judged on the signed rules is appended as one line to `log/blocks-YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/block_log.py`](boxdawn_guard/block_log.py)). A line holds the tool, the decision, the rule ids and where the target sits (inside the project, outside it, …), never the command or a path. Files older than 30 days are deleted at the next Bash or PowerShell call. At session start, right after the signed rules are fetched, the lines are sent to Boxdawn and then deleted from your machine ([`boxdawn_guard/block_send.py`](boxdawn_guard/block_send.py)); the request carries the key and those lines only. To keep the record on this machine instead, turn on `keep_blocks_local` in the plugin's settings. Without a key, or on the fixed rules, nothing is recorded or sent. Decisions on the `Read` and `Grep` tools are not recorded.
 
-The guard's messages are in English. Set `language` to 한국어 in the plugin's settings for Korean. The decision is the same in both.
+The guard's messages are in English, or in Korean when Korean is this machine's language (on Windows the display language or the first preferred language; `LC_ALL`, `LC_MESSAGES` or `LANG` elsewhere). Set `language` to English or 한국어 in the plugin's settings to fix one. The decision is the same in both.
 
 ## Tested
 

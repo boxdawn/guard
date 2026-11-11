@@ -76,6 +76,41 @@ def test_english_is_the_default(monkeypatch):
     assert out["permissionDecisionReason"].isascii()
 
 
+@pytest.mark.parametrize("choice", [None, "", "Auto"])
+def test_with_no_choice_a_korean_system_gets_korean(monkeypatch, choice):
+    monkeypatch.setattr(command_hook, "_system_is_korean", lambda: True)
+    if choice is None:
+        monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_LANGUAGE", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_LANGUAGE", choice)
+    out = command_hook.decide(payload("rm -rf /etc/x"))["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert re.search("[가-힣]", out["permissionDecisionReason"])
+
+
+def test_a_chosen_language_wins_over_the_system(monkeypatch):
+    monkeypatch.setattr(command_hook, "_system_is_korean", lambda: True)
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_LANGUAGE", "English")
+    assert command_hook.decide(payload("rm -rf /etc/x"))["hookSpecificOutput"]["permissionDecisionReason"].isascii()
+    monkeypatch.setattr(command_hook, "_system_is_korean", lambda: False)
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_LANGUAGE", messages_ko.KOREAN)
+    assert re.search("[가-힣]", command_hook.decide(payload("rm -rf /etc/x"))["hookSpecificOutput"]["permissionDecisionReason"])
+
+
+@pytest.mark.parametrize("env, korean", [
+    ({"LANG": "ko_KR.UTF-8"}, True), ({"LANG": "en_US.UTF-8"}, False), ({}, False),
+    ({"LC_ALL": "C", "LANG": "ko_KR.UTF-8"}, False), ({"LC_MESSAGES": "ko_KR", "LANG": "en_US"}, True),
+])
+def test_the_system_language_off_windows_is_read_from_the_locale(monkeypatch, env, korean):
+    monkeypatch.undo()  # the real function, not the fixture's stand-in
+    monkeypatch.setattr(command_hook.os, "name", "posix")
+    for name in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert command_hook._system_is_korean() is korean
+
+
 def test_korean_changes_the_words_and_not_the_decision(monkeypatch):
     monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_LANGUAGE", raising=False)
     english = command_hook.decide(payload("rm -rf /etc/x"))["hookSpecificOutput"]
