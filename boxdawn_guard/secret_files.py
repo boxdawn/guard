@@ -10,6 +10,7 @@ shell search, or a secret in a file with an ordinary name is not seen.
 from __future__ import annotations
 
 import fnmatch
+import os
 import posixpath
 import re
 from typing import Optional
@@ -338,8 +339,15 @@ def _copied_out(args: list) -> list[str]:
     return [a for a in operands[:-1] if a is not None and not _is_remote(a)]
 
 
+# `h:/tmp` is drive H on Windows. Elsewhere there are no drive letters, so it
+# is the host `h`.
+_WINDOWS = os.name == "nt"
+
+
 def _is_remote(path: Optional[str]) -> bool:
-    return path is not None and ":" in path and not re.match(r"[A-Za-z]:[\\/]", path)
+    if path is None or ":" not in path:
+        return False
+    return not (_WINDOWS and re.match(r"[A-Za-z]:[\\/]", path))
 
 
 def literals_in_code(code: str) -> list[str]:
