@@ -37,8 +37,35 @@ def _globs(pattern: str) -> list[str]:
     return [m.group(1) + part + m.group(3) for part in m.group(2).split(",")] if m else [pattern]
 
 
+def _system_is_korean() -> bool:
+    """Whether the person at this machine reads Korean first: on Windows the
+    display language or the first of the preferred languages, elsewhere the
+    locale variables. Anything unexpected means no."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            import winreg
+            if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x12:  # LANG_KOREAN
+                return True
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International\User Profile") as key:
+                preferred = winreg.QueryValueEx(key, "Languages")[0]
+            return bool(preferred) and str(preferred[0]).lower().startswith("ko")
+        for name in ("LC_ALL", "LC_MESSAGES", "LANG"):
+            value = os.environ.get(name)
+            if value:
+                return value.lower().startswith("ko")
+    except Exception:  # noqa: BLE001 - the language is never worth failing a decision for
+        pass
+    return False
+
+
 def _korean() -> bool:
-    return os.environ.get("CLAUDE_PLUGIN_OPTION_LANGUAGE") == messages_ko.KOREAN
+    """`language`: 한국어 or English as chosen; Auto, or no setting at all
+    (the Copilot edition has none), follows the machine."""
+    choice = os.environ.get("CLAUDE_PLUGIN_OPTION_LANGUAGE")
+    if choice in (None, "", "Auto"):
+        return _system_is_korean()
+    return choice == messages_ko.KOREAN
 
 
 def _search_roots(tool_input: dict, cwd: str | None) -> tuple[str, ...]:
