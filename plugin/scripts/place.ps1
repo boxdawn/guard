@@ -37,7 +37,9 @@ if (-not $keep -and -not ((Test-Path $dstId) -and ((Get-Content -Raw $srcId) -eq
 # background (the session does not wait). Without one this does nothing and
 # opens no connection.
 # With `undo` on, the first snapshot of the project, also in the background.
-if ($env:CLAUDE_PLUGIN_OPTION_UNDO -in @('true', '1', 'yes') -and $env:CLAUDE_PROJECT_DIR) {
+# A drive root is never a project, and without its `\` it would name another folder.
+if ($env:CLAUDE_PLUGIN_OPTION_UNDO -in @('true', '1', 'yes') -and $env:CLAUDE_PROJECT_DIR -and
+    $env:CLAUDE_PROJECT_DIR.TrimEnd('\').Length -gt 2) {
     Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList @('undo-start', "`"$($env:CLAUDE_PROJECT_DIR.TrimEnd('\'))`"") -WindowStyle Hidden
 }
 if ($env:CLAUDE_PLUGIN_OPTION_API_KEY) {

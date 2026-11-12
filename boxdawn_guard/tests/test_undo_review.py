@@ -23,14 +23,27 @@ def _junction(link, target):
     subprocess.run(["cmd", "/c", "mklink", "/J", link, str(target)], check=True, capture_output=True)
 
 
-def test_a_process_over_its_time_is_stopped_with_its_children():
+def test_a_process_over_its_time_is_stopped_with_its_children(tmp_path):
     """A real process whose child keeps the pipes open, as the launcher git on Windows does."""
-    child = ("import subprocess, sys, time; "
-             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); time.sleep(60)")
+    script = tmp_path / "parent.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "open(sys.argv[1], 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n")
     started = time.perf_counter()
     with pytest.raises(subprocess.TimeoutExpired):
-        undo._run([sys.executable, "-c", child], cwd=os.getcwd(), env=dict(os.environ), stdin=None, timeout=1)
+        undo._run([sys.executable, str(script), str(tmp_path / "pid")], cwd=os.getcwd(), env=dict(os.environ),
+                  stdin=None, timeout=3)
     assert time.perf_counter() - started < 15
+    grandchild = int((tmp_path / "pid").read_text())
+    time.sleep(0.5)
+    if os.name == "nt":
+        listed = subprocess.run(["tasklist", "/FI", f"PID eq {grandchild}", "/NH"], capture_output=True, text=True)
+        assert str(grandchild) not in listed.stdout
+    else:
+        with pytest.raises(OSError):
+            os.kill(grandchild, 0)
 
 
 def test_a_file_that_grew_past_the_limit_is_not_overwritten_by_going_back(project, monkeypatch):
@@ -231,7 +244,7 @@ def test_a_restore_that_stops_part_way_says_so(project, monkeypatch, capsys):
     _write(project, "notes.txt", b"changed\n")
     assert undo._cli(["undo", "restore", "1", project]) == 1
     err = capsys.readouterr().err
-    assert "stopped part-way" in err and "snapshot 2" in err and "Traceback" not in err
+    assert "stopped" in err and "snapshot 2" in err and "Traceback" not in err
 
 
 def test_old_unprotected_notes_go_with_the_old_snapshots(project):
@@ -243,3 +256,222 @@ def test_old_unprotected_notes_go_with_the_old_snapshots(project):
     assert store.acquire()
     assert store.prune(now=store.rows()[-1]["at"] + undo.KEEP_SECONDS + 5) == 1
     assert [(r.get("n"), "unprotected" in r) for r in store.rows()] == [(2, False)]
+
+
+# -- what the second review found -------------------------------------------------
+
+def _read(project, rel):
+    with open(os.path.join(project, rel), "rb") as f:
+        return f.read()
+
+
+def test_going_back_can_itself_be_undone(project, capsys):
+    _write(project, "f.txt", b"v1")
+    undo.before_command(_payload(project, "one"), _data())
+    _write(project, "f.txt", b"v2 - an hour of work")
+    undo.before_command(_payload(project, "two"), _data())
+    assert undo._cli(["undo", "restore", "1", project]) == 0
+    assert _read(project, "f.txt") == b"v1"
+    assert undo._cli(["undo", "restore", "3", project]) == 0  # 3 = the state just before going back
+    assert _read(project, "f.txt") == b"v2 - an hour of work"
+    assert "left as it is" not in capsys.readouterr().out
+
+
+def test_the_snapshot_after_a_restore_is_of_what_is_on_disk(project):
+    _write(project, "f.txt", b"v1")
+    undo.before_command(_payload(project, "c1"), _data())
+    _write(project, "f.txt", b"v2-longer")
+    undo.before_command(_payload(project, "c2"), _data())
+    store = _store(project)
+    assert store.acquire()
+    store.restore(1)
+    store.release()
+    undo.before_command(_payload(project, "rm f.txt"), _data())
+    os.remove(os.path.join(project, "f.txt"))
+    last = store.snapshots()[-1]
+    assert last["before"] == "rm f.txt"
+    assert store.git("show", f"{last['commit']}:f.txt") == b"v1"
+
+
+def test_one_path_git_cannot_look_at_does_not_empty_the_snapshot(project, monkeypatch):
+    real = undo.Store.git
+
+    def add_dies_on_bad(self, *args, **kwargs):
+        if "add" in args and b"bad.txt" in (kwargs.get("stdin") or b"").split(b"\0"):
+            return 128, b"", b"fatal: unable to stat 'bad.txt': No such file or directory"
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(undo.Store, "git", add_dies_on_bad)
+    _write(project, "bad.txt", b"x")
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    row = store.snapshots()[0]
+    assert row["unreadable"] == ["bad.txt"]
+    assert {"notes.txt", "src/app.py", ".env"} <= store._names(row["commit"])
+
+
+def test_a_saved_file_that_became_a_heavy_folder_is_not_walked_into(project):
+    _write(project, "tools/node_modules", b"a file with that name")
+    undo.before_command(_payload(project), _data())
+    os.remove(os.path.join(project, "tools", "node_modules"))
+    _write(project, "tools/node_modules/pkg/index.js", b"heavy")
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    row = store.snapshots()[-1]
+    assert "tools/node_modules (heavy)" in row["folders"]
+    assert not [n for n in store._names(row["commit"]) if n.startswith("tools/node_modules")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are a Windows thing")
+def test_a_saved_file_that_became_a_junction_is_not_walked_into(project, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_bytes(b"not ours")
+    _write(project, "f", b"a file")
+    undo.before_command(_payload(project), _data())
+    os.remove(os.path.join(project, "f"))
+    _junction(os.path.join(project, "f"), outside)
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    assert not [n for n in store._names(store.snapshots()[-1]["commit"]) if n == "f" or n.startswith("f/")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions and the 260-character limit are Windows things")
+def test_a_junction_below_a_very_long_path_is_not_followed(project, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "o.txt").write_bytes(b"OUT-v1")
+    deep = os.path.join(project, *["d" * 46] * 6)
+    os.makedirs("\\\\?\\" + deep)
+    with open("\\\\?\\" + os.path.join(deep, "in.txt"), "wb") as f:
+        f.write(b"inside")
+    _junction("\\\\?\\" + os.path.join(deep, "jn"), outside)
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    row = store.snapshots()[0]
+    names = store._names(row["commit"])
+    assert any(n.endswith("/in.txt") for n in names) and not [n for n in names if "/jn/" in n]
+    os.remove(outside / "o.txt")
+    assert store.acquire()
+    store.restore(1)
+    assert not (outside / "o.txt").exists()
+
+
+def test_looking_for_folders_stops_at_the_budget(project, monkeypatch):
+    started = []
+    monkeypatch.setattr(undo, "start_in_background", started.append)
+    monkeypatch.setattr(undo, "HOOK_BUDGET", 0.0001)
+    for i in range(50):
+        os.makedirs(os.path.join(project, f"many/d{i}"))
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    assert "took over" in store.rows()[-1]["unprotected"] and started
+
+
+def test_the_list_cannot_be_drawn_over_by_a_command(project, capsys):
+    undo.before_command(_payload(project, "echo hi\n   7  11-12 09:00:00  before: FORGED"), _data())
+    store = _store(project)
+    store.note({"unprotected": "x\ry", "before": "rm -rf src\r   8  harmless \x1b[2J"})
+    assert undo._cli(["undo", "list", project]) == 0
+    out = capsys.readouterr().out
+    assert len(out.splitlines()) == 3 and "\r" not in out.replace("\r\n", "\n") and "\x1b" not in out
+    assert "\\n   7" in out and "\\r   8" in out
+
+
+@pytest.mark.parametrize("row", [
+    '{"at": NaN, "n": 9, "commit": "x"}', '{"at": 1e20, "unprotected": "x"}', '{"at": -1e20, "unprotected": "x"}',
+    '{"at": true, "unprotected": "x"}',
+])
+def test_a_row_with_an_impossible_time_is_not_a_row(project, row, capsys):
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    with open(store.log, "a", encoding="utf-8") as f:
+        f.write(row + "\n")
+    assert len(store.rows()) == 1
+    assert undo._cli(["undo", "list", project]) == 0
+
+
+def test_a_row_with_odd_fields_does_not_stop_the_list(project, capsys):
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    good = store.rows()[0]
+    for extra in ({"folders": 5}, {"too_large": [1, 2]}, {"before": ["a"]}, {"unreadable": "abc", "unreadable_more": "x"}):
+        store.note({**good, **extra, "n": good["n"] + 1})
+    assert undo._cli(["undo", "list", project]) == 0
+    assert "not in it" in capsys.readouterr().out  # the real row's node_modules line is still shown
+
+
+def test_settings_planted_in_the_store_do_not_change_what_is_saved(project):
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    with open(os.path.join(store.shadow, "config"), "a", encoding="utf-8") as f:
+        f.write("[core]\n\tignoreStat = true\n\tautocrlf = true\n")
+    marker = os.path.join(os.environ["CLAUDE_PLUGIN_DATA"], "hook-ran")
+    hook = os.path.join(store.shadow, "hooks", "post-checkout")
+    with open(hook, "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/sh\necho ran > '%s'\n" % marker.replace(os.sep, "/"))
+    os.chmod(hook, 0o755)
+    time.sleep(1.1)
+    _write(project, "notes.txt", b"changed after the planting\r\n")
+    undo.before_command(_payload(project), _data())
+    last = store.snapshots()[-1]
+    assert store.git("show", f"{last['commit']}:notes.txt") == b"changed after the planting\r\n"
+    _write(project, "notes.txt", b"again")
+    assert store.acquire()
+    store.restore(last["n"])
+    assert not os.path.exists(marker)
+
+
+def test_no_git_and_a_refused_project_each_leave_one_row(project, monkeypatch):
+    monkeypatch.setattr(undo, "_git_exe", lambda: None)
+    for _ in range(3):
+        undo.before_command(_payload(project, "rm -rf src"), _data())
+    rows = _store(project).rows()
+    assert len(rows) == 1 and "git is not installed" in rows[0]["unprotected"]
+
+
+def test_a_refused_project_leaves_a_row(project, monkeypatch):
+    inside = os.path.join(project, "inside-data")
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", inside)
+    undo.before_command(_payload(project), inside)
+    assert "holds the snapshot store" in _store(project).rows()[-1]["unprotected"]
+
+
+def test_the_list_says_when_there_is_nothing(project, capsys):
+    assert undo._cli(["undo", "list", os.path.join(project, "src")]) == 0
+    assert "No snapshots of" in capsys.readouterr().out
+    assert undo._cli(["undo", "restore", "1", project]) == 1
+
+
+def test_a_stop_before_the_present_was_saved_says_nothing_was_written(project, monkeypatch, capsys):
+    _write(project, "a.txt", b"a1")
+    undo.before_command(_payload(project), _data())
+    _write(project, "a.txt", b"a2")
+    undo.before_command(_payload(project), _data())
+    assert undo._cli(["undo", "restore", "1", project]) == 0  # leaves an earlier "before going back" row
+    _write(project, "a.txt", b"a3-precious")
+
+    def no_snapshot(self, *a, **k):
+        raise RuntimeError("git add: Unable to create index.lock")
+    monkeypatch.setattr(undo.Store, "snapshot", no_snapshot)
+    capsys.readouterr()
+    assert undo._cli(["undo", "restore", "2", project]) == 1
+    assert "Nothing was written" in capsys.readouterr().err and _read(project, "a.txt") == b"a3-precious"
+
+
+def test_the_clean_up_does_not_write_through_a_link_and_keeps_the_record_private(project, tmp_path):
+    store = _store(project)
+    for i in range(2):
+        _write(project, "notes.txt", b"version %d\n" % i)
+        undo.before_command(_payload(project), _data())
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    try:
+        os.symlink(str(victim), store.log + ".tmp")
+    except OSError:
+        with open(store.log + ".tmp", "w") as f:  # no right to make a link: a left-over file must not stop it either
+            f.write("left over")
+    assert store.acquire()
+    assert store.prune(now=store.rows()[-1]["at"] + undo.KEEP_SECONDS + 5) == 1
+    assert victim.read_text() == "precious" and [r["n"] for r in store.snapshots()] == [2]
+    if os.name != "nt":
+        assert os.stat(store.log).st_mode & 0o777 == 0o600
