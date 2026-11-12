@@ -1496,10 +1496,17 @@ def _positional(args: list[Value]) -> list[Value]:
 
 
 def _code_or_file(name: str, args: list[Value], rules: CommandRules) -> bool:
-    """True when the interpreter is told what to run, so stdin is data."""
+    """True when the interpreter is told what to run, so stdin is data.
+    `bash /dev/stdin` and `bash -s arg` still run stdin."""
     if _code_on_line(name, args, rules) is not None:
         return True
-    return bool(_positional(args))
+    if name in rules.shells and any(a is not None and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args):
+        return False
+    positional = _positional(args)
+    return bool(positional) and positional[0] not in _STDIN_FILES
+
+
+_STDIN_FILES = frozenset({"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 
 
 # Short flags run together (`bash -lc`, `perl -le`, `python -Ic`). A shell

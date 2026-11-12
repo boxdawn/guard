@@ -134,7 +134,7 @@ _ITEMS = frozenset({"new-item", "set-item", "remove-item", "clear-item", "rename
 _SELF = frozenset({"powershell", "pwsh"})
 _HARMLESS = frozenset({"nul", "$null"})
 _DOTNET = re.compile(r"(?i)\[\s*(?:system\.)?io\.(?:file|directory)\s*\]\s*::\s*"
-                     r"(delete|move|replace|copy|create\w*|openwrite|write\w*)\s*\(")
+                     r"(delete|move|replace|copy|create\w*|openwrite|write\w*|append\w*)\s*\(")
 _LITERAL = re.compile(r"""'([^']*)'|"([^"]*)\"""")
 _HERE = re.compile(r"(?i)^\$(?:pwd|\(pwd\)|\(get-location\))[\\/]")
 
@@ -441,7 +441,7 @@ class _PowerShell:
         code = _code_only(text)
         for m in _DOTNET.finditer(code):
             verb = m.group(1)
-            writes = verb.lower().startswith(("write", "create", "openwrite"))
+            writes = verb.lower().startswith(("write", "create", "openwrite", "append"))
             paths = _dotnet_paths(text, code, m.end())
             if verb.lower() == "copy":
                 paths = paths[1:2]  # its source is only read
