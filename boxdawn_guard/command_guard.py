@@ -830,9 +830,9 @@ class _Judge:
             return
         if "&" in op and dest_node.type == "number":
             return  # 2>&1
-        self._output(_value(dest_node, self.env), appends=">>" in op)
+        self._output(_value(dest_node, self.env))
 
-    def _output(self, dest: Value, appends: bool) -> None:
+    def _output(self, dest: Value) -> None:
         if dest is None:
             self.flag("ask", "redirect.runtime", "output is written to a path known only at run time", "unknown")
             return
@@ -841,7 +841,7 @@ class _Judge:
         if dest.startswith(self.rules.devices):
             self.flag("deny", "redirect.disk_device", f"output overwrites the disk device `{dest}`", "disk_device")
             return
-        if self._where(dest) == "outside" and not appends:
+        if self._where(dest) == "outside":
             self.flag("ask", "redirect.outside", f"output is written to `{dest}` outside the project", "outside")
 
     def _redirect_reads_secret(self, node: Node) -> bool:
@@ -898,7 +898,7 @@ class _Judge:
                 (c for c in stage.named_children if c.type == "command"), None)
             if command is None:
                 continue
-            name, args = self._name_args(command)
+            name, args = self._final(*self._name_args(command))
             if name in self.rules.interpreters and not _code_or_file(name, args, self.rules):
                 self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{name}` code")
 
@@ -1056,9 +1056,8 @@ class _Judge:
                     self.flag("ask", "mv.outside", f"`mv` takes away {said}", where)
 
     def _tee(self, name: str, args: list[Value], depth: int) -> None:
-        appends = "a" in _short_flags(args) or "--append" in args
         for dest in _operands(args):
-            self._output(dest, appends)
+            self._output(dest)
 
     def _tar(self, name: str, args: list[Value], depth: int) -> None:
         short = _tar_short(args)

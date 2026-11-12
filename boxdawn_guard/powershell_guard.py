@@ -59,7 +59,7 @@ def parse(command: str) -> dict:
 _ALIASES = {
     "rm": "remove-item", "del": "remove-item", "erase": "remove-item", "rd": "remove-item",
     "ri": "remove-item", "rmdir": "remove-item",
-    "clc": "clear-content", "sc": "set-content", "tee": "tee-object",
+    "clc": "clear-content", "sc": "set-content", "ac": "add-content", "tee": "tee-object",
     "iex": "invoke-expression", "start": "start-process", "saps": "start-process",
     "cd": "set-location", "sl": "set-location", "chdir": "set-location",
     "pushd": "push-location",
@@ -92,6 +92,8 @@ _SPECS: dict[str, tuple[dict, dict, tuple]] = {
     "remove-item": ({**_PATHS, "recurse": _S}, _PATH_ALIASES, ("path",)),
     "clear-content": (_PATHS, _PATH_ALIASES, ("path",)),
     "set-content": ({**_PATHS, "value": _V, "encoding": _V, "nonewline": _S, "passthru": _S,
+                     "asbytestream": _S}, _PATH_ALIASES, ("path", "value")),
+    "add-content": ({**_PATHS, "value": _V, "encoding": _V, "nonewline": _S, "passthru": _S,
                      "asbytestream": _S}, _PATH_ALIASES, ("path", "value")),
     "out-file": ({"filepath": _V, "literalpath": _V, "encoding": _V, "append": _S, "force": _S,
                   "noclobber": _S, "width": _V, "nonewline": _S, "inputobject": _V},
@@ -198,8 +200,7 @@ class _PowerShell:
                     a is not None and not a.startswith("-") and j._is_secret(a) for a in args))
             self._dotnet(text)
             for w in tree["writes"]:
-                if not w["append"]:
-                    self._writes(self._value(w["to"], w["start"]), "output")
+                self._writes(self._value(w["to"], w["start"]), "output")
         finally:
             self.env, j.workdirs = outer
 
@@ -504,8 +505,11 @@ class _PowerShell:
         for t in self._targets(c, b, "path", "literalpath"):
             self._writes(t, f"`{raw}` output")
 
+    def _add_content(self, c, b, raw, depth) -> None:
+        self._set_content(c, b, raw, depth)
+
     def _out_file(self, c, b, raw, depth) -> None:
-        if b.get("append") is True or b.get("noclobber") is True:
+        if b.get("noclobber") is True:
             return
         for t in (b.get("filepath") or []) + (b.get("literalpath") or []):
             self._writes(t, f"`{raw}` output")
