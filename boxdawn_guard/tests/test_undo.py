@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -89,8 +90,9 @@ def test_every_kind_of_file_comes_back_byte_for_byte(project):
     _write(project, "made_later.txt", b"new")
     store = _store(project)
     assert store.acquire()
-    target, present = store.restore(1)
+    target, present, skipped = store.restore(1)
     store.release()
+    assert skipped == {}
     after = _state(project)
     assert {k: v for k, v in after.items() if k != "made_later.txt"} == before
     assert "made_later.txt" in after  # a file made since is not deleted
@@ -115,7 +117,7 @@ def test_a_file_over_the_limit_is_left_out_and_named(project, monkeypatch):
     undo.before_command(_payload(project), data)
     store = _store(project)
     first, second = store.snapshots()
-    assert "data/deep/rows.bin" in first["left_out"] and "small.bin" in second["left_out"]
+    assert "data/deep/rows.bin" in first["too_large"] and "small.bin" in second["too_large"]
     names = store.git("ls-tree", "-r", "--name-only", second["commit"]).decode().split()
     assert "small.bin" not in names  # the old, small version would otherwise come back over the new one
 
@@ -169,8 +171,7 @@ def test_over_the_budget_the_command_goes_on_and_the_rest_runs_in_the_background
 
     def slow(self, *args, **kwargs):
         raise subprocess.TimeoutExpired("git", 3)
-    monkeypatch.setattr(undo.Store, "git", slow)
-    monkeypatch.setattr(undo.Store, "_init", lambda self: None)
+    monkeypatch.setattr(undo.Store, "_changed", slow)
     undo.before_command(_payload(project), os.environ["CLAUDE_PLUGIN_DATA"])
     store = _store(project)
     assert started == [os.path.realpath(project)]

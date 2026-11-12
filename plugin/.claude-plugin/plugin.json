@@ -27,7 +27,7 @@
     "undo": {
       "type": "boolean",
       "title": "Snapshot the project before each command",
-      "description": "Before each Bash or PowerShell command the guard saves a copy of the project's files, ignored ones such as .env too, in the plugin's data folder on this machine. Nothing is sent anywhere. `bdxguard.exe undo list` shows the copies and `bdxguard.exe undo restore <n>` puts one back. Needs git. Not saved: files outside the project, node_modules and similar folders, files over 50 MB, databases, anything remote.",
+      "description": "Before each Bash or PowerShell command the guard saves a copy of the project's files, ignored ones such as .env too, in the plugin's data folder on this machine. Nothing is sent anywhere. `bdxguard.exe undo list` shows the copies and `bdxguard.exe undo restore <n>` puts one back. Needs git. Not saved: files outside the project, node_modules and similar folders, repositories inside the project, files over 50 MB, databases, anything remote. A command that runs before its copy is ready shows as NO SNAPSHOT in the list.",
       "default": false
     },
     "language": {

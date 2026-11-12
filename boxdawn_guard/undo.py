@@ -6,11 +6,22 @@ Off unless the plugin setting `undo` is on. A snapshot is a commit in a
 project: its own `.git`, index and files are not written.
 
 In a snapshot: every file under the project folder, ignored ones too.
-Not in it: the folders in `HEAVY`, any `.git`, a file over `MAX_FILE_BYTES`,
-and what is inside a nested repository (git records only a pointer to it).
+Not in it, and named in the record: folders in `HEAVY`, nested repositories,
+on Windows a folder that is a link or junction, a file over `MAX_FILE_BYTES`,
+a file that could not be read. Never in it: any `.git`.
+
+A restore writes a file only where what is on disk now is in the snapshot it
+takes first, so going back can itself be undone; anything else is skipped
+and named.
 
 Nothing here may change the guard's decision or stop a command: the hook calls
 `before_command` after the decision is made and ignores whatever it raises.
+
+Known limits: a file rewritten with the same size and the same modified time
+is not seen as changed. The store is not protected from the agent: a command
+that writes into it can stop snapshots (the record then says "unprotected"
+for as long as the record itself is intact), and the copies of ignored files
+such as `.env` in it can be read with git.
 """
 from __future__ import annotations
 
@@ -18,18 +29,22 @@ import hashlib
 import json
 import os
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import time
 
-HEAVY = ("node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", "target", ".tox",
-         ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache", ".gradle", ".turbo")
+HEAVY = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".next", ".tox", ".mypy_cache",
+                   ".pytest_cache", ".ruff_cache", ".cache", ".gradle", ".turbo"})
 MAX_FILE_BYTES = 50 * 1024 * 1024
 KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds a command may wait for its snapshot
 LOCK_STALE = 15 * 60     # a lock older than this was left by a process that died
+NAMED = 50               # how many left-out paths one row of the record names
 _ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"  # files go in and come out byte for byte
+_REPARSE = 0x400         # FILE_ATTRIBUTE_REPARSE_POINT: a Windows symlink or junction
 
 
 def enabled() -> bool:
@@ -41,16 +56,65 @@ def project_of(payload: dict) -> str | None:
     return os.path.realpath(project) if project else None
 
 
+def _git_exe() -> str | None:
+    """Git for Windows puts a launcher on PATH (`cmd\\git.exe`); stopping it leaves
+    the real git running. The real one sits next to it."""
+    found = shutil.which("git")
+    if found and os.name == "nt":
+        folder = os.path.dirname(os.path.abspath(found))
+        if os.path.basename(folder).lower() == "cmd":
+            for build in ("mingw64", "clangarm64", "mingw32"):
+                real = os.path.join(os.path.dirname(folder), build, "bin", "git.exe")
+                if os.path.isfile(real):
+                    return real
+    return found
+
+
+def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: float | None):
+    """Like `subprocess.run`, but a process over its time is stopped with its children."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                            start_new_session=os.name != "nt")
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        proc.kill()
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    return proc.returncode, out, err
+
+
+def _is_link(path: str) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & _REPARSE)
+
+
 def _inside(path: str, folder: str) -> bool:
     path, folder = os.path.normcase(path), os.path.normcase(folder)
     return path == folder or path.startswith(folder.rstrip("\\/") + os.sep)
 
 
 def _refused(project: str, data_dir: str) -> str | None:
-    """A project that is the home folder, above it, a drive, or around the store
-    would put far more than a project in the snapshot."""
+    """A project that is the home folder, above it, a drive, on the network, or
+    around the store would put far more than a project in the snapshot."""
     if not os.path.isdir(project):
         return "not a folder"
+    if project.replace("\\", "/").startswith("//"):
+        return "a network path"
     if os.path.dirname(project) == project:
         return "a whole drive"
     if _inside(os.path.realpath(os.path.expanduser("~")), project):
@@ -63,40 +127,47 @@ def _refused(project: str, data_dir: str) -> str | None:
 class Store:
     def __init__(self, project: str, data_dir: str):
         self.project = project
-        key = hashlib.sha256(os.path.normcase(project).encode("utf-8")).hexdigest()[:16]
+        key = hashlib.sha256(os.path.normcase(project).encode("utf-8", "surrogatepass")).hexdigest()[:16]
         self.root = os.path.join(os.path.realpath(data_dir), "undo")
         self.shadow = os.path.join(self.root, key + ".git")
         self.log = os.path.join(self.root, key + ".jsonl")
         self.lock = os.path.join(self.root, key + ".lock")
 
     # -- git ---------------------------------------------------------------
-    def git(self, *args: str, timeout: float | None = None, stdin: bytes | None = None) -> bytes:
+    def git(self, *args: str, timeout: float | None = None, stdin: bytes | None = None, check: bool = True):
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
         env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
                    GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
-        run = subprocess.run(
-            ["git", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c", "core.longpaths=true",
-             "-c", "core.fsmonitor=false", "-c", "gc.auto=0", "-c", "advice.addIgnoredFile=false",
-             "-c", "advice.addEmbeddedRepo=false", f"--git-dir={self.shadow}", f"--work-tree={self.project}", *args],
-            cwd=self.project, env=env, input=stdin, capture_output=True, timeout=timeout)
-        if run.returncode != 0:
-            raise RuntimeError(f"git {args[0]}: {run.stderr.decode('utf-8', 'replace')[-300:]}")
-        return run.stdout
+        code, out, err = _run(
+            [_git_exe() or "git", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "-c",
+             "core.longpaths=true", "-c", "core.fsmonitor=false", "-c", "gc.auto=0", "-c",
+             "advice.addIgnoredFile=false", "-c", "advice.addEmbeddedRepo=false",
+             f"--git-dir={self.shadow}", f"--work-tree={self.project}", *args],
+            cwd=self.project, env=env, stdin=stdin, timeout=timeout)
+        if check and code != 0:
+            raise RuntimeError(f"git {args[0]}: {err.decode('utf-8', 'replace')[-300:]}")
+        return out if check else (code, out, err)
 
     def _init(self) -> None:
         if os.path.isdir(self.shadow):
             return
         os.makedirs(self.root, mode=0o700, exist_ok=True)
-        subprocess.run(["git", "init", "-q", "--bare", self.shadow], check=True, capture_output=True)
+        subprocess.run([_git_exe() or "git", "init", "-q", "--bare", self.shadow], check=True, capture_output=True)
         with open(os.path.join(self.shadow, "info", "attributes"), "w", encoding="utf-8") as f:
             f.write(_ATTRIBUTES)
+
+    def _names(self, commit: str) -> set[str]:
+        out = self.git("ls-tree", "-r", "-z", "--name-only", commit)
+        return {os.fsdecode(p) for p in out.split(b"\0") if p}
 
     # -- one writer at a time ---------------------------------------------
     def acquire(self) -> bool:
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         try:
-            if time.time() - os.path.getmtime(self.lock) > LOCK_STALE:
-                os.remove(self.lock)
+            st = os.lstat(self.lock)
+            # Not a plain file: nothing of ours. Old: its owner died.
+            if not stat.S_ISREG(st.st_mode) or time.time() - st.st_mtime > LOCK_STALE:
+                os.rmdir(self.lock) if stat.S_ISDIR(st.st_mode) and not _is_link(self.lock) else os.remove(self.lock)
         except OSError:
             pass
         try:
@@ -118,44 +189,124 @@ class Store:
 
     # -- the record --------------------------------------------------------
     def rows(self) -> list[dict]:
+        found = []
         try:
             with open(self.log, encoding="utf-8") as f:
-                return [json.loads(line) for line in f if line.strip()]
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue  # a line cut short by a crash must not end the record
+                    if isinstance(row, dict) and isinstance(row.get("at"), (int, float)):
+                        found.append(row)
         except OSError:
-            return []
+            pass
+        return found
 
     def note(self, row: dict) -> None:
         os.makedirs(self.root, mode=0o700, exist_ok=True)
-        with open(self.log, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"at": round(time.time(), 1), **row}, ensure_ascii=False) + "\n")
+        if os.path.islink(self.log):  # never write through a link someone put here
+            os.remove(self.log)
+        fd = os.open(self.log, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": round(time.time(), 1), **row}) + "\n")
 
     def snapshots(self) -> list[dict]:
-        return [r for r in self.rows() if "commit" in r]
+        return [r for r in self.rows() if isinstance(r.get("commit"), str) and isinstance(r.get("n"), int)]
+
+    # -- what stays out ----------------------------------------------------
+    def _folders_left_out(self) -> dict[str, str]:
+        """Folders the snapshot does not go into, found without following a link."""
+        out: dict[str, str] = {}
+        stack = [""]
+        while stack:
+            rel = stack.pop()
+            try:
+                entries = list(os.scandir(os.path.join(self.project, rel)))
+            except OSError:
+                continue
+            for entry in entries:
+                child = f"{rel}/{entry.name}" if rel else entry.name
+                try:
+                    link = entry.is_symlink() or bool(
+                        getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & _REPARSE)
+                    if link:
+                        # Elsewhere git keeps a link as a link. Git for Windows walks into it.
+                        if os.name == "nt" and entry.is_dir():
+                            out[child] = "link"
+                        continue
+                    if not entry.is_dir(follow_symlinks=False) or entry.name == ".git":
+                        continue
+                except OSError:
+                    continue
+                if entry.name.casefold() in HEAVY:
+                    out[child] = "heavy"
+                elif os.path.lexists(os.path.join(entry.path, ".git")):
+                    out[child] = "repository"
+                else:
+                    stack.append(child)
+        return out
+
+    def _link_above(self, rel: str, seen: dict[str, bool]) -> bool:
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            key = "/".join(parts[:i])
+            if key not in seen:
+                seen[key] = _is_link(os.path.join(self.project, *parts[:i]))
+            if seen[key]:
+                return True
+        return False
 
     # -- taking one --------------------------------------------------------
+    def _changed(self, exclude_file: str, timeout: float | None) -> list[str]:
+        listed = self.git("ls-files", "-z", "-m", "-o", "-d", "-X", exclude_file, "--", ".", timeout=timeout)
+        return sorted({os.fsdecode(p) for p in listed.split(b"\0") if p})
+
     def snapshot(self, why: dict, budget: float | None = None) -> dict:
         """The caller holds the lock. Raises `subprocess.TimeoutExpired` over budget."""
         started = time.perf_counter()
-        left = (lambda: max(0.1, budget - (time.perf_counter() - started))) if budget else (lambda: None)
+
+        def left() -> float | None:
+            if budget is None:
+                return None
+            remaining = budget - (time.perf_counter() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("snapshot", budget)
+            return remaining
+
         self._init()
-        exclude = [f":(exclude,glob)**/{h}/**" for h in HEAVY] + [f":(exclude){h}" for h in HEAVY]
-        listed = self.git("ls-files", "-z", "-m", "-o", "-d", "--", ".", *exclude, timeout=left())
-        changed = sorted({p for p in listed.split(b"\0") if p})
-        too_big = []
-        for path in changed:
+        folders = self._folders_left_out()
+        exclude_file = os.path.join(self.shadow, "info", "exclude")
+        with open(exclude_file, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+            for rel in folders:
+                if "\n" not in rel:
+                    f.write("/" + "".join("\\" + c if c in "\\*?[]" else c for c in rel) + "/\n")
+        changed = self._changed(exclude_file, left())
+        links: dict[str, bool] = {}
+        add, drop, too_big = [], [], []
+        for rel in changed:
+            if self._link_above(rel, links):
+                drop.append(rel)  # was saved as a file; a link stands above it now
+                continue
             try:
-                if os.lstat(os.path.join(os.fsencode(self.project), path)).st_size > MAX_FILE_BYTES:
-                    too_big.append(path)
+                big = os.lstat(os.path.join(self.project, rel)).st_size > MAX_FILE_BYTES
             except OSError:
-                pass  # deleted: `add -A` records that
+                big = False  # deleted: `add -A` records that
+            (too_big if big else add).append(rel)
+        unreadable: list[str] = []
         previous = self.snapshots()
         if changed or not previous:
-            add = [p for p in changed if p not in too_big]
             if add:
-                self.git("--literal-pathspecs", "add", "-A", "-f", "--pathspec-from-file=-", "--pathspec-file-nul",
-                         stdin=b"\0".join(add), timeout=left())
-            if too_big:  # an older, smaller version must not come back in place of this one
-                self.git("update-index", "--force-remove", "-z", "--stdin", stdin=b"\0".join(too_big), timeout=left())
+                code, _, _ = self.git("--literal-pathspecs", "add", "-A", "-f", "--ignore-errors",
+                                      "--pathspec-from-file=-", "--pathspec-file-nul", check=False,
+                                      stdin=b"\0".join(map(os.fsencode, add)), timeout=left())
+                if code != 0:  # some file could not be read; whatever still differs was not saved
+                    still = set(self._changed(exclude_file, left()))
+                    unreadable = [rel for rel in add if rel in still]
+            gone = drop + too_big + unreadable
+            if gone:  # an older version in the index must not stand in for what is there now
+                self.git("update-index", "--force-remove", "-z", "--stdin",
+                         stdin=b"\0".join(map(os.fsencode, gone)), timeout=left())
             tree = self.git("write-tree", timeout=left()).decode().strip()
             commit = self.git("-c", "user.name=boxdawn", "-c", "user.email=guard@localhost", "commit-tree", tree,
                               "-m", "snapshot", timeout=left()).decode().strip()
@@ -163,21 +314,49 @@ class Store:
             commit = previous[-1]["commit"]
         n = max((r["n"] for r in previous), default=0) + 1
         self.git("update-ref", f"refs/snap/{n}", commit, timeout=left())
-        row = {"n": n, "commit": commit, "seconds": round(time.perf_counter() - started, 3),
-               "left_out": [p.decode("utf-8", "replace") for p in too_big], **why}
+        row = {"n": n, "commit": commit, "seconds": round(time.perf_counter() - started, 3), **why}
+        for name, paths in (("too_large", too_big), ("unreadable", unreadable),
+                            ("folders", [f"{rel} ({kind})" for rel, kind in sorted(folders.items())])):
+            if paths:
+                row[name] = paths[:NAMED]
+                if len(paths) > NAMED:
+                    row[name + "_more"] = len(paths) - NAMED
         self.note(row)
         return row
 
     # -- coming back -------------------------------------------------------
-    def restore(self, n: int) -> tuple[dict, dict]:
+    def restore(self, n: int) -> tuple[dict, dict, dict[str, str]]:
         """Files as they were in snapshot `n`. The present goes into a snapshot
-        first; files made after `n` stay where they are."""
+        first, and a file is written only where that snapshot holds what is on
+        disk now. Files made after `n` stay. Returns (target, present, skipped)."""
         target = next((r for r in self.snapshots() if r["n"] == n), None)
         if target is None:
             raise LookupError(f"no snapshot {n}")
         present = self.snapshot({"note": f"before going back to {n}"})
-        self.git("checkout", target["commit"], "--", ".")
-        return target, present
+        saved_now = self._names(present["commit"])
+        differs = self.git("diff", "--name-only", "-z", present["commit"])
+        differs = {os.fsdecode(p) for p in differs.split(b"\0") if p}
+        links: dict[str, bool] = {}
+        write, skipped = [], {}
+        for rel in sorted(self._names(target["commit"])):
+            full = os.path.join(self.project, rel)
+            parts = rel.split("/")
+            above = ["/".join(parts[:i]) for i in range(1, len(parts))]
+            if self._link_above(rel, links):
+                skipped[rel] = "a link stands above it"
+            elif os.path.isdir(full) and not _is_link(full):
+                skipped[rel] = "it is a folder now"
+            elif rel in differs or (os.path.lexists(full) and rel not in saved_now):
+                skipped[rel] = "what is there now could not be saved first"
+            elif any(a not in saved_now and os.path.lexists(os.path.join(self.project, a))
+                     and not os.path.isdir(os.path.join(self.project, a)) for a in above):
+                skipped[rel] = "a file that could not be saved first is in its place"
+            else:
+                write.append(rel)
+        if write:
+            self.git("--literal-pathspecs", "checkout", target["commit"], "--pathspec-from-file=-",
+                     "--pathspec-file-nul", stdin=b"\0".join(map(os.fsencode, write)))
+        return target, present, skipped
 
     # -- keeping it small --------------------------------------------------
     def size(self) -> int:
@@ -214,8 +393,12 @@ class Store:
             kept = kept[len(oldest):]
             self.git("gc", "--prune=now", "-q")
         if dropped:
+            numbers = {r["n"] for r in kept}
+            # Snapshot rows that are left, and the "unprotected" notes that are not old yet.
+            rows = [r for r in self.rows()
+                    if (r.get("n") in numbers if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
             with open(self.log + ".tmp", "w", encoding="utf-8") as f:
-                f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in kept)
+                f.writelines(json.dumps(r) + "\n" for r in rows)
             os.replace(self.log + ".tmp", self.log)
         return dropped
 
@@ -237,26 +420,32 @@ def start_in_background(project: str) -> None:
 
 
 def before_command(payload: dict, data_dir: str | None) -> None:
-    """Called by the hook for a Bash or PowerShell call it did not deny."""
+    """Called by the hook for a Bash or PowerShell call it did not deny. A command
+    that goes on without a snapshot gets an "unprotected" row in the record."""
     project = project_of(payload)
-    if not (enabled() and data_dir and project and shutil.which("git")):
+    if not (enabled() and data_dir and project and _git_exe()):
         return
     if _refused(project, data_dir):
         return
     store = Store(project, data_dir)
     command = payload.get("tool_input", {}).get("command")
     why = {"before": command[:200] if isinstance(command, str) else "", "session": payload.get("session_id")}
-    if not store.acquire():
-        store.note({"unprotected": "another snapshot was still being taken", **why})
-        return
+    finish_later = False
     try:
-        store.snapshot(why, budget=HOOK_BUDGET)
+        if not store.acquire():
+            store.note({"unprotected": "another snapshot was still being taken", **why})
+            return
+        try:
+            store.snapshot(why, budget=HOOK_BUDGET)
+        finally:
+            store.release()
     except subprocess.TimeoutExpired:
-        store.release()
+        finish_later = True
         store.note({"unprotected": f"the snapshot took over {HOOK_BUDGET:g}s; finishing in the background", **why})
+    except Exception as exc:  # noqa: BLE001 - whatever it was, the record must say this command had no snapshot
+        store.note({"unprotected": f"the snapshot failed ({type(exc).__name__}: {str(exc)[:200]})", **why})
+    if finish_later:
         start_in_background(project)
-    finally:
-        store.release()
 
 
 def start(project: str, data_dir: str) -> str:
@@ -265,16 +454,29 @@ def start(project: str, data_dir: str) -> str:
     refused = _refused(project, data_dir)
     if refused:
         return f"not taken: the project is {refused}"
-    if not shutil.which("git"):
+    if not _git_exe():
         return "not taken: git is not installed"
     store = Store(project, data_dir)
-    if not store.acquire():
-        return "another snapshot is being taken"
     try:
-        row = store.snapshot({"note": "session start"})
-        return f"snapshot {row['n']} in {row['seconds']}s, {store.prune()} old dropped"
-    finally:
-        store.release()
+        if not store.acquire():
+            return "another snapshot is being taken"
+        try:
+            row = store.snapshot({"note": "session start"})
+            return f"snapshot {row['n']} in {row['seconds']}s, {store.prune()} old dropped"
+        finally:
+            store.release()
+    except Exception as exc:  # noqa: BLE001 - runs unattended; say what happened and leave
+        store.note({"unprotected": f"the snapshot at session start failed ({type(exc).__name__}: {str(exc)[:200]})"})
+        return f"failed: {type(exc).__name__}: {exc}"
+
+
+def _left_out(row: dict) -> str:
+    parts = []
+    for key, label in (("too_large", "too large"), ("unreadable", "could not be read"), ("folders", "folders")):
+        if row.get(key):
+            more = f" and {row[key + '_more']} more" if row.get(key + "_more") else ""
+            parts.append(f"{label}: {', '.join(row[key])}{more}")
+    return f"\n        not in it — {'; '.join(parts)}" if parts else ""
 
 
 def _cli(argv: list[str]) -> int:
@@ -286,14 +488,18 @@ def _cli(argv: list[str]) -> int:
         print("boxdawn guard undo: CLAUDE_PLUGIN_DATA is not set", file=sys.stderr)
         return 1
     if argv[:1] == ["undo-start"] and len(argv) == 2:
-        print(f"boxdawn guard undo: {start(argv[1], data_dir)}", file=sys.stderr)
-        return 0
+        result = start(argv[1], data_dir)
+        print(f"boxdawn guard undo: {result}", file=sys.stderr)
+        return 1 if result.startswith("failed") else 0
     if argv[:2] == ["undo", "list"]:
         store = Store(os.path.realpath(argv[2] if len(argv) > 2 else os.getcwd()), data_dir)
-        for r in store.snapshots():
+        for r in store.rows():
             when = time.strftime("%m-%d %H:%M:%S", time.localtime(r["at"]))
-            left_out = f"  (left out, too large: {', '.join(r['left_out'])})" if r.get("left_out") else ""
-            print(f"{r['n']:4d}  {when}  before: {r.get('before') or r.get('note', '')}{left_out}")
+            what = r.get("before") or r.get("note", "")
+            if isinstance(r.get("commit"), str) and isinstance(r.get("n"), int):
+                print(f"{r['n']:4d}  {when}  before: {what}{_left_out(r)}")
+            elif "unprotected" in r:
+                print(f"   -  {when}  NO SNAPSHOT ({r['unprotected']}) before: {what}")
         return 0
     if argv[:2] == ["undo", "restore"] and len(argv) in (3, 4) and argv[2].isdigit():
         store = Store(os.path.realpath(argv[3] if len(argv) > 3 else os.getcwd()), data_dir)
@@ -301,14 +507,22 @@ def _cli(argv: list[str]) -> int:
             print("boxdawn guard undo: a snapshot is being taken; try again in a moment", file=sys.stderr)
             return 1
         try:
-            target, present = store.restore(int(argv[2]))
+            target, present, skipped = store.restore(int(argv[2]))
         except LookupError as exc:
             print(f"boxdawn guard undo: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001 - say where things stand instead of a traceback
+            last = store.snapshots()[-1:]
+            where = (f" The state before this attempt is snapshot {last[0]['n']}."
+                     if last and "going back" in last[0].get("note", "") else " Nothing was written.")
+            print(f"boxdawn guard undo: stopped part-way ({type(exc).__name__}: {exc}).{where}", file=sys.stderr)
             return 1
         finally:
             store.release()
         print(f"Files are back as they were in snapshot {target['n']}. "
               f"The state just before this is snapshot {present['n']}. Files made since stay in place.")
+        for rel, reason in skipped.items():
+            print(f"  left as it is: {rel} ({reason})")
         return 0
     print(_cli.__doc__, file=sys.stderr)
     return 1
