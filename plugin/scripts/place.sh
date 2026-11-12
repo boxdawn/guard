@@ -46,6 +46,12 @@ fi
 # With an API key in the plugin's settings, fetch the signed rules in the
 # background (the session does not wait). Without one this does nothing and
 # opens no connection.
+# With `undo` on, the first snapshot of the project, also in the background.
+case "${CLAUDE_PLUGIN_OPTION_UNDO:-}" in true|1|yes)
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    nohup "$dst/bdxguard.exe" undo-start "$CLAUDE_PROJECT_DIR" </dev/null >/dev/null 2>&1 &
+  fi ;;
+esac
 if [ -n "${CLAUDE_PLUGIN_OPTION_API_KEY:-}" ]; then
   nohup "$dst/bdxguard.exe" fetch-rules </dev/null >/dev/null 2>&1 &
 fi

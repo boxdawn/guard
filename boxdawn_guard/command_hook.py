@@ -20,7 +20,7 @@ import re
 import shutil
 import sys
 
-from boxdawn_guard import block_log, messages_ko, secret_files
+from boxdawn_guard import block_log, messages_ko, secret_files, undo
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -275,6 +275,19 @@ def decide(payload: dict) -> dict | None:
     }}
 
 
+def _snapshot_before(payload: dict, out: dict | None) -> None:
+    """`undo` on: a snapshot of the project before a command that was not denied.
+    The decision is already made and stays as it is, whatever happens here."""
+    if not undo.enabled() or payload.get("tool_name") not in ("Bash", "PowerShell"):
+        return
+    if out is not None and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
+        return
+    try:
+        undo.before_command(payload, os.environ.get("CLAUDE_PLUGIN_DATA"))
+    except Exception:  # noqa: BLE001 - a snapshot that fails must not stop or change a command
+        pass
+
+
 def main() -> int:
     payload = None
     try:
@@ -284,6 +297,7 @@ def main() -> int:
         raw = stdin.buffer.read().decode("utf-8") if hasattr(stdin, "buffer") else stdin.read()
         payload = json.loads(raw or "{}")
         out = decide(payload)
+        _snapshot_before(payload, out)
     except Exception as exc:  # noqa: BLE001 - a broken guard must not wave a call through
         tool = payload.get("tool_name") if isinstance(payload, dict) else None
         if isinstance(tool, str) and tool in _FILE_TOOLS:

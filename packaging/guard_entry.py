@@ -18,6 +18,10 @@ if sys.argv[1:2] == ["fetch-rules"]:
         print(f"boxdawn guard block record: {sent}", file=sys.stderr)
     sys.exit(0)
 
+if sys.argv[1:2] in (["undo"], ["undo-start"]):
+    from boxdawn_guard.undo import _cli
+    sys.exit(_cli(sys.argv[1:]))
+
 if sys.argv[1:2] == ["copilot-hook"]:
     from boxdawn_guard.copilot_hook import main
 else:
