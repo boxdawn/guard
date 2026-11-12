@@ -190,6 +190,17 @@ def test_a_broken_line_in_the_record_is_skipped(project):
     assert [r["n"] for r in store.snapshots()] == [1, 2]
 
 
+def test_a_forged_row_is_not_a_snapshot(project):
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    store.note({"n": 7, "commit": "--pathspec-from-file=/etc/passwd"})
+    store.note({"n": 8, "commit": "refs/heads/main"})
+    assert [r["n"] for r in store.snapshots()] == [1]
+    assert store.acquire()
+    with pytest.raises(LookupError):
+        store.restore(7)
+
+
 def test_the_record_is_not_written_through_a_link(project, tmp_path):
     store = _store(project)
     os.makedirs(store.root, exist_ok=True)

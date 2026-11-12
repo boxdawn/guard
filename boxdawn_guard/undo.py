@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -212,7 +213,9 @@ class Store:
             f.write(json.dumps({"at": round(time.time(), 1), **row}) + "\n")
 
     def snapshots(self) -> list[dict]:
-        return [r for r in self.rows() if isinstance(r.get("commit"), str) and isinstance(r.get("n"), int)]
+        # A commit is used as a git argument: nothing but an object id may pass.
+        return [r for r in self.rows() if isinstance(r.get("n"), int) and not isinstance(r["n"], bool)
+                and isinstance(r.get("commit"), str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", r["commit"])]
 
     # -- what stays out ----------------------------------------------------
     def _folders_left_out(self) -> dict[str, str]:
@@ -493,10 +496,11 @@ def _cli(argv: list[str]) -> int:
         return 1 if result.startswith("failed") else 0
     if argv[:2] == ["undo", "list"]:
         store = Store(os.path.realpath(argv[2] if len(argv) > 2 else os.getcwd()), data_dir)
+        numbered = store.snapshots()
         for r in store.rows():
             when = time.strftime("%m-%d %H:%M:%S", time.localtime(r["at"]))
             what = r.get("before") or r.get("note", "")
-            if isinstance(r.get("commit"), str) and isinstance(r.get("n"), int):
+            if r in numbered:
                 print(f"{r['n']:4d}  {when}  before: {what}{_left_out(r)}")
             elif "unprotected" in r:
                 print(f"   -  {when}  NO SNAPSHOT ({r['unprotected']}) before: {what}")
