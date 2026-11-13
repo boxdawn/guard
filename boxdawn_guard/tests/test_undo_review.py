@@ -585,3 +585,76 @@ def test_going_back_does_not_write_through_a_junction_to_an_empty_folder(project
     _, _, skipped = store.restore(1)
     store.release()
     assert skipped.get("conf/app.ini") == "a link stands above it" and os.listdir(outside) == []
+
+
+# -- fourth review -----------------------------------------------------------
+
+def _small(tmp_path, monkeypatch, files):
+    root = str(tmp_path / "small")
+    for rel, data in files.items():
+        _write(root, rel, data)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", root)
+    return root
+
+
+def test_one_changed_file_git_could_not_take_is_not_a_numbered_snapshot(project, tmp_path, monkeypatch):
+    root = _small(tmp_path, monkeypatch, {"only.txt": b"x"})
+    monkeypatch.setattr(undo.Store, "_add", lambda self, paths, exclude_file, left: list(paths))
+    undo.before_command(_payload(root), _data())
+    store = undo.Store(os.path.realpath(root), _data())
+    assert store.snapshots() == [] and "no file could be saved" in store.rows()[-1]["unprotected"]
+
+
+def test_going_back_says_how_many_files_came_back_and_fails_when_none(project, tmp_path, monkeypatch, capsys):
+    root = _small(tmp_path, monkeypatch, {"a.txt": b"a1", "b.txt": b"b1", "c.txt": b"c1"})
+    undo.before_command(_payload(root), _data())
+    _write(root, "a.txt", b"a2-changed")
+    os.remove(os.path.join(root, "b.txt"))
+    os.makedirs(os.path.join(root, "b.txt"))  # a saved file that is a folder now is left as it is
+    capsys.readouterr()
+    assert undo._cli(["undo", "restore", "1", root]) == 0
+    out = capsys.readouterr().out
+    assert "2 of the 3 files in snapshot 1" in out and "b.txt" in out and _read(root, "a.txt") == b"a1"
+    for name in ("a.txt", "c.txt"):
+        os.remove(os.path.join(root, name))
+        os.makedirs(os.path.join(root, name))
+    _write(root, "d.txt", b"made later")  # the present still has a file to save
+    assert undo._cli(["undo", "restore", "1", root]) == 1
+    captured = capsys.readouterr()
+    assert "Nothing was put back" in captured.err and "are as they were" not in captured.out
+
+
+def test_going_back_where_it_is_not_supported_or_to_a_number_not_there(project, monkeypatch, capsys):
+    undo.before_command(_payload(project), _data())
+    shutil.rmtree(project, onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+    assert undo._cli(["undo", "restore", "7", project]) == 1
+    assert "no snapshot 7" in capsys.readouterr().err and not os.path.exists(project)
+    monkeypatch.setattr(undo, "SUPPORTED", ())
+    assert undo._cli(["undo", "restore", "1", project]) == 1
+    assert "not supported" in capsys.readouterr().err and not os.path.exists(project)
+
+
+def test_the_list_on_a_console_that_cannot_show_the_text(project, tmp_path):
+    undo.before_command(_payload(project, "echo ☃ 한글 caf\xe9"), _data())
+    _write(project, "node_modules/x/y.js", b"1")
+    env = dict(os.environ, PYTHONIOENCODING="ascii", PYTHONPATH=os.path.dirname(os.path.dirname(undo.__file__)),
+               PYTHONDONTWRITEBYTECODE="1")
+    out = subprocess.run([sys.executable, "-m", "boxdawn_guard.undo", "undo", "list", project], env=env,
+                         capture_output=True)
+    assert out.returncode == 0 and b"before: echo" in out.stdout and out.stderr == b""
+
+
+def test_a_path_folder_on_another_machine_is_not_where_git_comes_from(project, monkeypatch):
+    real = undo._on_path(None)
+    monkeypatch.setenv("PATH", os.pathsep.join(["\\\\localhost\\c$\\x", "//server/share", os.path.dirname(real)]))
+    assert undo._on_path(project) == real
+
+
+def test_a_path_folder_on_another_machine_is_not_looked_at(project, monkeypatch):
+    real = undo._on_path(None)
+    looked = []
+    isfile = os.path.isfile
+    monkeypatch.setattr(os.path, "isfile", lambda p: looked.append(p) or isfile(p))
+    monkeypatch.setenv("PATH", os.pathsep.join(["\\\\localhost\\c$\\x", "//server/share", os.path.dirname(real)]))
+    assert undo._on_path(project) == real
+    assert not [p for p in looked if p.replace("\\", "/").startswith("//")]

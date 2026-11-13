@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 
 import pytest
 
-from boxdawn_guard import command_hook
+from boxdawn_guard import command_hook, undo
 from boxdawn_guard.tests.test_undo import _payload, project  # noqa: F401 - `project` is a fixture
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -118,3 +119,171 @@ def test_file_tools_do_not_reach_into_the_folder(project):
     assert command_hook.decide({"tool_name": "Write", "tool_input": {"file_path": os.path.join(project, "a.txt")},
                                 "cwd": project}) is None
     assert command_hook.decide({"tool_name": "Write", "tool_input": {}, "cwd": project}) is None
+
+
+# -- fourth review -----------------------------------------------------------
+
+def _home_rest():
+    """The data folder written from the home folder on, when it is under it."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    data = _data()
+    return data[len(home):] if data.lower().startswith(home.lower() + os.sep) else None
+
+
+def test_a_relative_path_into_the_folder_is_denied(project):
+    for command, tool in [
+        ("cat ../data/undo/k.jsonl", "Bash"),
+        ("git --git-dir=../data/undo/k.git config core.hooksPath x", "Bash"),
+        ("git --git-dir=../data/undo/k.git archive refs/snap/1 -o all.tar", "Bash"),
+        ('cmd /c "rd /s /q ..\\data\\undo"', "Bash"),
+        ("touch ../data/undo/k.lock", "Bash"),
+        ("python -c \"open('../data/undo/k.jsonl','a').write('[')\"", "Bash"),
+        ("GIT_DIR=../data/undo/k.git git config filter.x.clean evil", "Bash"),
+        ("7z x a.7z -o../data/undo", "Bash"),
+        ("cd .. && cat data/undo/k.jsonl", "Bash"),
+        ("(cd .. && git -C data/undo/k.git config x y)", "Bash"),
+        ("D=..; cat $D/data/undo/k.jsonl", "Bash"),
+        ("ln -s ../data lnk", "Bash"),
+        ("Get-Content ..\\data\\undo\\k.jsonl", "PowerShell"),
+        ("New-Item -ItemType Junction -Path j -Target ..\\data", "PowerShell"),
+        ("Remove-Item -Path:..\\data\\undo -Recurse", "PowerShell"),
+    ]:
+        decision, reason = _decision(_payload(project, command, tool))
+        assert decision == "deny" and "own folder" in reason, (tool, command, decision, reason)
+
+
+def test_other_spellings_of_the_full_path_are_denied(project):
+    data = _data()
+    slash = data.replace("\\", "/")
+    head, name = slash.rsplit("/", 1)
+    first, rest = slash.split("/", 1)
+    forms = [
+        (f"cat {first}/./{rest}/undo/k.jsonl", "Bash"),
+        (f"cat {first}/x/../{rest}/undo/k.jsonl", "Bash"),
+        (f"cat {head}/{name[0]}\\{name[1:]}/undo/k.jsonl", "Bash"),
+        (f"cat {head}/{{{name}}}/undo/k.jsonl", "Bash"),
+        (f"cat {head}/$'{name}'/undo/k.jsonl", "Bash"),
+    ]
+    if os.name == "nt":
+        drive = slash[0].lower()
+        forms += [(f"cat /proc/cygdrive/{drive}{slash[2:]}/undo/k.jsonl", "Bash"),
+                  (f"cat /cygdrive/{drive}{slash[2:]}/undo/k.jsonl", "Bash"),
+                  (f"Get-Content \\\\localhost\\{drive}$\\{data[3:]}\\undo\\k.jsonl", "PowerShell"),
+                  (f"Get-Content \\\\127.0.0.1\\{drive}$\\{data[3:]}\\undo\\k.jsonl", "PowerShell"),
+                  (f"Get-Content {data}.\\undo\\k.jsonl", "PowerShell")]
+    rest_home = _home_rest()
+    if rest_home:
+        user = os.path.basename(os.path.realpath(os.path.expanduser("~")))
+        r = rest_home.replace("\\", "/")
+        forms += [(f"cat ~{user}{r}/undo/k.jsonl", "Bash"),
+                  (f"cat ${{HOME:-x}}{r}/undo/k.jsonl", "Bash"),
+                  (f"cat $HOMEDRIVE$HOMEPATH{r}/undo/k.jsonl", "Bash"),
+                  (f'cmd /c "type %HOMEDRIVE%%HOMEPATH%{rest_home}\\undo\\k.jsonl"', "Bash"),
+                  (f"Get-Content ${{env:USERPROFILE}}{rest_home}\\undo\\k.jsonl", "PowerShell"),
+                  (f"Get-Content $env:HOMEDRIVE$env:HOMEPATH{rest_home}\\undo\\k.jsonl", "PowerShell"),
+                  (f"cat %userprofile%{r}/undo/k.jsonl", "Bash"),
+                  (f"cat ${{HOME}}{r}/undo", "Bash")]
+    forms += [("Get-Content ${env:CLAUDE_PLUGIN_DATA}\\undo\\k.jsonl", "PowerShell"),
+              ("cat ${CLAUDE_PLUGIN_DATA:-x}/undo/k.jsonl", "Bash"),
+              ('cmd /c "type %CLAUDE_PLUGIN_DATA:~0%\\undo\\k.jsonl"', "Bash")]
+    for command, tool in forms:
+        decision, reason = _decision(_payload(project, command, tool))
+        assert decision == "deny" and "own folder" in reason, (tool, command, decision, reason)
+
+
+def test_the_guards_own_command_called_by_a_relative_path(project):
+    assert _decision(_payload(project, "../data/current/bdxguard.exe undo list"))[0] is None
+    decision, reason = _decision(_payload(project, "../data/current/bdxguard.exe undo restore 1"))
+    assert decision == "ask" and "snapshot" in reason
+    assert _decision(_payload(project, "& ..\\data\\current\\bdxguard.exe undo restore 1", "PowerShell"))[0] == "ask"
+    for command in ("../data/current/bdxguard.exe undo-start /c/Users", "../data/current/bdxguard.exe fetch-rules",
+                    "../data/current/bdxguard.exe undo restore 1 --force"):
+        decision, reason = _decision(_payload(project, command))
+        assert decision == "deny" and "own folder" in reason, command
+
+
+def test_file_tools_with_other_spellings_are_denied(project):
+    data = _data()
+    inside = os.path.join(data, "undo", "k.jsonl")
+    paths = [os.path.join(project, "..", "data", "undo", "k.jsonl"), "../data/undo/k.jsonl", inside.upper(),
+             inside + "::$DATA", os.path.join(data + ".", "undo", "k.jsonl")]
+    if os.name == "nt":
+        drive = data[0].lower()
+        paths += ["\\\\?\\" + inside, "\\\\.\\" + inside, "//?/" + inside.replace("\\", "/"),
+                  f"\\\\localhost\\{drive}$\\{inside[3:]}", f"\\\\127.0.0.1\\{drive}$\\{inside[3:]}",
+                  f"\\\\?\\UNC\\localhost\\{drive}$\\{inside[3:]}", "\\\\?\\GLOBALROOT\\DosDevices\\" + inside,
+                  f"/{drive}{inside[2:]}".replace("\\", "/")]
+        os.makedirs(os.path.join(data, "undo"), exist_ok=True)
+        link = os.path.join(project, "lnk")
+        subprocess.run(["cmd", "/c", "mklink", "/J", link, data], check=True, capture_output=True)
+        paths.append(os.path.join(link, "undo", "k.jsonl"))
+    for path in paths:
+        for tool, key in (("Read", "file_path"), ("Write", "file_path"), ("Grep", "path")):
+            decision, reason = _decision({"tool_name": tool, "tool_input": {key: path, "pattern": "x"}, "cwd": project})
+            assert decision == "deny" and "own folder" in reason, (tool, path, decision)
+
+
+def test_a_folder_search_above_leaves_the_folder_out(project):
+    data = _data()
+    above = os.path.dirname(data)
+    out = command_hook.decide({"tool_name": "Grep", "tool_input": {"pattern": "before", "path": above,
+                                                                    "glob": "**/undo/*.jsonl"}, "cwd": project})
+    glob = out["hookSpecificOutput"]["updatedInput"]["glob"]
+    assert glob.startswith("**/undo/*.jsonl ") and f"!**/{os.path.basename(data)}/**" in glob
+    decision, reason = _decision({"tool_name": "Grep", "tool_input": {
+        "pattern": "before", "glob": data.replace("\\", "/") + "/undo/*.jsonl"}, "cwd": project})
+    assert decision == "deny" and "own folder" in reason
+    beside = command_hook.decide({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": project}, "cwd": project})
+    assert f"!**/{os.path.basename(data)}/**" not in beside["hookSpecificOutput"]["updatedInput"]["glob"]
+
+
+def test_neighbours_and_mentions_of_other_paths_are_left_alone(project):
+    slash = _data().replace("\\", "/")
+    for command in (f"ls {slash}.bak", f"ls {slash}~", f"ls {slash}+x", f"ls {slash}@2",
+                    f"ls {slash}-old", f"ls {slash}_2/undo", f"curl https://example.com{slash[2:]}/undo",
+                    f"ls ./vendor{slash[2:]}", "ls ../database", "cat data/undo/x", "git status", "echo undo"):
+        assert "own folder" not in _decision(_payload(project, command))[1], command
+
+
+def test_the_guards_own_list_takes_no_snapshot(project):
+    exe = _data().replace("\\", "/") + "/current/bdxguard.exe"
+    store = undo.Store(os.path.realpath(project), os.environ["CLAUDE_PLUGIN_DATA"])
+    for command in (f'"{exe}" undo list "{project}"', f'"{exe}" undo restore 1 "{project}"'):
+        payload = _payload(project, command)
+        command_hook._snapshot_before(payload, command_hook.decide(payload))
+    assert store.rows() == []
+    command_hook._snapshot_before(_payload(project, "ls"), None)
+    assert [r["n"] for r in store.snapshots()] == [1]
+
+
+def test_a_setting_that_points_at_home_or_the_project_turns_the_rule_off(project, monkeypatch):
+    for where in (os.path.expanduser("~"), project, os.path.splitdrive(project)[0] + os.sep):
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", where)
+        assert command_hook.decide({"tool_name": "Write", "tool_input": {"file_path": os.path.join(project, "a.txt")},
+                                    "cwd": project}) is None, where
+        assert "own folder" not in _decision(_payload(project, "git status"))[1], where
+
+
+def test_lines_the_mutation_check_found_untested(project, monkeypatch):
+    data = _data()
+    from boxdawn_guard import own_folder
+    folder = os.path.normcase(data)
+    # a command run from inside the folder
+    inside = os.path.join(data, "undo")
+    os.makedirs(inside, exist_ok=True)
+    decision, reason = _decision(dict(_payload(project, "git status"), cwd=inside))
+    assert decision == "deny" and "own folder" in reason
+    # PowerShell's -Name:value, on a reading command the judge does not look at
+    decision, reason = _decision(_payload(project, "Get-Content -Path:..\\data\\undo\\k.jsonl", "PowerShell"))
+    assert decision == "deny" and "own folder" in reason
+    # a stream named on the folder itself
+    if os.name == "nt":
+        assert own_folder.command_reaches(f"Get-Content {data}::$INDEX_ALLOCATION\\undo\\k.jsonl", folder, project)
+    # a carriage return inside the guard's own line
+    exe = data.replace("\\", "/") + "/current/bdxguard.exe"
+    assert own_folder.own_command(f'"{exe}" undo list\rx', folder, project) is None
+    assert own_folder.own_command(f'"{exe}" undo list x', folder, project) == "list"
+    # a setting that is the home folder or a whole drive, without a project to hold
+    assert own_folder.folder_to_keep(os.path.expanduser("~"), None) is None
+    assert own_folder.folder_to_keep(os.path.splitdrive(data)[0] + os.sep if os.name == "nt" else "/", None) is None
+    assert own_folder.folder_to_keep(data, None) == folder

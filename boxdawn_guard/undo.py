@@ -35,10 +35,12 @@ Known limits:
 - A project with tens of thousands of folders: finding the folders to leave
   out takes longer than a command may wait, so commands there are covered by
   the snapshots taken in the background only, and the list says so.
-- The store is kept from the agent only as far as the hook sees its folder
-  named (`command_hook._own_folder`): a command that puts the path together
-  when it runs, works on a copy of a folder above it, or does it from inside a
-  script is not seen. Such a command can stop snapshots, make them wrong or
+- A large project at the start of a session: until the first snapshot is
+  done, commands go on without one, and the list says so.
+- The store is kept from the agent only as far as the hook reads a path to it
+  in the call (`own_folder`): a command that puts the path together only when
+  it runs, follows a link that already leads there, or reaches it from inside
+  a script or program is not seen. Such a command can stop snapshots, make them wrong or
   make git run a program of its choice (a filter in the store's config),
   without a trace in the record, and can read the copies of ignored files such
   as `.env` with git.
@@ -66,6 +68,7 @@ LOCK_STALE = 15 * 60     # a lock older than this is taken to be left by a proce
 SUPPORTED = ("win32",)   # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
 _ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"  # files go in and come out byte for byte
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's id for a tree with nothing in it
 _REPARSE = 0x400         # FILE_ATTRIBUTE_REPARSE_POINT: a Windows symlink or junction
 
 
@@ -84,7 +87,8 @@ def _on_path(project: str | None) -> str | None:
     names = ("git.exe",) if os.name == "nt" else ("git",)
     for folder in os.environ.get("PATH", "").split(os.pathsep):
         folder = folder.strip('"')
-        if not os.path.isabs(folder) or (project and _inside(os.path.realpath(folder), project)):
+        if not os.path.isabs(folder) or folder.replace("\\", "/").startswith("//") \
+                or (project and _inside(os.path.realpath(folder), project)):
             continue
         for name in names:
             full = os.path.join(folder, name)
@@ -442,6 +446,8 @@ class Store:
         # The index, not the list of changes, says whether this is the same state as the last
         # snapshot: a restore changes the index without taking one.
         tree = self.git("write-tree", timeout=left()).decode().strip()
+        if tree == _EMPTY_TREE and gone:
+            raise RuntimeError("no file could be saved")  # not a snapshot: do not number it
         previous = self.snapshots()
         if previous and previous[-1].get("tree") == tree:
             commit = previous[-1]["commit"]
@@ -658,8 +664,14 @@ def _cli(argv: list[str]) -> int:
         return 0
     if argv[:2] == ["undo", "restore"] and len(argv) in (3, 4) and argv[2].isdigit():
         store = Store(os.path.realpath(argv[3] if len(argv) > 3 else os.getcwd()), data_dir)
+        if sys.platform not in SUPPORTED:
+            print("boxdawn guard undo: not supported on this system yet", file=sys.stderr)
+            return 1
         if not store.snapshots():
             print(f"boxdawn guard undo: no snapshots of {_shown(store.project)}", file=sys.stderr)
+            return 1
+        if not any(r["n"] == int(argv[2]) for r in store.snapshots()):
+            print(f"boxdawn guard undo: no snapshot {int(argv[2])}", file=sys.stderr)
             return 1
         if not os.path.lexists(store.project):
             os.makedirs(store.project)  # the whole folder was removed: its files go back into a new one

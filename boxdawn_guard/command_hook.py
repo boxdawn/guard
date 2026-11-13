@@ -20,7 +20,7 @@ import re
 import shutil
 import sys
 
-from boxdawn_guard import block_log, messages_ko, secret_files, undo
+from boxdawn_guard import block_log, messages_ko, own_folder, secret_files, undo
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -109,7 +109,7 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     if _one_file(roots):
         return None
     glob = tool_input.get("glob")
-    excludes = " ".join(secret_files.search_excludes(*roots))
+    excludes = " ".join(secret_files.search_excludes(*roots) + _own_excludes(roots))
     if isinstance(glob, str) and glob.endswith(excludes):  # sent back as we changed it; the last glob wins
         return None
     return {"hookSpecificOutput": {
@@ -234,72 +234,19 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...], cwd: str | No
 
 
 def _own_folder() -> str | None:
-    """The plugin's data folder. While `undo` keeps copies of the project there,
-    ignored files such as `.env` too, a call that names it is not let through."""
-    data_dir = os.environ.get("CLAUDE_PLUGIN_DATA")
-    return os.path.realpath(data_dir) if data_dir and undo.enabled() else None
-
-
-def _flat(text: str) -> str:
-    """Quotes off, one kind of slash, one case: the same folder written another way reads the same."""
-    return re.sub(r"/{2,}", "/", re.sub(r"[\"'`^]", "", text).replace("\\", "/").lower())
-
-
-def _spellings(folder: str) -> set[str]:
-    found = {"$claude_plugin_data", "${claude_plugin_data}", "%claude_plugin_data%", "$env:claude_plugin_data"}
-    home = _flat(os.path.expanduser("~")).rstrip("/")
-    for full in {folder, os.path.abspath(os.environ.get("CLAUDE_PLUGIN_DATA") or folder)}:
-        flat = _flat(full).rstrip("/")
-        found.add(flat)
-        drive = re.match(r"([a-z]):(/.*)", flat)
-        if drive:  # as Git Bash, WSL and Cygwin write a drive
-            found.update(f"{start}{drive.group(1)}{drive.group(2)}" for start in ("/", "/mnt/", "/cygdrive/"))
-        if flat.startswith(home + "/"):
-            found.update(start + flat[len(home):] for start in (
-                "~", "$home", "${home}", "$env:home", "%userprofile%", "$env:userprofile", "$userprofile",
-                "${userprofile}"))
-    return found
-
-
-def _after(flat: str, folder: str) -> list[str]:
-    """What follows each place `flat` names the folder; a longer name (`<folder>-old`) is another folder."""
-    rests = []
-    for spelling in _spellings(folder):
-        at = flat.find(spelling)
-        while at != -1:
-            rest = flat[at + len(spelling):]
-            if not (rest[:1].isalnum() or rest[:1] in ("_", "-")):
-                rests.append(rest)
-            at = flat.find(spelling, at + 1)
-    return rests
-
-
-def _own_command(command: str, folder: str) -> str | None:
-    """`list` or `restore` when the whole line is the guard's own undo command and nothing else."""
-    # One line and nothing a shell reads as the end of one: PowerShell ends a statement at a
-    # carriage return too, and what followed would ride on this line's answer.
-    if "`" in command or not all(ch.isprintable() for ch in command):
+    """The plugin's data folder while `undo` keeps copies of the project there (see `own_folder`)."""
+    if not undo.enabled():
         return None
-    flat = _flat(command).strip()
-    flat = flat[1:].lstrip() if flat.startswith("&") else flat  # PowerShell's call operator
-    for spelling in _spellings(folder):
-        start = spelling + "/current/bdxguard.exe undo "
-        if flat.startswith(start):
-            m = re.fullmatch(r"(list|restore) ?\d*( [^&|;<>$()%{}]*)?", flat[len(start):])
-            if m and not _after(m.group(2) or "", folder):
-                return m.group(1)
-    return None
+    return own_folder.folder_to_keep(os.environ.get("CLAUDE_PLUGIN_DATA"), os.environ.get("CLAUDE_PROJECT_DIR"))
 
 
-def _in_own_folder(path: str, cwd: str | None, folder: str) -> bool:
-    path = os.path.expanduser(path.strip())
-    if os.name == "nt":
-        path = re.sub(r"^/([a-zA-Z])(?=/|$)", r"\1:", path)
-    full = os.path.abspath(os.path.join(cwd or "", path))
-    if not full.replace("\\", "/").startswith("//"):  # looking a network path up contacts the host
-        full = os.path.realpath(full)
-    full, folder = os.path.normcase(full), os.path.normcase(folder)
-    return full == folder or full.startswith(folder.rstrip("\\/") + os.sep)
+def _own_excludes(roots: tuple[str, ...]) -> tuple[str, ...]:
+    """A folder search that starts above the data folder leaves it out."""
+    folder = _own_folder()
+    if folder and any(own_folder.within(folder, os.path.normcase(os.path.normpath(r))) for r in roots):
+        name = os.path.basename(folder)
+        return (f"!**/{name}/**", f"!**/{name}")
+    return ()
 
 
 def _answer(decision: str, reason: str) -> dict:
@@ -315,10 +262,15 @@ def decide(payload: dict) -> dict | None:
     tool_input = payload.get("tool_input") or {}
     own = _own_folder()
     if own and (tool in _WRITE_TOOLS or tool in _FILE_TOOLS):
-        key = _WRITE_TOOLS.get(tool) or _FILE_TOOLS[tool][0]
-        if isinstance(tool_input.get(key), str) and tool_input[key].strip() \
-                and _in_own_folder(tool_input[key], payload.get("cwd"), own):
-            return _answer("deny", f"`{tool}` reaches into the guard's own folder")
+        keys = (_WRITE_TOOLS[tool],) if tool in _WRITE_TOOLS else _FILE_TOOLS[tool]
+        for key in keys:
+            value = tool_input.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            pieces = [g for g in _globs(value.strip()) for g in g.split()] if key == "glob" else [value]
+            if any(own_folder.path_reaches(p.lstrip("!"), payload.get("cwd"), own) for p in pieces
+                   if key != "glob" or own_folder.looks_absolute(p.lstrip("!"))):
+                return _answer("deny", f"`{tool}` reaches into the guard's own folder")
     if tool in _WRITE_TOOLS:
         return None
     if tool in _FILE_TOOLS:
@@ -346,10 +298,10 @@ def decide(payload: dict) -> dict | None:
     if tool in _FILE_TOOLS:
         verdict = evaluate_file_tool(tool, paths, **where)
     else:
-        typed = _own_command(tool_input["command"], own) if own else None
+        typed = own_folder.own_command(tool_input["command"], own, where["cwd"]) if own else None
         if typed == "restore":
             return _answer("deny" if where["unattended"] else "ask", "this puts the project's files back from a snapshot")
-        if own and typed is None and _after(_flat(tool_input["command"]), own):
+        if own and typed is None and own_folder.command_reaches(tool_input["command"], own, where["cwd"]):
             return _answer("deny", "the command names the guard's own folder")
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
             tool_input["command"], known_env=known_env, own=(own,) if own and typed is None else (), **where)
@@ -374,6 +326,9 @@ def _snapshot_before(payload: dict, out: dict | None) -> None:
         return
     if out is not None and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
         return
+    own, command = _own_folder(), (payload.get("tool_input") or {}).get("command")
+    if own and isinstance(command, str) and own_folder.own_command(command, own, payload.get("cwd") or os.getcwd()):
+        return  # the guard's own `undo list` or `undo restore`: restore takes its own snapshot first
     try:
         undo.before_command(payload, os.environ.get("CLAUDE_PLUGIN_DATA"))
     except Exception:  # noqa: BLE001 - a snapshot that fails must not stop or change a command
