@@ -422,7 +422,7 @@ def test_settings_planted_in_the_store_do_not_change_what_is_saved(project):
 
 
 def test_no_git_and_a_refused_project_each_leave_one_row(project, monkeypatch):
-    monkeypatch.setattr(undo, "_git_exe", lambda: None)
+    monkeypatch.setattr(undo, "_git_exe", lambda project=None: None)
     for _ in range(3):
         undo.before_command(_payload(project, "rm -rf src"), _data())
     rows = _store(project).rows()
@@ -433,7 +433,7 @@ def test_a_refused_project_leaves_a_row(project, monkeypatch):
     inside = os.path.join(project, "inside-data")
     monkeypatch.setenv("CLAUDE_PLUGIN_DATA", inside)
     undo.before_command(_payload(project), inside)
-    assert "holds the snapshot store" in _store(project).rows()[-1]["unprotected"]
+    assert "around the snapshot store" in _store(project).rows()[-1]["unprotected"]
 
 
 def test_the_list_says_when_there_is_nothing(project, capsys):
@@ -475,3 +475,112 @@ def test_the_clean_up_does_not_write_through_a_link_and_keeps_the_record_private
     assert victim.read_text() == "precious" and [r["n"] for r in store.snapshots()] == [2]
     if os.name != "nt":
         assert os.stat(store.log).st_mode & 0o777 == 0o600
+
+
+# -- third review ----------------------------------------------------------
+
+@pytest.mark.skipif(os.name != "nt", reason="the current folder is searched for programs on Windows only")
+@pytest.mark.parametrize("name", ["git.bat", "git.cmd"])
+def test_a_git_file_in_the_project_is_not_run(project, tmp_path, monkeypatch, name):
+    marker = tmp_path / "ran.txt"
+    _write(project, name, f'@echo off\r\necho ran >> "{marker}"\r\nexit /b 1\r\n'.encode())
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    monkeypatch.chdir(project)
+    undo.before_command(_payload(project), _data())
+    assert not marker.exists()
+    assert [r["n"] for r in _store(project).snapshots()] == [1]
+
+
+def test_git_is_not_taken_from_the_project_or_a_folder_not_written_in_full(project, monkeypatch):
+    real = undo._on_path(None)
+    name = os.path.basename(real)
+    shutil.copy(sys.executable, os.path.join(project, name))
+    os.makedirs(os.path.join(project, "bin"))
+    shutil.copy(sys.executable, os.path.join(project, "bin", name))
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", os.pathsep.join([".", "", "bin", os.path.join(project, "bin"), os.path.dirname(real)]))
+    assert undo._on_path(project) == real
+
+
+def test_a_git_too_old_for_the_snapshot_leaves_no_numbered_row(project, monkeypatch):
+    real = undo.Store.git
+
+    def old_git(self, *args, **kw):
+        if "add" in args:
+            return 129, b"", b"error: unknown option `pathspec-from-file=-'\nusage: git add"
+        return real(self, *args, **kw)
+    monkeypatch.setattr(undo.Store, "git", old_git)
+    undo.before_command(_payload(project, "rm -rf src"), _data())
+    store = _store(project)
+    assert store.snapshots() == [] and "too old" in store.rows()[-1]["unprotected"]
+
+
+def test_a_snapshot_git_took_nothing_into_is_not_numbered(project, monkeypatch):
+    monkeypatch.setattr(undo.Store, "_add", lambda self, paths, exclude_file, left: list(paths))
+    undo.before_command(_payload(project), _data())
+    store = _store(project)
+    assert store.snapshots() == [] and "took none of the files" in store.rows()[-1]["unprotected"]
+
+
+def test_a_system_that_is_not_supported_leaves_one_row(project, monkeypatch):
+    monkeypatch.setattr(undo, "SUPPORTED", ())
+    for _ in range(3):
+        undo.before_command(_payload(project), _data())
+    rows = _store(project).rows()
+    assert len(rows) == 1 and "not supported" in rows[0]["unprotected"]
+    assert "not supported" in undo.start(project, _data())
+
+
+def test_rows_no_clock_or_text_can_hold_do_not_end_the_list(project, capsys):
+    undo.before_command(_payload(project, "one"), _data())
+    store = _store(project)
+    with open(store.log, "ab") as f:
+        f.write(b'{"at": ' + b"9" * 400 + b', "unprotected": "x"}\n')
+        f.write(b'{"at": 1, "unprotected": "\xff\xfe"}\n')
+        f.write(b'{"at": 1700000000, "n": 999999999, "commit": "' + b"a" * 40 + b'", "before": "planted"}\n')
+    assert undo._cli(["undo", "list", project]) == 0
+    assert "one" in capsys.readouterr().out
+    _write(project, "later.txt", b"x")
+    undo.before_command(_payload(project, "two"), _data())  # no number past the last one that can be listed
+    assert "damaged" in store.rows()[-1]["unprotected"]
+
+
+def test_going_back_after_the_whole_folder_was_removed(project, capsys):
+    undo.before_command(_payload(project, "rm -rf ."), _data())
+    os.chdir(os.path.dirname(project))
+    shutil.rmtree(project, onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+    assert undo._cli(["undo", "restore", "1", project]) == 0
+    assert "of the" in capsys.readouterr().out and _read(project, "src/app.py") == b"print('v2, not committed')\n"
+
+
+def test_a_file_changed_after_the_present_was_saved_is_left_alone(project, monkeypatch):
+    _write(project, "a.txt", b"a1")
+    undo.before_command(_payload(project), _data())
+    _write(project, "a.txt", b"a2-longer")
+    real = undo.Store.snapshot
+
+    def then_another_program_writes(self, why, budget=None):
+        row = real(self, why, budget)
+        _write(project, "a.txt", b"a3-written-in-between")
+        return row
+    monkeypatch.setattr(undo.Store, "snapshot", then_another_program_writes)
+    store = _store(project)
+    assert store.acquire()
+    _, _, skipped = store.restore(1)
+    store.release()
+    assert "a.txt" in skipped and _read(project, "a.txt") == b"a3-written-in-between"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="junctions are a Windows thing")
+def test_going_back_does_not_write_through_a_junction_to_an_empty_folder(project, tmp_path):
+    _write(project, "conf/app.ini", b"mine")
+    undo.before_command(_payload(project), _data())
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.rmtree(os.path.join(project, "conf"))
+    _junction(os.path.join(project, "conf"), outside)
+    store = _store(project)
+    assert store.acquire()
+    _, _, skipped = store.restore(1)
+    store.release()
+    assert skipped.get("conf/app.ini") == "a link stands above it" and os.listdir(outside) == []

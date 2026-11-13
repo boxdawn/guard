@@ -60,6 +60,7 @@ def project(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "true")
     monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", root)
+    monkeypatch.setattr(undo, "SUPPORTED", (sys.platform,))  # the mechanism is tested wherever the tests run
     return root
 
 
