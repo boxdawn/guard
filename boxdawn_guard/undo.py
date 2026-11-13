@@ -37,13 +37,13 @@ Known limits:
   the snapshots taken in the background only, and the list says so.
 - A large project at the start of a session: until the first snapshot is
   done, commands go on without one, and the list says so.
-- The store is kept from the agent only as far as the hook reads a path to it
-  in the call (`own_folder`): a command that puts the path together only when
-  it runs, follows a link that already leads there, or reaches it from inside
-  a script or program is not seen. Such a command can stop snapshots, make them wrong or
-  make git run a program of its choice (a filter in the store's config),
-  without a trace in the record, and can read the copies of ignored files such
-  as `.env` with git.
+- This is for an agent's mistakes, not for an agent that works against it.
+  The store is not kept from the agent: a command that writes into it can stop
+  snapshots, make them wrong or make git run a program of its choice (a filter
+  in the store's config), without a trace in the record, and a command can
+  read the copies of ignored files such as `.env` in it with git. The only
+  thing the hook does about it is ask before a line that plainly runs the
+  guard's own `undo restore`.
 """
 from __future__ import annotations
 
@@ -662,7 +662,7 @@ def _cli(argv: list[str]) -> int:
             elif "unprotected" in r:
                 print(f"   -  {when}  NO SNAPSHOT ({_shown(r['unprotected'])}) before: {what}")
         return 0
-    if argv[:2] == ["undo", "restore"] and len(argv) in (3, 4) and argv[2].isdigit():
+    if argv[:2] == ["undo", "restore"] and len(argv) in (3, 4) and re.fullmatch(r"[0-9]+", argv[2]):
         store = Store(os.path.realpath(argv[3] if len(argv) > 3 else os.getcwd()), data_dir)
         if sys.platform not in SUPPORTED:
             print("boxdawn guard undo: not supported on this system yet", file=sys.stderr)

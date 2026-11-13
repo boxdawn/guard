@@ -20,7 +20,7 @@ import re
 import shutil
 import sys
 
-from boxdawn_guard import block_log, messages_ko, own_folder, secret_files, undo
+from boxdawn_guard import block_log, messages_ko, secret_files, undo
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -29,8 +29,9 @@ from boxdawn_guard.powershell_guard import evaluate_powershell
 # Reading with these is no less a read, but they get no `onFailure: block`: a
 # broken guard must not stop a session from opening any file.
 _FILE_TOOLS = {"Read": ("file_path",), "Grep": ("path", "glob")}
-# The tools that write a file. The guard looks at them for one thing only: its own folder.
-_WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
+# The guard's own `undo` command line, as it is usually typed. Not a wall: a line that hides it is not seen.
+_UNDO = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\b")
+_UNDO_RESTORE = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\s+restore\b")
 
 
 def _globs(pattern: str) -> list[str]:
@@ -109,7 +110,7 @@ def _search_without_secrets(tool: str, tool_input: dict, cwd: str | None) -> dic
     if _one_file(roots):
         return None
     glob = tool_input.get("glob")
-    excludes = " ".join(secret_files.search_excludes(*roots) + _own_excludes(roots))
+    excludes = " ".join(secret_files.search_excludes(*roots))
     if isinstance(glob, str) and glob.endswith(excludes):  # sent back as we changed it; the last glob wins
         return None
     return {"hookSpecificOutput": {
@@ -233,46 +234,9 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...], cwd: str | No
     }}
 
 
-def _own_folder() -> str | None:
-    """The plugin's data folder while `undo` keeps copies of the project there (see `own_folder`)."""
-    if not undo.enabled():
-        return None
-    return own_folder.folder_to_keep(os.environ.get("CLAUDE_PLUGIN_DATA"), os.environ.get("CLAUDE_PROJECT_DIR"))
-
-
-def _own_excludes(roots: tuple[str, ...]) -> tuple[str, ...]:
-    """A folder search that starts above the data folder leaves it out."""
-    folder = _own_folder()
-    if folder and any(own_folder.within(folder, os.path.normcase(os.path.normpath(r))) for r in roots):
-        name = os.path.basename(folder)
-        return (f"!**/{name}/**", f"!**/{name}")
-    return ()
-
-
-def _answer(decision: str, reason: str) -> dict:
-    return {"hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "permissionDecision": decision,
-        "permissionDecisionReason": "Boxdawn guard: " + (messages_ko.translate(reason) if _korean() else reason),
-    }}
-
-
 def decide(payload: dict) -> dict | None:
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
-    own = _own_folder()
-    if own and (tool in _WRITE_TOOLS or tool in _FILE_TOOLS):
-        keys = (_WRITE_TOOLS[tool],) if tool in _WRITE_TOOLS else _FILE_TOOLS[tool]
-        for key in keys:
-            value = tool_input.get(key)
-            if not isinstance(value, str) or not value.strip():
-                continue
-            pieces = [g for g in _globs(value.strip()) for g in g.split()] if key == "glob" else [value]
-            if any(own_folder.path_reaches(p.lstrip("!"), payload.get("cwd"), own) for p in pieces
-                   if key != "glob" or own_folder.looks_absolute(p.lstrip("!"))):
-                return _answer("deny", f"`{tool}` reaches into the guard's own folder")
-    if tool in _WRITE_TOOLS:
-        return None
     if tool in _FILE_TOOLS:
         paths = [tool_input.get(k) for k in _FILE_TOOLS[tool]]
         paths = [g for p in paths if isinstance(p, str) for g in _globs(p.strip())]
@@ -298,13 +262,20 @@ def decide(payload: dict) -> dict | None:
     if tool in _FILE_TOOLS:
         verdict = evaluate_file_tool(tool, paths, **where)
     else:
-        typed = own_folder.own_command(tool_input["command"], own, where["cwd"]) if own else None
-        if typed == "restore":
-            return _answer("deny" if where["unattended"] else "ask", "this puts the project's files back from a snapshot")
-        if own and typed is None and own_folder.command_reaches(tool_input["command"], own, where["cwd"]):
-            return _answer("deny", "the command names the guard's own folder")
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
-            tool_input["command"], known_env=known_env, own=(own,) if own and typed is None else (), **where)
+            tool_input["command"], known_env=known_env, **where)
+        if undo.enabled() and _UNDO_RESTORE.search(tool_input["command"]) and \
+                (verdict is None or verdict.decision != "deny"):
+            # Going back writes over the project's files: the person says so, the agent does not.
+            reasons = ["this puts the project's files back from a snapshot"]
+            if where["unattended"]:
+                reasons.append("nobody is present to approve it")
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny" if where["unattended"] else "ask",
+                "permissionDecisionReason": "Boxdawn guard: " + "; ".join(
+                    map(messages_ko.translate, reasons) if _korean() else reasons),
+            }}
     if verdict is None or verdict.decision is None:
         if tool == "Bash":
             return _grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd"))
@@ -326,8 +297,8 @@ def _snapshot_before(payload: dict, out: dict | None) -> None:
         return
     if out is not None and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
         return
-    own, command = _own_folder(), (payload.get("tool_input") or {}).get("command")
-    if own and isinstance(command, str) and own_folder.own_command(command, own, payload.get("cwd") or os.getcwd()):
+    command = (payload.get("tool_input") or {}).get("command")
+    if isinstance(command, str) and _UNDO.search(command):
         return  # the guard's own `undo list` or `undo restore`: restore takes its own snapshot first
     try:
         undo.before_command(payload, os.environ.get("CLAUDE_PLUGIN_DATA"))
@@ -347,7 +318,7 @@ def main() -> int:
         _snapshot_before(payload, out)
     except Exception as exc:  # noqa: BLE001 - a broken guard must not wave a call through
         tool = payload.get("tool_name") if isinstance(payload, dict) else None
-        if isinstance(tool, str) and (tool in _FILE_TOOLS or tool in _WRITE_TOOLS):
+        if isinstance(tool, str) and tool in _FILE_TOOLS:
             return 0
         out = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
