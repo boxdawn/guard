@@ -29,6 +29,8 @@ from boxdawn_guard.powershell_guard import evaluate_powershell
 # Reading with these is no less a read, but they get no `onFailure: block`: a
 # broken guard must not stop a session from opening any file.
 _FILE_TOOLS = {"Read": ("file_path",), "Grep": ("path", "glob")}
+# The tools that write a file. The guard looks at them for one thing only: its own folder.
+_WRITE_TOOLS = {"Write": "file_path", "Edit": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path"}
 
 
 def _globs(pattern: str) -> list[str]:
@@ -231,9 +233,92 @@ def _grep_without_secrets(tool_input: dict, ends: tuple[int, ...], cwd: str | No
     }}
 
 
+def _own_folder() -> str | None:
+    """The plugin's data folder. While `undo` keeps copies of the project there,
+    ignored files such as `.env` too, a call that names it is not let through."""
+    data_dir = os.environ.get("CLAUDE_PLUGIN_DATA")
+    return os.path.realpath(data_dir) if data_dir and undo.enabled() else None
+
+
+def _flat(text: str) -> str:
+    """Quotes off, one kind of slash, one case: the same folder written another way reads the same."""
+    return re.sub(r"/{2,}", "/", re.sub(r"[\"'`^]", "", text).replace("\\", "/").lower())
+
+
+def _spellings(folder: str) -> set[str]:
+    found = {"$claude_plugin_data", "${claude_plugin_data}", "%claude_plugin_data%", "$env:claude_plugin_data"}
+    home = _flat(os.path.expanduser("~")).rstrip("/")
+    for full in {folder, os.path.abspath(os.environ.get("CLAUDE_PLUGIN_DATA") or folder)}:
+        flat = _flat(full).rstrip("/")
+        found.add(flat)
+        drive = re.match(r"([a-z]):(/.*)", flat)
+        if drive:  # as Git Bash, WSL and Cygwin write a drive
+            found.update(f"{start}{drive.group(1)}{drive.group(2)}" for start in ("/", "/mnt/", "/cygdrive/"))
+        if flat.startswith(home + "/"):
+            found.update(start + flat[len(home):] for start in (
+                "~", "$home", "${home}", "$env:home", "%userprofile%", "$env:userprofile", "$userprofile",
+                "${userprofile}"))
+    return found
+
+
+def _after(flat: str, folder: str) -> list[str]:
+    """What follows each place `flat` names the folder; a longer name (`<folder>-old`) is another folder."""
+    rests = []
+    for spelling in _spellings(folder):
+        at = flat.find(spelling)
+        while at != -1:
+            rest = flat[at + len(spelling):]
+            if not (rest[:1].isalnum() or rest[:1] in ("_", "-")):
+                rests.append(rest)
+            at = flat.find(spelling, at + 1)
+    return rests
+
+
+def _own_command(command: str, folder: str) -> str | None:
+    """`list` or `restore` when the whole line is the guard's own undo command and nothing else."""
+    if "`" in command or "\n" in command:
+        return None
+    flat = _flat(command).strip()
+    flat = flat[1:].lstrip() if flat.startswith("&") else flat  # PowerShell's call operator
+    for spelling in _spellings(folder):
+        start = spelling + "/current/bdxguard.exe undo "
+        if flat.startswith(start):
+            m = re.fullmatch(r"(list|restore) ?\d*( [^&|;<>$()%{}]*)?", flat[len(start):])
+            if m and not _after(m.group(2) or "", folder):
+                return m.group(1)
+    return None
+
+
+def _in_own_folder(path: str, cwd: str | None, folder: str) -> bool:
+    path = os.path.expanduser(path.strip())
+    if os.name == "nt":
+        path = re.sub(r"^/([a-zA-Z])(?=/|$)", r"\1:", path)
+    full = os.path.abspath(os.path.join(cwd or "", path))
+    if not full.replace("\\", "/").startswith("//"):  # looking a network path up contacts the host
+        full = os.path.realpath(full)
+    full, folder = os.path.normcase(full), os.path.normcase(folder)
+    return full == folder or full.startswith(folder.rstrip("\\/") + os.sep)
+
+
+def _answer(decision: str, reason: str) -> dict:
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": "Boxdawn guard: " + (messages_ko.translate(reason) if _korean() else reason),
+    }}
+
+
 def decide(payload: dict) -> dict | None:
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input") or {}
+    own = _own_folder()
+    if own and (tool in _WRITE_TOOLS or tool in _FILE_TOOLS):
+        key = _WRITE_TOOLS.get(tool) or _FILE_TOOLS[tool][0]
+        if isinstance(tool_input.get(key), str) and tool_input[key].strip() \
+                and _in_own_folder(tool_input[key], payload.get("cwd"), own):
+            return _answer("deny", f"`{tool}` reaches into the guard's own folder")
+    if tool in _WRITE_TOOLS:
+        return None
     if tool in _FILE_TOOLS:
         paths = [tool_input.get(k) for k in _FILE_TOOLS[tool]]
         paths = [g for p in paths if isinstance(p, str) for g in _globs(p.strip())]
@@ -259,8 +344,13 @@ def decide(payload: dict) -> dict | None:
     if tool in _FILE_TOOLS:
         verdict = evaluate_file_tool(tool, paths, **where)
     else:
+        typed = _own_command(tool_input["command"], own) if own else None
+        if typed == "restore":
+            return _answer("deny" if where["unattended"] else "ask", "this puts the project's files back from a snapshot")
+        if own and typed is None and _after(_flat(tool_input["command"]), own):
+            return _answer("deny", "the command names the guard's own folder")
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
-            tool_input["command"], known_env=known_env, **where)
+            tool_input["command"], known_env=known_env, own=(own,) if own and typed is None else (), **where)
     if verdict is None or verdict.decision is None:
         if tool == "Bash":
             return _grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd"))
@@ -300,7 +390,7 @@ def main() -> int:
         _snapshot_before(payload, out)
     except Exception as exc:  # noqa: BLE001 - a broken guard must not wave a call through
         tool = payload.get("tool_name") if isinstance(payload, dict) else None
-        if isinstance(tool, str) and tool in _FILE_TOOLS:
+        if isinstance(tool, str) and (tool in _FILE_TOOLS or tool in _WRITE_TOOLS):
             return 0
         out = {"hookSpecificOutput": {
             "hookEventName": "PreToolUse",

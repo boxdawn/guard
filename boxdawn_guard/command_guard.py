@@ -118,7 +118,7 @@ RULE_IDS = frozenset({
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
     "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
     "db.reset", "git.discard_changes", "git.stash_drop", "rm.history", "iac.auto_approve",
-    "mirror.delete", "gh.delete",
+    "mirror.delete", "gh.delete", "guard.own_folder",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -135,11 +135,13 @@ _TARGET_OF_WHERE = {"inside": "project", "cwd": "project_root",
 
 
 def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
-             unattended: bool = False, known_env: dict[str, str] | None = None) -> Verdict:
+             unattended: bool = False, known_env: dict[str, str] | None = None,
+             own: tuple[str, ...] = ()) -> Verdict:
     """`known_env`: variables whose value the caller read from the process
     environment (the hook passes TEMP/TMP/TMPDIR). Used only when the line
-    itself never assigns them — the same rules as any other variable."""
-    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}))
+    itself never assigns them — the same rules as any other variable.
+    `own`: folders of the guard itself; a path the line names there is denied."""
+    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}), own=tuple(own))
     try:
         judge.run(command, depth=0)
     except Exception as exc:  # noqa: BLE001 - a guard that crashes must not pass
@@ -292,6 +294,7 @@ class _Judge:
     made_links: list[str] = field(default_factory=list)  # by this same command: not on disk yet
     reals: dict = field(default_factory=dict)
     grep_ends: list[int] = field(default_factory=list)
+    own: tuple[str, ...] = ()  # folders of the guard itself
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -299,6 +302,7 @@ class _Judge:
             self.cwd = self.cwd.replace("\\", "/")
         self.cwd = posixpath.normpath(_posix(self.cwd))
         self.home = posixpath.normpath(_posix(self.home))
+        self.own = tuple(self._fold(posixpath.normpath(_posix(d.replace("\\", "/")))) for d in self.own if d)
 
     def flag(self, level: str, rule: str, reason: str, target: Optional[str] = None) -> None:
         if rule not in RULE_IDS:
@@ -538,6 +542,8 @@ class _Judge:
                 where = "unknown"
             else:
                 path = self._absolute(target, base or self.cwd)
+                if any(self._fold(path) == d or self._fold(path).startswith(d + "/") for d in self.own):
+                    self.flag("deny", "guard.own_folder", f"`{target}` is in the guard's own folder", "outside")
                 where = self._relation(path)
                 if where != "outside":
                     lands = self._lands(target, base or self.cwd, keep_last)

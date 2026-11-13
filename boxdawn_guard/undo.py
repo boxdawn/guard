@@ -35,10 +35,13 @@ Known limits:
 - A project with tens of thousands of folders: finding the folders to leave
   out takes longer than a command may wait, so commands there are covered by
   the snapshots taken in the background only, and the list says so.
-- The store is not protected from the agent. A command that writes into it can
-  stop snapshots, make them wrong or make git run a program of its choice
-  (a filter in the store's config), without a trace in the record, and the
-  copies of ignored files such as `.env` in it can be read with git.
+- The store is kept from the agent only as far as the hook sees its folder
+  named (`command_hook._own_folder`): a command that puts the path together
+  when it runs, works on a copy of a folder above it, or does it from inside a
+  script is not seen. Such a command can stop snapshots, make them wrong or
+  make git run a program of its choice (a filter in the store's config),
+  without a trace in the record, and can read the copies of ignored files such
+  as `.env` with git.
 """
 from __future__ import annotations
 

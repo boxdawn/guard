@@ -19,6 +19,10 @@ _TABLE = (
     ("the command name is only known at run time", "무슨 명령이 실행될지 미리 알 수 없습니다"),
     ("the git subcommand is known only at run time", "실행해야만 git 하위 명령을 알 수 있습니다"),
     ("nobody is present to approve it", "승인할 사람이 없습니다"),
+    ("the command names the guard's own folder", "차단기 자신의 폴더를 가리키는 명령입니다"),
+    ("`{}` reaches into the guard's own folder", "`{0}`: 차단기 자신의 폴더 안을 가리킵니다"),
+    ("`{}` is in the guard's own folder", "`{0}`: 차단기 자신의 폴더 안입니다"),
+    ("this puts the project's files back from a snapshot", "사진에서 프로젝트 파일을 되돌리는 명령입니다"),
     # secret files
     ("`{}` reads the secret file `{}`", "`{0}`: 비밀 파일을 읽습니다: `{1}`"),
     ("`{}` sends the secret file `{}` out", "`{0}`: 비밀 파일을 밖으로 보냅니다: `{1}`"),
