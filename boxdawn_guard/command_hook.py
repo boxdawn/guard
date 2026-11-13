@@ -276,7 +276,9 @@ def _after(flat: str, folder: str) -> list[str]:
 
 def _own_command(command: str, folder: str) -> str | None:
     """`list` or `restore` when the whole line is the guard's own undo command and nothing else."""
-    if "`" in command or "\n" in command:
+    # One line and nothing a shell reads as the end of one: PowerShell ends a statement at a
+    # carriage return too, and what followed would ride on this line's answer.
+    if "`" in command or not all(ch.isprintable() for ch in command):
         return None
     flat = _flat(command).strip()
     flat = flat[1:].lstrip() if flat.startswith("&") else flat  # PowerShell's call operator

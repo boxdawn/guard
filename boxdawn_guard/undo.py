@@ -283,8 +283,8 @@ class Store:
                 for line in f:
                     try:
                         row = json.loads(line)
-                    except ValueError:
-                        continue  # a line cut short by a crash must not end the record
+                    except (ValueError, RecursionError):
+                        continue  # a line cut short by a crash, or one nested too deep, must not end the record
                     at = row.get("at") if isinstance(row, dict) else None
                     # A time the clock can show; anything else was not written by this code.
                     if isinstance(at, (int, float)) and not isinstance(at, bool) \

@@ -94,10 +94,19 @@ def test_the_guards_own_undo_command(project):
     unattended = dict(_payload(project, restore), permission_mode="bypassPermissions")
     assert _decision(unattended)[0] == "deny"
     for more in (restore + "; rm -rf src", restore + " && echo x", listing + " | tee out.txt", listing + " `echo x`",
-                 listing + "\nrm -rf src", f'"{exe}" undo list "$(echo x)"', f'"{exe}" fetch-rules',
+                 listing + "\nrm -rf src", restore + "\rrm -rf src", listing + "\rrm -rf src",
+                 restore + "\u2028rm -rf src", listing + "\x0brm -rf src", f'"{exe}" undo list "$(echo x)"', f'"{exe}" fetch-rules',
                  f'"{exe}" undo list "{_data()}"'):
         decision, reason = _decision(_payload(project, more))
         assert decision == "deny" and "own folder" in reason, more
+
+
+def test_a_second_powershell_statement_after_a_carriage_return_is_not_carried(project):
+    exe = _data().replace("\\", "/") + "/current/bdxguard.exe"
+    delete = "Remove-Item -Recurse -Force C:\\Windows\\Temp\\x"
+    alone = _decision(_payload(project, delete, "PowerShell"))[0]
+    for first in (f'& "{exe}" undo restore 2 "{project}"', f'& "{exe}" undo list "{project}"'):
+        assert _decision(_payload(project, first + "\r" + delete, "PowerShell"))[0] == "deny" == alone
 
 
 def test_file_tools_do_not_reach_into_the_folder(project):

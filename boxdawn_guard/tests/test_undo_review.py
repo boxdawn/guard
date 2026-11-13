@@ -537,6 +537,7 @@ def test_rows_no_clock_or_text_can_hold_do_not_end_the_list(project, capsys):
     with open(store.log, "ab") as f:
         f.write(b'{"at": ' + b"9" * 400 + b', "unprotected": "x"}\n')
         f.write(b'{"at": 1, "unprotected": "\xff\xfe"}\n')
+        f.write(b"[" * 100000 + b"\n")
         f.write(b'{"at": 1700000000, "n": 999999999, "commit": "' + b"a" * 40 + b'", "before": "planted"}\n')
     assert undo._cli(["undo", "list", project]) == 0
     assert "one" in capsys.readouterr().out
