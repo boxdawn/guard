@@ -188,10 +188,17 @@ def test_while_another_is_being_taken_the_command_does_not_wait(project):
 
 
 def test_a_lock_left_by_a_dead_process_is_taken_over(project):
+    """A real process takes the lock and is killed while it holds it (as a hook stopped mid-snapshot)."""
+    src = os.path.dirname(os.path.dirname(os.path.abspath(undo.__file__)))
+    code = ("import sys, time; from boxdawn_guard import undo\n"
+            "s = undo.Store(sys.argv[1], sys.argv[2]); assert s.acquire(); print('held', flush=True); time.sleep(60)\n")
+    holder = subprocess.Popen([sys.executable, "-c", code, os.path.realpath(project), os.environ["CLAUDE_PLUGIN_DATA"]],
+                              stdout=subprocess.PIPE, env=dict(os.environ, PYTHONPATH=src), cwd=os.path.dirname(project))
+    assert holder.stdout.readline().strip() == b"held"
     store = _store(project)
-    assert store.acquire()
-    old = os.path.getmtime(store.lock) - undo.LOCK_STALE - 1
-    os.utime(store.lock, (old, old))
+    assert not store.acquire()
+    holder.kill()
+    holder.wait()
     assert store.acquire()
 
 

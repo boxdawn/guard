@@ -113,11 +113,13 @@ def test_a_lock_left_by_a_process_that_is_gone_does_not_hold_snapshots_back(proj
 
 
 def test_a_lock_held_by_a_running_process_still_holds(project):
-    store = _store(project)
-    os.makedirs(store.root, exist_ok=True)
-    with open(store.lock, "w") as f:
-        f.write(str(os.getpid()))
-    assert not store.acquire()
+    holder = _store(project)
+    assert holder.acquire()
+    try:
+        assert not _store(project).acquire()
+    finally:
+        holder.release()
+    assert _store(project).acquire()
 
 
 def test_a_stop_part_way_also_names_what_was_left_as_it_is(project, monkeypatch, capsys):

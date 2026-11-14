@@ -36,9 +36,11 @@ Known limits:
   (it comes back as a file of its own).
 - A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
   in the snapshots, and comes back under it.
-- A snapshot cut short holds the next ones back until its process is seen to
-  be gone; when that cannot be told (the machine itself stopped and the
-  process id is in use again), for up to `LOCK_STALE` seconds.
+- A git stopped from outside in the middle of a snapshot (not by this code)
+  can leave its own lock in the store: snapshots fail, and the list says so,
+  for up to `LOCK_STALE` seconds.
+- A command can wait for the record up to `LOG_WAIT` seconds more than
+  `HOOK_BUDGET`, when another process is writing it at that moment.
 - A project with tens of thousands of folders: finding the folders to leave
   out takes longer than a command may wait, so commands there are covered by
   the snapshots taken in the background only, and the list says so.
@@ -72,7 +74,7 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds the snapshot itself may take; the hook around it adds up to a second
-LOCK_STALE = 15 * 60     # a lock older than this is taken to be left by a process that died
+LOCK_STALE = 15 * 60     # a git `index.lock` older than this was left by a git that was stopped
 LOG_WAIT = 2.0           # seconds a row waits for another writer of the record
 SUPPORTED = ("win32",)   # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
@@ -148,33 +150,33 @@ def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: f
     return proc.returncode, out, err
 
 
-def _alive(pid: int) -> bool:
-    """Whether a process with this id is running. True when it cannot be told."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel.OpenProcess.restype = wintypes.HANDLE
-        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not handle:
-            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
-        try:
-            code = wintypes.DWORD()
-            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == 259  # STILL_ACTIVE
-        finally:
-            kernel.CloseHandle(handle)
+def _take(fd: int) -> bool:
+    """A lock the system holds on byte 0 of an open file, not waiting. Each open file is its
+    own holder, in one process or several; it goes when the file is closed or its process ends."""
     try:
-        os.kill(pid, 0)  # elsewhere signal 0 only asks (on Windows os.kill would end the process)
-    except ProcessLookupError:
-        return False
-    except OSError:
+        os.lseek(fd, 0, os.SEEK_SET)  # Windows locks from where the file stands
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    return True
+    except OSError:
+        return False
+
+
+def _give(fd: int) -> None:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass  # closing the file lets it go in any case
 
 
 def _long(path: str) -> str:
@@ -253,6 +255,7 @@ class Store:
         self.shadow = os.path.join(self.root, key + ".git")
         self.log = os.path.join(self.root, key + ".jsonl")
         self.lock = os.path.join(self.root, key + ".lock")
+        self._held: int | None = None  # the open lock file while this holds the lock
 
     # -- git ---------------------------------------------------------------
     @staticmethod
@@ -304,48 +307,39 @@ class Store:
 
     # -- one writer at a time ---------------------------------------------
     def acquire(self) -> bool:
+        """A lock the system holds on the lock file's first byte: one holder at a time, and it
+        goes when its process does, so one that died leaves nothing to clear. The file stays."""
+        if self._held is not None:
+            return False
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         try:
-            st = os.lstat(self.lock)
-            # Not a plain file: nothing of ours. Old, or its process is gone (a hook that was
-            # stopped mid-snapshot): its owner died.
-            if not stat.S_ISREG(st.st_mode) or time.time() - st.st_mtime > LOCK_STALE or self._owner_gone(st):
-                os.rmdir(self.lock) if stat.S_ISDIR(st.st_mode) and not _is_link(self.lock) else os.remove(self.lock)
+            fd = os.open(self.lock, os.O_CREAT | os.O_RDWR, 0o600)
         except OSError:
-            pass
-        try:
-            fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            return False
-        try:
-            os.write(fd, str(os.getpid()).encode())
-        finally:
+            try:  # not a plain file (a folder, say): nothing of ours
+                st = os.lstat(self.lock)
+                os.rmdir(self.lock) if stat.S_ISDIR(st.st_mode) and not _is_link(self.lock) else os.remove(self.lock)
+                fd = os.open(self.lock, os.O_CREAT | os.O_RDWR, 0o600)
+            except OSError:
+                return False
+        if not _take(fd):
             os.close(fd)
-        # Ours alone now: a git that was stopped mid-way may have left its own lock.
+            return False
+        self._held = fd
+        # A git stopped from outside mid-way leaves its own lock; one still running keeps it fresh
+        # enough, so only an old one is cleared. (A git this code stops clears its own: `snapshot`.)
+        index_lock = os.path.join(self.shadow, "index.lock")
         try:
-            os.remove(os.path.join(self.shadow, "index.lock"))
+            if time.time() - os.lstat(index_lock).st_mtime > LOCK_STALE:
+                os.remove(index_lock)
         except OSError:
             pass
         return True
 
-    def _owner_gone(self, st) -> bool:
-        """The lock holds the process id that took it. False when not sure (then only age frees it)."""
-        try:
-            with open(self.lock, "rb") as f:
-                text = f.read(32)
-        except OSError:
-            return False
-        if not text:  # taken, its id not written yet, or cut short right there
-            return time.time() - st.st_mtime > 10
-        if not re.fullmatch(rb"[0-9]{1,10}", text):
-            return False
-        return not _alive(int(text))
-
     def release(self) -> None:
-        try:
-            os.remove(self.lock)
-        except OSError:
-            pass
+        fd, self._held = self._held, None
+        if fd is not None:
+            _give(fd)
+            os.close(fd)
 
     # -- the record --------------------------------------------------------
     def rows(self) -> list[dict]:
@@ -384,34 +378,19 @@ class Store:
         except OSError:
             yield  # no way to take turns: write anyway
             return
-        # A lock the system holds on the file's first byte: it goes when the process does,
-        # so a writer that died leaves nothing to clear. The file itself stays.
-        if os.name == "nt":
-            import msvcrt
-            take = lambda: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # noqa: E731
-            give = lambda: msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # noqa: E731
-        else:
-            import fcntl
-            take = lambda: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
-            give = lambda: fcntl.flock(fd, fcntl.LOCK_UN)  # noqa: E731
+        # Like the store's lock (`acquire`): a writer that died leaves nothing to clear.
         deadline, mine = time.monotonic() + LOG_WAIT, False
         try:
-            while True:
-                try:
-                    take()
-                    mine = True
-                    break
-                except OSError:
+            while not mine:
+                mine = _take(fd)
+                if not mine:
                     if time.monotonic() > deadline:
                         break
                     time.sleep(0.005)
             yield
         finally:
-            try:
-                if mine:
-                    give()
-            except OSError:
-                pass
+            if mine:
+                _give(fd)
             os.close(fd)
 
     def note(self, row: dict) -> None:
@@ -504,6 +483,18 @@ class Store:
         """The caller holds the lock. Raises `subprocess.TimeoutExpired` over budget.
         `empty_ok`: numbered even when no file could be saved (a restore must record the present
         to go back, and after a wipe that may hold nothing; what it could not save is named)."""
+        try:
+            return self._take_snapshot(why, budget, empty_ok)
+        except subprocess.TimeoutExpired:
+            # The git stopped over budget may have left its own lock. The store's lock is still
+            # held, so no other git runs here, and the next snapshot must not find it.
+            try:
+                os.remove(os.path.join(self.shadow, "index.lock"))
+            except OSError:
+                pass
+            raise
+
+    def _take_snapshot(self, why: dict, budget: float | None, empty_ok: bool) -> dict:
         started = time.perf_counter()
 
         def left() -> float | None:
@@ -659,12 +650,14 @@ class Store:
                 left = [r for r in self.rows()
                         if (r.get("n") not in gone if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
                 self._write_new(self.log + ".tmp", [json.dumps(r) + "\n" for r in left], append=False)
-                for attempt in range(40):
+                # Well under `LOG_WAIT`: a writer waiting for its turn must not give up and append
+                # to the file that is about to be replaced.
+                for attempt in range(15):
                     try:
                         os.replace(self.log + ".tmp", self.log)
                         break
                     except PermissionError:  # Windows: a reader has it open for a moment
-                        if attempt == 39:
+                        if attempt == 14:
                             os.remove(self.log + ".tmp")
                             raise
                         time.sleep(0.05)
@@ -818,11 +811,12 @@ def _cli(argv: list[str]) -> int:
             return 0
         for r in rows:
             when = time.strftime("%m-%d %H:%M:%S", time.localtime(r["at"]))
-            what = _shown(r.get("before") or r.get("note", ""))
+            # "before:" a command; a snapshot taken for another reason shows its note as it is.
+            what = f"before: {_shown(r['before'])}" if r.get("before") else _shown(r.get("note", ""))
             if r in numbered:
-                print(f"{r['n']:4d}  {when}  before: {what}{_left_out(r)}")
+                print(f"{r['n']:4d}  {when}  {what}{_left_out(r)}")
             elif "unprotected" in r:
-                print(f"   -  {when}  NO SNAPSHOT ({_shown(r['unprotected'])}) before: {what}")
+                print(f"   -  {when}  NO SNAPSHOT ({_shown(r['unprotected'])}) {what}")
         return 0
     if argv[:2] == ["undo", "restore"] and len(argv) in (3, 4) and re.fullmatch(r"[0-9]+", argv[2]):
         store = Store(os.path.realpath(argv[3] if len(argv) > 3 else os.getcwd()), data_dir)
@@ -838,8 +832,7 @@ def _cli(argv: list[str]) -> int:
         if not os.path.lexists(store.project):
             os.makedirs(store.project)  # the whole folder was removed: its files go back into a new one
         if not store.acquire():
-            print("boxdawn guard undo: a snapshot is being taken, or one was cut short in the last "
-                  f"{LOCK_STALE // 60} minutes; try again later", file=sys.stderr)
+            print("boxdawn guard undo: a snapshot is being taken; try again in a moment", file=sys.stderr)
             return 1
         highest = max(r["n"] for r in store.snapshots())
         try:

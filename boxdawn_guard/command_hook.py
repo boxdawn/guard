@@ -34,9 +34,10 @@ _UNDO = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\b")
 _UNDO_RESTORE = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\s+restore\b")
 # A line that is nothing but the guard's own `undo list` or `undo restore <n>`, with at most a
 # folder after it: only such a line goes without a snapshot. (No `$` or backquote in the words:
-# inside double quotes the shell would run what they hold.)
-_WORD = r"""(?:"[^"$`]*"|'[^']*'|[^\s"'$`;&|<>()]+)"""
-_UNDO_ONLY = re.compile(rf"(?is)\s*(?:&\s*)?{_WORD}\s+undo\s+(?:list|restore\s+[0-9]+)(?:\s+{_WORD})?\s*")
+# inside double quotes the shell would run what they hold. Spaces and tabs only, never a line
+# break, inside or around them: a second line is a second command.)
+_WORD = r"""(?:"[^"$`\r\n]*"|'[^'\r\n]*'|[^\s"'$`;&|<>()]+)"""
+_UNDO_ONLY = re.compile(rf"(?i)[ \t]*(?:&[ \t]*)?{_WORD}[ \t]+undo[ \t]+(?:list|restore[ \t]+[0-9]+)(?:[ \t]+{_WORD})?[ \t]*")
 
 
 def _globs(pattern: str) -> list[str]:
