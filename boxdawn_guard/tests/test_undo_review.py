@@ -360,7 +360,7 @@ def test_a_junction_below_a_very_long_path_is_not_followed(project, tmp_path):
 
 def test_looking_for_folders_stops_at_the_budget(project, monkeypatch):
     started = []
-    monkeypatch.setattr(undo, "start_in_background", started.append)
+    monkeypatch.setattr(undo, "start_in_background", lambda *args: started.append(args))
     monkeypatch.setattr(undo, "HOOK_BUDGET", 0.0001)
     for i in range(50):
         os.makedirs(os.path.join(project, f"many/d{i}"))
@@ -562,8 +562,8 @@ def test_a_file_changed_after_the_present_was_saved_is_left_alone(project, monke
     _write(project, "a.txt", b"a2-longer")
     real = undo.Store.snapshot
 
-    def then_another_program_writes(self, why, budget=None):
-        row = real(self, why, budget)
+    def then_another_program_writes(self, why, budget=None, **kw):
+        row = real(self, why, budget, **kw)
         _write(project, "a.txt", b"a3-written-in-between")
         return row
     monkeypatch.setattr(undo.Store, "snapshot", then_another_program_writes)

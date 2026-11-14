@@ -168,14 +168,14 @@ def test_a_snapshot_that_fails_changes_nothing(project, monkeypatch, capsys):
 
 def test_over_the_budget_the_command_goes_on_and_the_rest_runs_in_the_background(project, monkeypatch):
     started = []
-    monkeypatch.setattr(undo, "start_in_background", started.append)
+    monkeypatch.setattr(undo, "start_in_background", lambda *args: started.append(args))
 
     def slow(self, *args, **kwargs):
         raise subprocess.TimeoutExpired("git", 3)
     monkeypatch.setattr(undo.Store, "_changed", slow)
     undo.before_command(_payload(project), os.environ["CLAUDE_PLUGIN_DATA"])
     store = _store(project)
-    assert started == [os.path.realpath(project)]
+    assert started == [(os.path.realpath(project), "ls")]  # the late row will name the command
     assert "unprotected" in store.rows()[-1] and not store.snapshots()
     assert store.acquire()  # the lock was given back
 

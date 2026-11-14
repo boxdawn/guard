@@ -32,6 +32,11 @@ _FILE_TOOLS = {"Read": ("file_path",), "Grep": ("path", "glob")}
 # The guard's own `undo` command line, as it is usually typed. Not a wall: a line that hides it is not seen.
 _UNDO = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\b")
 _UNDO_RESTORE = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\s+restore\b")
+# A line that is nothing but the guard's own `undo list` or `undo restore <n>`, with at most a
+# folder after it: only such a line goes without a snapshot. (No `$` or backquote in the words:
+# inside double quotes the shell would run what they hold.)
+_WORD = r"""(?:"[^"$`]*"|'[^']*'|[^\s"'$`;&|<>()]+)"""
+_UNDO_ONLY = re.compile(rf"(?is)\s*(?:&\s*)?{_WORD}\s+undo\s+(?:list|restore\s+[0-9]+)(?:\s+{_WORD})?\s*")
 
 
 def _globs(pattern: str) -> list[str]:
@@ -274,11 +279,16 @@ def decide(payload: dict) -> dict | None:
                 reasons.append("nobody is present to approve it")
             if asked and bundle_exp is not None:
                 block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
+            # A line let through as it is would have had secret files kept out of its grep: so here too.
+            kept_out = {} if asked or tool != "Bash" or verdict is None else \
+                (_grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd")) or {}).get(
+                    "hookSpecificOutput", {})
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny" if where["unattended"] else "ask",
                 "permissionDecisionReason": "Boxdawn guard: " + "; ".join(
                     map(messages_ko.translate, reasons) if _korean() else reasons),
+                **{k: v for k, v in kept_out.items() if k in ("updatedInput", "additionalContext")},
             }}
     if verdict is None or verdict.decision is None:
         if tool == "Bash":
@@ -302,8 +312,8 @@ def _snapshot_before(payload: dict, out: dict | None) -> None:
     if out is not None and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
         return
     command = (payload.get("tool_input") or {}).get("command")
-    if isinstance(command, str) and _UNDO.search(command):
-        return  # the guard's own `undo list` or `undo restore`: restore takes its own snapshot first
+    if isinstance(command, str) and _UNDO.search(command) and _UNDO_ONLY.fullmatch(command):
+        return  # only the guard's own `undo list` or `undo restore`: restore takes its own snapshot first
     try:
         undo.before_command(payload, os.environ.get("CLAUDE_PLUGIN_DATA"))
     except Exception:  # noqa: BLE001 - a snapshot that fails must not stop or change a command

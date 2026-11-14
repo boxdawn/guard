@@ -33,8 +33,12 @@ Known limits:
   `HOOK_BUDGET`, then goes on without one, and the list says so.
 - What comes back is the bytes of each file: not its read-only or hidden
   attribute, its modified time, its alternate data streams, or a hard link
-  (it comes back as a file of its own). A snapshot cut short by a crash holds the next ones back for up to
-  `LOCK_STALE` seconds.
+  (it comes back as a file of its own).
+- A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
+  in the snapshots, and comes back under it.
+- A snapshot cut short holds the next ones back until its process is seen to
+  be gone; when that cannot be told (the machine itself stopped and the
+  process id is in use again), for up to `LOCK_STALE` seconds.
 - A project with tens of thousands of folders: finding the folders to leave
   out takes longer than a command may wait, so commands there are covered by
   the snapshots taken in the background only, and the list says so.
@@ -144,6 +148,35 @@ def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: f
     return proc.returncode, out, err
 
 
+def _alive(pid: int) -> bool:
+    """Whether a process with this id is running. True when it cannot be told."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process
+        try:
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)  # elsewhere signal 0 only asks (on Windows os.kill would end the process)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _long(path: str) -> str:
     """Windows calls stop at 260 characters unless the path is written this way; git does not stop."""
     if os.name == "nt" and not path.startswith("\\\\"):
@@ -206,9 +239,10 @@ def _refused(project: str, data_dir: str) -> str | None:
 class PartialRestore(RuntimeError):
     """The write stopped part way. `done` is None when which files were written is not known."""
 
-    def __init__(self, message: str, present: dict, done: list[str] | None, rest: list[str]):
+    def __init__(self, message: str, present: dict, done: list[str] | None, rest: list[str],
+                 skipped: dict[str, str]):
         super().__init__(message)
-        self.present, self.done, self.rest = present, done, rest
+        self.present, self.done, self.rest, self.skipped = present, done, rest, skipped
 
 
 class Store:
@@ -273,21 +307,39 @@ class Store:
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         try:
             st = os.lstat(self.lock)
-            # Not a plain file: nothing of ours. Old: its owner died.
-            if not stat.S_ISREG(st.st_mode) or time.time() - st.st_mtime > LOCK_STALE:
+            # Not a plain file: nothing of ours. Old, or its process is gone (a hook that was
+            # stopped mid-snapshot): its owner died.
+            if not stat.S_ISREG(st.st_mode) or time.time() - st.st_mtime > LOCK_STALE or self._owner_gone(st):
                 os.rmdir(self.lock) if stat.S_ISDIR(st.st_mode) and not _is_link(self.lock) else os.remove(self.lock)
         except OSError:
             pass
         try:
-            os.close(os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             return False
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
         # Ours alone now: a git that was stopped mid-way may have left its own lock.
         try:
             os.remove(os.path.join(self.shadow, "index.lock"))
         except OSError:
             pass
         return True
+
+    def _owner_gone(self, st) -> bool:
+        """The lock holds the process id that took it. False when not sure (then only age frees it)."""
+        try:
+            with open(self.lock, "rb") as f:
+                text = f.read(32)
+        except OSError:
+            return False
+        if not text:  # taken, its id not written yet, or cut short right there
+            return time.time() - st.st_mtime > 10
+        if not re.fullmatch(rb"[0-9]{1,10}", text):
+            return False
+        return not _alive(int(text))
 
     def release(self) -> None:
         try:
@@ -448,8 +500,10 @@ class Store:
         still = set(self._changed(exclude_file, left()))  # these were skipped one by one
         return [rel for rel in paths if rel in still]
 
-    def snapshot(self, why: dict, budget: float | None = None) -> dict:
-        """The caller holds the lock. Raises `subprocess.TimeoutExpired` over budget."""
+    def snapshot(self, why: dict, budget: float | None = None, empty_ok: bool = False) -> dict:
+        """The caller holds the lock. Raises `subprocess.TimeoutExpired` over budget.
+        `empty_ok`: numbered even when no file could be saved (a restore must record the present
+        to go back, and after a wipe that may hold nothing; what it could not save is named)."""
         started = time.perf_counter()
 
         def left() -> float | None:
@@ -510,7 +564,7 @@ class Store:
         # The index, not the list of changes, says whether this is the same state as the last
         # snapshot: a restore changes the index without taking one.
         tree = self.git("write-tree", timeout=left()).decode().strip()
-        if tree == _EMPTY_TREE and gone:
+        if tree == _EMPTY_TREE and gone and not empty_ok:
             raise RuntimeError("no file could be saved")  # not a snapshot: do not number it
         previous = self.snapshots()
         if previous and previous[-1].get("tree") == tree:
@@ -540,7 +594,7 @@ class Store:
         target = next((r for r in self.snapshots() if r["n"] == n), None)
         if target is None:
             raise LookupError(f"no snapshot {n}")
-        present = self.snapshot({"note": f"before going back to {n}"})
+        present = self.snapshot({"note": f"before going back to {n}"}, empty_ok=True)
         saved_now = self._names(present["commit"])
         differs = self.git("diff", "--name-only", "-z", present["commit"])
         differs = {os.fsdecode(p) for p in differs.split(b"\0") if p}
@@ -573,7 +627,8 @@ class Store:
                     done = [rel for rel in write if rel not in still and not _is_folder(os.path.join(self.project, rel))]
                 except Exception:  # noqa: BLE001 - the first error is the one to report
                     done = None
-                raise PartialRestore(str(exc), present, done, [rel for rel in write if done is None or rel not in done])
+                raise PartialRestore(str(exc), present, done, [rel for rel in write if done is None or rel not in done],
+                                     skipped)
         return target, present, skipped
 
     # -- keeping it small --------------------------------------------------
@@ -595,29 +650,37 @@ class Store:
         dropped = 0
 
         def drop(rows: list[dict]) -> None:
+            """The record first, then the snapshots: a record that could not be rewritten
+            (someone is reading it) leaves everything as it was, to be tried next time."""
             nonlocal dropped
+            gone = {r["n"] for r in rows}
+            with self._log_turn():  # a row noted while this rewrites would be lost
+                # Snapshot rows that are left, and the "unprotected" notes that are not old yet.
+                left = [r for r in self.rows()
+                        if (r.get("n") not in gone if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
+                self._write_new(self.log + ".tmp", [json.dumps(r) + "\n" for r in left], append=False)
+                for attempt in range(40):
+                    try:
+                        os.replace(self.log + ".tmp", self.log)
+                        break
+                    except PermissionError:  # Windows: a reader has it open for a moment
+                        if attempt == 39:
+                            os.remove(self.log + ".tmp")
+                            raise
+                        time.sleep(0.05)
             for r in rows:
                 self.git("update-ref", "-d", f"refs/snap/{r['n']}")
+            self.git("gc", "--prune=now", "-q")
             dropped += len(rows)
 
         old = [r for r in kept[:-1] if now - r["at"] > KEEP_SECONDS]
         if old:
             drop(old)
             kept = [r for r in kept if r not in old]
-            self.git("gc", "--prune=now", "-q")
         while len(kept) > 1 and self.size() > MAX_STORE_BYTES:
             oldest = kept[:max(1, len(kept) // 4)]
             drop(oldest)
             kept = kept[len(oldest):]
-            self.git("gc", "--prune=now", "-q")
-        if dropped:
-            numbers = {r["n"] for r in kept}
-            with self._log_turn():  # a row noted while this rewrites would be lost
-                # Snapshot rows that are left, and the "unprotected" notes that are not old yet.
-                rows = [r for r in self.rows()
-                        if (r.get("n") in numbers if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
-                self._write_new(self.log + ".tmp", [json.dumps(r) + "\n" for r in rows], append=False)
-                os.replace(self.log + ".tmp", self.log)
         return dropped
 
 
@@ -627,12 +690,14 @@ def _own_command(*args: str) -> list[str]:
     return [sys.executable, "-m", "boxdawn_guard.undo", *args]
 
 
-def start_in_background(project: str) -> None:
-    """A snapshot that did not fit the budget is finished here; the command has gone on."""
+def start_in_background(project: str, command: str = "") -> None:
+    """A snapshot that did not fit the budget is finished here; the command has gone on.
+    Its row names that command: rows written in between may stand between them in the list."""
     flags = 0
     if os.name == "nt":
         flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    subprocess.Popen(_own_command("undo-start", project, "late"), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    subprocess.Popen(_own_command("undo-start", project, "late", command[:200].replace("\0", "")),
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, creationflags=flags, start_new_session=os.name != "nt",
                      close_fds=True)
 
@@ -675,11 +740,13 @@ def before_command(payload: dict, data_dir: str | None) -> None:
     except Exception as exc:  # noqa: BLE001 - whatever it was, the record must say this command had no snapshot
         store.note({"unprotected": f"the snapshot failed ({type(exc).__name__}: {str(exc)[:200]})", **why})
     if finish_later:
-        start_in_background(project)
+        start_in_background(project, why["before"])
 
 
-def start(project: str, data_dir: str, note: str = "session start") -> str:
-    """In the background: a snapshot with no time limit, then the clean-up."""
+def start(project: str, data_dir: str, note: str = "session start", late_for: str | None = None) -> str:
+    """In the background: a snapshot with no time limit, then the clean-up. `late_for`: the
+    command whose snapshot did not fit its budget; if this one cannot be taken either, the
+    record says so."""
     project = os.path.realpath(project)
     if sys.platform not in SUPPORTED:
         return "not taken: snapshots are not supported on this system yet"
@@ -691,14 +758,23 @@ def start(project: str, data_dir: str, note: str = "session start") -> str:
     store = Store(project, data_dir)
     try:
         if not store.acquire():
+            if late_for is not None:
+                store.note({"unprotected": "the snapshot left for later was not taken: another snapshot was "
+                                           "being taken", "before": late_for})
             return "another snapshot is being taken"
         try:
             row = store.snapshot({"note": note})
-            return f"snapshot {row['n']} in {row['seconds']}s, {store.prune()} old dropped"
+            try:
+                cleaned = f"{store.prune()} old dropped"
+            except Exception as exc:  # noqa: BLE001 - the snapshot is taken; the clean-up is tried next time
+                cleaned = f"clean-up left for next time ({type(exc).__name__})"
+            return f"snapshot {row['n']} in {row['seconds']}s, {cleaned}"
         finally:
             store.release()
     except Exception as exc:  # noqa: BLE001 - runs unattended; say what happened and leave
-        store.note({"unprotected": f"the snapshot at session start failed ({type(exc).__name__}: {str(exc)[:200]})"})
+        what = "the snapshot left for later" if late_for is not None else "the snapshot at session start"
+        store.note({"unprotected": f"{what} failed ({type(exc).__name__}: {str(exc)[:200]})",
+                    **({"before": late_for} if late_for is not None else {})})
         return f"failed: {type(exc).__name__}: {exc}"
 
 
@@ -725,9 +801,12 @@ def _cli(argv: list[str]) -> int:
     if not data_dir:
         print("boxdawn guard undo: CLAUDE_PLUGIN_DATA is not set", file=sys.stderr)
         return 1
-    if argv[:1] == ["undo-start"] and (len(argv) == 2 or argv[2:] == ["late"]):
-        result = start(argv[1], data_dir, "finished late, after the command above had started" if argv[2:] else
-                       "session start")
+    if argv[:1] == ["undo-start"] and (len(argv) == 2 or (argv[2:3] == ["late"] and len(argv) in (3, 4))):
+        late_for = argv[3] if len(argv) == 4 else "" if len(argv) == 3 else None
+        note = ("session start" if late_for is None else
+                f"finished late, after this command had started: {late_for}" if late_for else
+                "finished late, after the command above had started")
+        result = start(argv[1], data_dir, note, late_for)
         print(f"boxdawn guard undo: {result}", file=sys.stderr)
         return 1 if result.startswith("failed") else 0
     if argv[:2] == ["undo", "list"]:
@@ -773,15 +852,17 @@ def _cli(argv: list[str]) -> int:
                   f"snapshot {exc.present['n']}.", file=sys.stderr)
             if exc.done is None:
                 print("  which files were written is not known; these were to be:", file=sys.stderr)
-            for label, names in (("put back", exc.done or []), ("not put back", exc.rest)):
+            for label, names in (("put back", exc.done or []), ("not put back", exc.rest),
+                                 ("left as it is", [f"{rel} ({why})" for rel, why in exc.skipped.items()])):
                 for rel in names[:NAMED]:
                     print(f"  {label}: {_shown(rel)}", file=sys.stderr)
                 if len(names) > NAMED:
                     print(f"  {label}: and {len(names) - NAMED} more", file=sys.stderr)
             return 1
         except Exception as exc:  # noqa: BLE001 - say where things stand instead of a traceback
+            # Files are written in one place only, and a stop there is the case above.
             taken = [r for r in store.snapshots() if r["n"] > highest]  # the present, if this call got that far
-            where = (f" The state before this attempt is snapshot {taken[-1]['n']}; some files may have been written."
+            where = (f" The state before this attempt is snapshot {taken[-1]['n']}; nothing was written."
                      if taken else " Nothing was written.")
             print(f"boxdawn guard undo: stopped ({type(exc).__name__}: {_shown(exc)}).{where}", file=sys.stderr)
             return 1
