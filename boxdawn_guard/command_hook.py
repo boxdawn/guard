@@ -267,9 +267,13 @@ def decide(payload: dict) -> dict | None:
         if undo.enabled() and _UNDO_RESTORE.search(tool_input["command"]) and \
                 (verdict is None or verdict.decision != "deny"):
             # Going back writes over the project's files: the person says so, the agent does not.
-            reasons = ["this puts the project's files back from a snapshot"]
-            if where["unattended"]:
+            # What else the line was asked about stays in front of the person, and in the record.
+            asked = verdict is not None and verdict.decision is not None
+            reasons = [*(verdict.reasons if asked else []), "this puts the project's files back from a snapshot"]
+            if where["unattended"] and "nobody is present to approve it" not in reasons:
                 reasons.append("nobody is present to approve it")
+            if asked and bundle_exp is not None:
+                block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny" if where["unattended"] else "ask",

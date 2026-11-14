@@ -73,8 +73,10 @@ def test_a_file_that_became_a_folder_and_a_folder_that_became_a_file(project):
     _, _, skipped = store.restore(1)
     assert skipped.get("pkg") == "it is a folder now"
     assert os.path.isfile(os.path.join(project, "pkg", "node_modules", "m", "index.js"))
-    with open(os.path.join(project, "lib", "one.txt"), "rb") as f:  # the file in its way was saved, so it gave way
-        assert f.read() == b"one"
+    # Review 6: the file in its way was made since, and "files made since stay" (it used to give way).
+    with open(os.path.join(project, "lib"), "rb") as f:
+        assert f.read() == b"now a file"
+    assert skipped.get("lib/one.txt") == "a file now stands where its folder was"
 
 
 def test_a_nested_repository_with_no_commit_does_not_stop_snapshots(project):
@@ -519,7 +521,7 @@ def test_a_snapshot_git_took_nothing_into_is_not_numbered(project, monkeypatch):
     monkeypatch.setattr(undo.Store, "_add", lambda self, paths, exclude_file, left: list(paths))
     undo.before_command(_payload(project), _data())
     store = _store(project)
-    assert store.snapshots() == [] and "took none of the files" in store.rows()[-1]["unprotected"]
+    assert store.snapshots() == [] and "no file could be saved" in store.rows()[-1]["unprotected"]
 
 
 def test_a_system_that_is_not_supported_leaves_one_row(project, monkeypatch):

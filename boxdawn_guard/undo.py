@@ -29,8 +29,11 @@ Known limits:
   seen as changed.
 - A file changed by an edit tool is in the snapshot taken before the next Bash
   or PowerShell command, not before.
-- Two snapshots at once: the second command goes on without one, and the list
-  says so. A snapshot cut short by a crash holds the next ones back for up to
+- Two snapshots at once: the second command waits for the first up to
+  `HOOK_BUDGET`, then goes on without one, and the list says so.
+- What comes back is the bytes of each file: not its read-only or hidden
+  attribute, its modified time, its alternate data streams, or a hard link
+  (it comes back as a file of its own). A snapshot cut short by a crash holds the next ones back for up to
   `LOCK_STALE` seconds.
 - A project with tens of thousands of folders: finding the folders to leave
   out takes longer than a command may wait, so commands there are covered by
@@ -47,6 +50,7 @@ Known limits:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -65,6 +69,7 @@ KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds the snapshot itself may take; the hook around it adds up to a second
 LOCK_STALE = 15 * 60     # a lock older than this is taken to be left by a process that died
+LOG_WAIT = 2.0           # seconds a row waits for another writer of the record
 SUPPORTED = ("win32",)   # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
 _ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"  # files go in and come out byte for byte
@@ -121,7 +126,10 @@ def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: f
         out, err = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+            # By its full path: a `taskkill.exe` in the project (the working folder) must not run.
+            root = os.environ.get("SystemRoot") or ""
+            taskkill = os.path.join(root if os.path.isabs(root) else r"C:\Windows", "System32", "taskkill.exe")
+            subprocess.run([taskkill, "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
         else:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -193,6 +201,14 @@ def _refused(project: str, data_dir: str) -> str | None:
     if _inside(os.path.realpath(data_dir), project):
         return "around the snapshot store"
     return None
+
+
+class PartialRestore(RuntimeError):
+    """The write stopped part way. `done` is None when which files were written is not known."""
+
+    def __init__(self, message: str, present: dict, done: list[str] | None, rest: list[str]):
+        super().__init__(message)
+        self.present, self.done, self.rest = present, done, rest
 
 
 class Store:
@@ -306,9 +322,49 @@ class Store:
         with os.fdopen(os.open(path, flags, 0o600), "a" if append else "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-    def note(self, row: dict) -> None:
+    @contextlib.contextmanager
+    def _log_turn(self):
+        """One writer of the record at a time. Appends from several processes are not whole on
+        Windows: rows were lost. Held only for a write; after `LOG_WAIT` the write goes ahead."""
         os.makedirs(self.root, mode=0o700, exist_ok=True)
-        self._write_new(self.log, [json.dumps({"at": round(time.time(), 1), **row}) + "\n"], append=True)
+        try:
+            fd = os.open(self.log + ".turn", os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            yield  # no way to take turns: write anyway
+            return
+        # A lock the system holds on the file's first byte: it goes when the process does,
+        # so a writer that died leaves nothing to clear. The file itself stays.
+        if os.name == "nt":
+            import msvcrt
+            take = lambda: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # noqa: E731
+            give = lambda: msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # noqa: E731
+        else:
+            import fcntl
+            take = lambda: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
+            give = lambda: fcntl.flock(fd, fcntl.LOCK_UN)  # noqa: E731
+        deadline, mine = time.monotonic() + LOG_WAIT, False
+        try:
+            while True:
+                try:
+                    take()
+                    mine = True
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.005)
+            yield
+        finally:
+            try:
+                if mine:
+                    give()
+            except OSError:
+                pass
+            os.close(fd)
+
+    def note(self, row: dict) -> None:
+        with self._log_turn():
+            self._write_new(self.log, [json.dumps({"at": round(time.time(), 1), **row}) + "\n"], append=True)
 
     def note_once(self, reason: str, why: dict) -> None:
         """For a cause that every command would repeat (no git, a refused project)."""
@@ -414,6 +470,15 @@ class Store:
         changed = self._changed(exclude_file, left())
         links: dict[str, bool] = {}
         add, drop, too_big, unreadable = [], [], [], []
+        if folders:
+            # Saved before the folder was left out (it became a repository, a link, ...) and not
+            # changed since: the record names the folder as not in the snapshot, so its files go too.
+            fold = str.casefold if os.name == "nt" else (lambda p: p)
+            under = tuple(fold(rel) + "/" for rel in folders)
+            listed = set(changed)
+            cached = self.git("ls-files", "-z", timeout=left())
+            drop += [p for p in sorted({os.fsdecode(x) for x in cached.split(b"\0") if x})
+                     if fold(p).startswith(under) and p not in listed]
         for rel in changed:
             full = os.path.join(self.project, rel)
             parts = rel.split("/")
@@ -435,10 +500,9 @@ class Store:
             else:
                 add.append(rel)
         if add:
-            refused = self._add(add, exclude_file, left)
-            if len(add) > 1 and len(refused) == len(add):
-                raise RuntimeError("git took none of the files")  # not a snapshot: do not number it
-            unreadable += refused
+            # Files git could not take are named; the rest of the project is still in the snapshot.
+            # (Files another program holds open, as in `.vs/`, are refused on every snapshot.)
+            unreadable += self._add(add, exclude_file, left)
         gone = drop + too_big + unreadable
         if gone:  # an older version in the index must not stand in for what is there now
             self.git("update-index", "--force-remove", "-z", "--stdin",
@@ -492,14 +556,24 @@ class Store:
                 skipped[rel] = "it is a folder now"
             elif rel in differs or (os.path.lexists(_long(full)) and rel not in saved_now):
                 skipped[rel] = "what is there now could not be saved first"
-            elif any(a not in saved_now and os.path.lexists(_long(os.path.join(self.project, a)))
+            elif any(os.path.lexists(_long(os.path.join(self.project, a)))
                      and not _is_folder(os.path.join(self.project, a)) for a in above):
-                skipped[rel] = "a file that could not be saved first is in its place"
+                # Writing it would delete that file, which "files made since stay" says does not happen.
+                skipped[rel] = "a file now stands where its folder was"
             else:
                 write.append(rel)
         if write:
-            self.git("--literal-pathspecs", "checkout", target["commit"], "--pathspec-from-file=-",
-                     "--pathspec-file-nul", stdin=b"\0".join(map(os.fsencode, write)))
+            try:
+                self.git("--literal-pathspecs", "checkout", target["commit"], "--pathspec-from-file=-",
+                         "--pathspec-file-nul", stdin=b"\0".join(map(os.fsencode, write)))
+            except RuntimeError as exc:  # some files may be written: say which
+                try:
+                    still = self.git("diff", "--name-only", "-z", target["commit"])
+                    still = {os.fsdecode(p) for p in still.split(b"\0") if p}
+                    done = [rel for rel in write if rel not in still and not _is_folder(os.path.join(self.project, rel))]
+                except Exception:  # noqa: BLE001 - the first error is the one to report
+                    done = None
+                raise PartialRestore(str(exc), present, done, [rel for rel in write if done is None or rel not in done])
         return target, present, skipped
 
     # -- keeping it small --------------------------------------------------
@@ -538,11 +612,12 @@ class Store:
             self.git("gc", "--prune=now", "-q")
         if dropped:
             numbers = {r["n"] for r in kept}
-            # Snapshot rows that are left, and the "unprotected" notes that are not old yet.
-            rows = [r for r in self.rows()
-                    if (r.get("n") in numbers if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
-            self._write_new(self.log + ".tmp", [json.dumps(r) + "\n" for r in rows], append=False)
-            os.replace(self.log + ".tmp", self.log)
+            with self._log_turn():  # a row noted while this rewrites would be lost
+                # Snapshot rows that are left, and the "unprotected" notes that are not old yet.
+                rows = [r for r in self.rows()
+                        if (r.get("n") in numbers if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
+                self._write_new(self.log + ".tmp", [json.dumps(r) + "\n" for r in rows], append=False)
+                os.replace(self.log + ".tmp", self.log)
         return dropped
 
 
@@ -564,7 +639,11 @@ def start_in_background(project: str) -> None:
 
 def before_command(payload: dict, data_dir: str | None) -> None:
     """Called by the hook for a Bash or PowerShell call it did not deny. A command
-    that goes on without a snapshot gets an "unprotected" row in the record."""
+    that goes on without a snapshot gets an "unprotected" row in the record; a cause
+    that every command would repeat (system not supported, project refused, no git)
+    gets one row, written again only after another row.
+    While another snapshot is being taken (the one at session start, say), this waits
+    for it within `HOOK_BUDGET`, then takes its own in what is left of it."""
     project = project_of(payload)
     if not (enabled() and data_dir and project):
         return
@@ -578,17 +657,21 @@ def before_command(payload: dict, data_dir: str | None) -> None:
                         "no snapshots: git is not installed", why)
         return
     finish_later = False
+    started = time.perf_counter()
     try:
-        if not store.acquire():
-            store.note({"unprotected": "another snapshot was still being taken", **why})
-            return
+        while not store.acquire():
+            if time.perf_counter() - started + 0.05 >= HOOK_BUDGET:
+                store.note({"unprotected": "another snapshot was still being taken", **why})
+                return
+            time.sleep(0.05)
         try:
-            store.snapshot(why, budget=HOOK_BUDGET)
+            store.snapshot(why, budget=HOOK_BUDGET - (time.perf_counter() - started))
         finally:
             store.release()
     except subprocess.TimeoutExpired:
         finish_later = True
-        store.note({"unprotected": f"the snapshot took over {HOOK_BUDGET:g}s; finishing in the background", **why})
+        store.note({"unprotected": f"the snapshot took over {HOOK_BUDGET:g}s (waiting included); "
+                                   "finishing in the background", **why})
     except Exception as exc:  # noqa: BLE001 - whatever it was, the record must say this command had no snapshot
         store.note({"unprotected": f"the snapshot failed ({type(exc).__name__}: {str(exc)[:200]})", **why})
     if finish_later:
@@ -684,6 +767,17 @@ def _cli(argv: list[str]) -> int:
             target, present, skipped = store.restore(int(argv[2]))
         except LookupError as exc:
             print(f"boxdawn guard undo: {exc}", file=sys.stderr)
+            return 1
+        except PartialRestore as exc:
+            print(f"boxdawn guard undo: stopped part way ({_shown(exc)}). The state before this attempt is "
+                  f"snapshot {exc.present['n']}.", file=sys.stderr)
+            if exc.done is None:
+                print("  which files were written is not known; these were to be:", file=sys.stderr)
+            for label, names in (("put back", exc.done or []), ("not put back", exc.rest)):
+                for rel in names[:NAMED]:
+                    print(f"  {label}: {_shown(rel)}", file=sys.stderr)
+                if len(names) > NAMED:
+                    print(f"  {label}: and {len(names) - NAMED} more", file=sys.stderr)
             return 1
         except Exception as exc:  # noqa: BLE001 - say where things stand instead of a traceback
             taken = [r for r in store.snapshots() if r["n"] > highest]  # the present, if this call got that far
