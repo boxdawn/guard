@@ -36,9 +36,10 @@ Known limits:
   (it comes back as a file of its own).
 - A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
   in the snapshots, and comes back under it.
-- A git stopped from outside in the middle of a snapshot (not by this code)
-  can leave its own lock in the store: snapshots fail, and the list says so,
-  for up to `LOCK_STALE` seconds.
+- The store's git processes end with the process that runs them (a Windows
+  job), and the next holder of the lock clears the lock git left behind. A git
+  that someone else runs on the store at the same time is not seen, and its
+  lock is cleared under it.
 - A command can wait for the record up to `LOG_WAIT` seconds more than
   `HOOK_BUDGET`, when another process is writing it at that moment.
 - A project with tens of thousands of folders: finding the folders to leave
@@ -74,7 +75,6 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds the snapshot itself may take; the hook around it adds up to a second
-LOCK_STALE = 15 * 60     # a git `index.lock` older than this was left by a git that was stopped
 LOG_WAIT = 2.0           # seconds a row waits for another writer of the record
 SUPPORTED = ("win32",)   # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
@@ -122,12 +122,70 @@ def _git_exe(project: str | None = None) -> str | None:
     return found
 
 
+_JOB: int | None = None  # this process's Windows job for its git processes; 0 when none could be made
+
+
+def _job() -> int:
+    """A Windows job that ends every process in it when this process ends, however it ends:
+    a git must not go on writing the store after the one that holds the lock is gone."""
+    global _JOB
+    if _JOB is None:
+        _JOB = 0
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        job = kernel.CreateJobObjectW(None, None)  # not inheritable: only this process holds it
+        if job:
+            info = Extended()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if kernel.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # extended limits
+                _JOB = job
+            else:
+                kernel.CloseHandle(wintypes.HANDLE(job))
+    return _JOB
+
+
+def _start_in_job(proc: subprocess.Popen) -> None:
+    """The process was made suspended: into the job before it runs a single instruction (so
+    whatever it starts is in the job too), then on its way."""
+    import ctypes
+    from ctypes import wintypes
+    try:
+        job = _job()
+        if job:
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            kernel.AssignProcessToJobObject(job, int(proc._handle))
+    finally:  # whatever happened above, the process must not stay suspended
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        ntdll.NtResumeProcess(int(proc._handle))
+
+
 def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: float | None):
-    """Like `subprocess.run`, but a process over its time is stopped with its children."""
+    """Like `subprocess.run`, but a process over its time is stopped with its children, and on
+    Windows it ends when this process ends (see `_job`)."""
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x4 if os.name == "nt" else 0  # 0x4: CREATE_SUSPENDED
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
                             start_new_session=os.name != "nt")
+    if os.name == "nt":
+        _start_in_job(proc)
     try:
         out, err = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -319,18 +377,18 @@ class Store:
                 st = os.lstat(self.lock)
                 os.rmdir(self.lock) if stat.S_ISDIR(st.st_mode) and not _is_link(self.lock) else os.remove(self.lock)
                 fd = os.open(self.lock, os.O_CREAT | os.O_RDWR, 0o600)
-            except OSError:
-                return False
+            except OSError as exc:  # not "being taken": say what is in the way
+                raise OSError(f"the store's lock file cannot be opened: {_shown(self.lock)} "
+                              f"({type(exc).__name__})") from exc
         if not _take(fd):
             os.close(fd)
             return False
         self._held = fd
-        # A git stopped from outside mid-way leaves its own lock; one still running keeps it fresh
-        # enough, so only an old one is cleared. (A git this code stops clears its own: `snapshot`.)
-        index_lock = os.path.join(self.shadow, "index.lock")
+        # Every git of the store runs in its holder's job (`_job`) and ends with it: with the lock
+        # ours, no git of the store is running, and a lock git left behind (its holder was stopped
+        # mid-way, by Claude Code ending a hook, say) is only in the way.
         try:
-            if time.time() - os.lstat(index_lock).st_mtime > LOCK_STALE:
-                os.remove(index_lock)
+            os.remove(os.path.join(self.shadow, "index.lock"))
         except OSError:
             pass
         return True
@@ -404,8 +462,12 @@ class Store:
             self.note({"unprotected": reason, **why})
 
     def snapshots(self) -> list[dict]:
+        return self._numbered(self.rows())
+
+    @staticmethod
+    def _numbered(rows: list[dict]) -> list[dict]:
         # A commit is used as a git argument: nothing but an object id may pass.
-        return [r for r in self.rows() if isinstance(r.get("n"), int) and not isinstance(r["n"], bool)
+        return [r for r in rows if isinstance(r.get("n"), int) and not isinstance(r["n"], bool)
                 and 0 < r["n"] < 10 ** 9
                 and isinstance(r.get("commit"), str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", r["commit"])]
 
@@ -423,7 +485,9 @@ class Store:
                 if rel:
                     out[rel] = "cannot be listed"
                 continue
-            for entry in entries:
+            for i, entry in enumerate(entries):
+                if i % 256 == 255:
+                    left()  # one folder can hold hundreds of thousands
                 child = f"{rel}/{entry.name}" if rel else entry.name
                 try:
                     link = entry.is_symlink() or bool(
@@ -524,7 +588,9 @@ class Store:
             cached = self.git("ls-files", "-z", timeout=left())
             drop += [p for p in sorted({os.fsdecode(x) for x in cached.split(b"\0") if x})
                      if fold(p).startswith(under) and p not in listed]
-        for rel in changed:
+        for i, rel in enumerate(changed):
+            if i % 256 == 255:
+                left()
             full = os.path.join(self.project, rel)
             parts = rel.split("/")
             if self._link_above(rel, links) or any("/".join(parts[:i]) in folders for i in range(1, len(parts))):
@@ -804,7 +870,8 @@ def _cli(argv: list[str]) -> int:
         return 1 if result.startswith("failed") else 0
     if argv[:2] == ["undo", "list"]:
         store = Store(os.path.realpath(argv[2] if len(argv) > 2 else os.getcwd()), data_dir)
-        rows, numbered = store.rows(), store.snapshots()
+        rows = store.rows()
+        numbered = {id(r) for r in store._numbered(rows)}  # one pass: the list is read whole every time
         if not rows:
             print(f"No snapshots of {_shown(store.project)} in {_shown(store.root)}. "
                   "Give the folder Claude Code was started in.")
@@ -813,7 +880,7 @@ def _cli(argv: list[str]) -> int:
             when = time.strftime("%m-%d %H:%M:%S", time.localtime(r["at"]))
             # "before:" a command; a snapshot taken for another reason shows its note as it is.
             what = f"before: {_shown(r['before'])}" if r.get("before") else _shown(r.get("note", ""))
-            if r in numbered:
+            if id(r) in numbered:
                 print(f"{r['n']:4d}  {when}  {what}{_left_out(r)}")
             elif "unprotected" in r:
                 print(f"   -  {when}  NO SNAPSHOT ({_shown(r['unprotected'])}) {what}")
@@ -831,7 +898,12 @@ def _cli(argv: list[str]) -> int:
             return 1
         if not os.path.lexists(store.project):
             os.makedirs(store.project)  # the whole folder was removed: its files go back into a new one
-        if not store.acquire():
+        try:
+            free = store.acquire()
+        except OSError as exc:
+            print(f"boxdawn guard undo: {_shown(exc)}. Nothing was written.", file=sys.stderr)
+            return 1
+        if not free:
             print("boxdawn guard undo: a snapshot is being taken; try again in a moment", file=sys.stderr)
             return 1
         highest = max(r["n"] for r in store.snapshots())

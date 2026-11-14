@@ -192,7 +192,9 @@ def test_a_lock_left_by_a_dead_process_is_taken_over(project):
     src = os.path.dirname(os.path.dirname(os.path.abspath(undo.__file__)))
     code = ("import sys, time; from boxdawn_guard import undo\n"
             "s = undo.Store(sys.argv[1], sys.argv[2]); assert s.acquire(); print('held', flush=True); time.sleep(60)\n")
-    holder = subprocess.Popen([sys.executable, "-c", code, os.path.realpath(project), os.environ["CLAUDE_PLUGIN_DATA"]],
+    # The python itself: a venv's python.exe is a launcher, and killing it leaves its child holding the lock.
+    python = getattr(sys, "_base_executable", None) or sys.executable
+    holder = subprocess.Popen([python, "-c", code, os.path.realpath(project), os.environ["CLAUDE_PLUGIN_DATA"]],
                               stdout=subprocess.PIPE, env=dict(os.environ, PYTHONPATH=src), cwd=os.path.dirname(project))
     assert holder.stdout.readline().strip() == b"held"
     store = _store(project)

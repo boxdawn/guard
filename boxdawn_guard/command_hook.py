@@ -36,8 +36,14 @@ _UNDO_RESTORE = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\s+restore\b")
 # folder after it: only such a line goes without a snapshot. (No `$` or backquote in the words:
 # inside double quotes the shell would run what they hold. Spaces and tabs only, never a line
 # break, inside or around them: a second line is a second command.)
-_WORD = r"""(?:"[^"$`\r\n]*"|'[^'\r\n]*'|[^\s"'$`;&|<>()]+)"""
-_UNDO_ONLY = re.compile(rf"(?i)[ \t]*(?:&[ \t]*)?{_WORD}[ \t]+undo[ \t]+(?:list|restore[ \t]+[0-9]+)(?:[ \t]+{_WORD})?[ \t]*")
+# The program is a plain path whose last part is `bdxguard`: no braces (a PowerShell script block,
+# Bash brace words), no `=` (a Bash variable set before it, such as PATH), no wildcards.
+_PLAIN = r"""[^\s"'$`;&|<>(){}=*?\[\]]"""            # outside quotes
+_QUOTED = r"""[^"'$`;&|<>(){}=*?\[\]\r\n]"""          # inside quotes: spaces are part of the path
+_BDX = r"""bdxguard(?:\.exe)?"""
+_PROGRAM = (rf"""(?:"(?:{_QUOTED}*[\\/])?{_BDX}"|'(?:{_QUOTED}*[\\/])?{_BDX}'|(?:{_PLAIN}*[\\/])?{_BDX})""")
+_WORD = r"""(?:"[^"$`\r\n{}]*"|'[^'\r\n{}]*'|[^\s"'$`;&|<>(){}]+)"""
+_UNDO_ONLY = re.compile(rf"(?i)[ \t]*(?:&[ \t]*)?{_PROGRAM}[ \t]+undo[ \t]+(?:list|restore[ \t]+[0-9]+)(?:[ \t]+{_WORD})?[ \t]*")
 
 
 def _globs(pattern: str) -> list[str]:
