@@ -9,7 +9,9 @@ index and files are not written. Needs git 2.25 or later.
 In a snapshot: every file under the project folder, ignored ones too.
 Not in it, and named in the record: folders in `HEAVY`, nested repositories,
 a folder that cannot be listed, on Windows a folder that is a link or
-junction, a file over `MAX_FILE_BYTES`, a file that could not be read.
+junction, a file over `MAX_FILE_BYTES`, a file that could not be saved (one
+another program holds open, or a name git does not take, such as `nul` or
+`aux.txt`).
 Never in it, and not named: any `.git` (the project's commits, stashes and
 branches do not come back), empty folders.
 
@@ -37,9 +39,19 @@ Known limits:
 - A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
   in the snapshots, and comes back under it.
 - The store's git processes end with the process that runs them (a Windows
-  job), and the next holder of the lock clears the lock git left behind. A git
-  that someone else runs on the store at the same time is not seen, and its
-  lock is cleared under it.
+  job), and the next holder of the lock clears every lock file git left behind
+  in the store. A git that someone else runs on the store at the same time is
+  not seen, and its locks are cleared under it. A process killed in the moment
+  (well under a millisecond) between starting a git and putting it in the job
+  leaves that git behind, stopped before its first instruction.
+- A hook that Claude Code itself stops (over the hook's time limit) leaves no
+  row for its command. The plugin's own hook has no time limit and blocks the
+  command when it fails.
+- While another program holds the record so that it cannot be read or written
+  (a backup or scanning tool, for moments), a snapshot waits briefly, then
+  fails; if the record cannot be written at all, the command has no row.
+- A file that is a symbolic link: not checked (the store keeps `symlinks =
+  false`, so it most likely comes back as a plain file holding the target).
 - A command can wait for the record up to `LOG_WAIT` seconds more than
   `HOOK_BUDGET`, when another process is writing it at that moment.
 - A project with tens of thousands of folders: finding the folders to leave
@@ -181,6 +193,8 @@ def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: f
     """Like `subprocess.run`, but a process over its time is stopped with its children, and on
     Windows it ends when this process ends (see `_job`)."""
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x4 if os.name == "nt" else 0  # 0x4: CREATE_SUSPENDED
+    if os.name == "nt":
+        _job()  # made before the process is: the time it stands suspended and outside the job stays short
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
                             start_new_session=os.name != "nt")
@@ -204,6 +218,9 @@ def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: f
             proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             pass
+        raise
+    except BaseException:  # Ctrl+C, say: the caller lets the lock go next, and no git may outlive that
+        proc.kill()
         raise
     return proc.returncode, out, err
 
@@ -384,14 +401,31 @@ class Store:
             os.close(fd)
             return False
         self._held = fd
-        # Every git of the store runs in its holder's job (`_job`) and ends with it: with the lock
-        # ours, no git of the store is running, and a lock git left behind (its holder was stopped
-        # mid-way, by Claude Code ending a hook, say) is only in the way.
+        self._clear_git_locks()
+        return True
+
+    def _clear_git_locks(self) -> None:
+        """Every git of the store runs in its holder's job (`_job`) and ends with it: with the lock
+        ours, no git of the store is running, and a lock file git left behind (its holder was
+        stopped mid-way, by Claude Code ending a hook, say) is only in the way. Not the index's
+        alone: one left under `refs/` stopped every later snapshot and restore, one on
+        `packed-refs` the clean-up. Loose objects are not looked at: git puts no lock there."""
+        folders = [self.shadow, os.path.join(self.shadow, "objects", "info"),
+                   os.path.join(self.shadow, "objects", "pack")]
         try:
-            os.remove(os.path.join(self.shadow, "index.lock"))
+            folders += [folder for folder, _, _ in os.walk(os.path.join(self.shadow, "refs"))]
         except OSError:
             pass
-        return True
+        for folder in folders:
+            try:
+                names = [e.name for e in os.scandir(folder) if e.name.endswith(".lock") or e.name == "gc.pid"]
+            except OSError:
+                continue
+            for name in names:
+                try:
+                    os.remove(os.path.join(folder, name))
+                except OSError:
+                    pass  # a folder under that name, say: git will give its own reason
 
     def release(self) -> None:
         fd, self._held = self._held, None
@@ -400,22 +434,34 @@ class Store:
             os.close(fd)
 
     # -- the record --------------------------------------------------------
-    def rows(self) -> list[dict]:
+    def rows(self, wait: float = 0.25) -> list[dict]:
+        """The record. No record yet is no rows; a record that is there and cannot be read
+        (another program holds it) is tried again for `wait` seconds and then raises: taking it
+        for empty had the clean-up write an empty record and the numbers start again at 1."""
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                return self._read_rows()
+            except FileNotFoundError:
+                return []
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+
+    def _read_rows(self) -> list[dict]:
         found = []
-        try:
-            with open(self.log, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    try:
-                        row = json.loads(line)
-                    except (ValueError, RecursionError):
-                        continue  # a line cut short by a crash, or one nested too deep, must not end the record
-                    at = row.get("at") if isinstance(row, dict) else None
-                    # A time the clock can show; anything else was not written by this code.
-                    if isinstance(at, (int, float)) and not isinstance(at, bool) \
-                            and (isinstance(at, int) or math.isfinite(at)) and 0 < at < 4_000_000_000:
-                        found.append(row)
-        except OSError:
-            pass
+        with open(self.log, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue  # a line cut short by a crash, or one nested too deep, must not end the record
+                at = row.get("at") if isinstance(row, dict) else None
+                # A time the clock can show; anything else was not written by this code.
+                if isinstance(at, (int, float)) and not isinstance(at, bool) \
+                        and (isinstance(at, int) or math.isfinite(at)) and 0 < at < 4_000_000_000:
+                    found.append(row)
         return found
 
     def _write_new(self, path: str, lines: list[str], append: bool) -> None:
@@ -452,17 +498,28 @@ class Store:
             os.close(fd)
 
     def note(self, row: dict) -> None:
+        deadline = time.monotonic() + LOG_WAIT  # the wait for the turn and the tries share it
         with self._log_turn():
-            self._write_new(self.log, [json.dumps({"at": round(time.time(), 1), **row}) + "\n"], append=True)
+            while True:
+                try:
+                    self._write_new(self.log, [json.dumps({"at": round(time.time(), 1), **row}) + "\n"], append=True)
+                    return
+                except PermissionError:  # Windows: another program holds the record for a moment
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
 
     def note_once(self, reason: str, why: dict) -> None:
         """For a cause that every command would repeat (no git, a refused project)."""
-        last = self.rows()[-1:]
+        try:
+            last = self.rows()[-1:]
+        except OSError:
+            last = []  # not known: say it again rather than not at all
         if not last or last[0].get("unprotected") != reason:
             self.note({"unprotected": reason, **why})
 
-    def snapshots(self) -> list[dict]:
-        return self._numbered(self.rows())
+    def snapshots(self, wait: float = 0.25) -> list[dict]:
+        return self._numbered(self.rows(wait))
 
     @staticmethod
     def _numbered(rows: list[dict]) -> list[dict]:
@@ -622,7 +679,9 @@ class Store:
         # snapshot: a restore changes the index without taking one.
         tree = self.git("write-tree", timeout=left()).decode().strip()
         if tree == _EMPTY_TREE and gone and not empty_ok:
-            raise RuntimeError("no file could be saved")  # not a snapshot: do not number it
+            # Not a snapshot: do not number it. What stood in the way is named here, as a row would.
+            more = f" and {len(gone) - 3} more" if len(gone) > 3 else ""
+            raise RuntimeError(f"no file could be saved: {', '.join(gone[:3])}{more} left out")
         previous = self.snapshots()
         if previous and previous[-1].get("tree") == tree:
             commit = previous[-1]["commit"]
@@ -647,7 +706,8 @@ class Store:
     def restore(self, n: int) -> tuple[dict, dict, dict[str, str]]:
         """Files as they were in snapshot `n`. The present goes into a snapshot
         first, and a file is written only where that snapshot holds what is on
-        disk now. Files made after `n` stay. Returns (target, present, skipped)."""
+        disk now. Files that are not in `n` stay; one deleted and made anew since is
+        in `n`, and goes back to what it was. Returns (target, present, skipped)."""
         target = next((r for r in self.snapshots() if r["n"] == n), None)
         if target is None:
             raise LookupError(f"no snapshot {n}")
@@ -701,10 +761,21 @@ class Store:
 
     def prune(self, now: float | None = None) -> int:
         """Drops snapshots older than `KEEP_SECONDS`, then the oldest until the store
-        fits `MAX_STORE_BYTES`. The newest one always stays. The caller holds the lock."""
+        fits `MAX_STORE_BYTES`. The newest one always stays. The caller holds the lock.
+        The record says what is a snapshot: whatever the store holds that the record does not
+        list goes too (left by a clean-up that was stopped after it rewrote the record)."""
         now = time.time() if now is None else now
-        kept = self.snapshots()
+        kept = self.snapshots(wait=0.5)
         dropped = 0
+
+        def sweep() -> None:
+            listed = {r["n"] for r in self.snapshots(wait=0.5)}
+            refs = self.git("for-each-ref", "--format=%(refname)", "refs/snap/").decode().split()
+            gone = [ref for ref in refs
+                    if not (re.fullmatch(r"refs/snap/[0-9]{1,9}", ref) and int(ref[10:]) in listed)]
+            if gone:
+                self.git("update-ref", "--stdin", stdin="".join(f"delete {ref}\n" for ref in gone).encode())
+                self.git("gc", "--prune=now", "-q")
 
         def drop(rows: list[dict]) -> None:
             """The record first, then the snapshots: a record that could not be rewritten
@@ -713,7 +784,7 @@ class Store:
             gone = {r["n"] for r in rows}
             with self._log_turn():  # a row noted while this rewrites would be lost
                 # Snapshot rows that are left, and the "unprotected" notes that are not old yet.
-                left = [r for r in self.rows()
+                left = [r for r in self.rows(wait=0.5)
                         if (r.get("n") not in gone if isinstance(r.get("commit"), str) else now - r["at"] <= KEEP_SECONDS)]
                 self._write_new(self.log + ".tmp", [json.dumps(r) + "\n" for r in left], append=False)
                 # Well under `LOG_WAIT`: a writer waiting for its turn must not give up and append
@@ -727,15 +798,15 @@ class Store:
                             os.remove(self.log + ".tmp")
                             raise
                         time.sleep(0.05)
-            for r in rows:
-                self.git("update-ref", "-d", f"refs/snap/{r['n']}")
-            self.git("gc", "--prune=now", "-q")
+            sweep()
             dropped += len(rows)
 
         old = [r for r in kept[:-1] if now - r["at"] > KEEP_SECONDS]
         if old:
             drop(old)
             kept = [r for r in kept if r not in old]
+        else:
+            sweep()
         while len(kept) > 1 and self.size() > MAX_STORE_BYTES:
             oldest = kept[:max(1, len(kept) // 4)]
             drop(oldest)
@@ -839,7 +910,7 @@ def start(project: str, data_dir: str, note: str = "session start", late_for: st
 
 def _left_out(row: dict) -> str:
     parts = []
-    for key, label in (("too_large", "too large"), ("unreadable", "could not be read"), ("folders", "folders")):
+    for key, label in (("too_large", "too large"), ("unreadable", "could not be saved"), ("folders", "folders")):
         names = row.get(key)
         if isinstance(names, list) and names and all(isinstance(x, str) for x in names):
             more = row.get(key + "_more")
@@ -870,7 +941,12 @@ def _cli(argv: list[str]) -> int:
         return 1 if result.startswith("failed") else 0
     if argv[:2] == ["undo", "list"]:
         store = Store(os.path.realpath(argv[2] if len(argv) > 2 else os.getcwd()), data_dir)
-        rows = store.rows()
+        try:
+            rows = store.rows(wait=1.0)
+        except OSError as exc:
+            print(f"boxdawn guard undo: the record cannot be read right now ({type(exc).__name__}): "
+                  f"{_shown(store.log)}", file=sys.stderr)
+            return 1
         numbered = {id(r) for r in store._numbered(rows)}  # one pass: the list is read whole every time
         if not rows:
             print(f"No snapshots of {_shown(store.project)} in {_shown(store.root)}. "
@@ -890,10 +966,16 @@ def _cli(argv: list[str]) -> int:
         if sys.platform not in SUPPORTED:
             print("boxdawn guard undo: not supported on this system yet", file=sys.stderr)
             return 1
-        if not store.snapshots():
+        try:
+            known = store.snapshots(wait=1.0)
+        except OSError as exc:
+            print(f"boxdawn guard undo: the record cannot be read right now ({type(exc).__name__}): "
+                  f"{_shown(store.log)}. Nothing was written.", file=sys.stderr)
+            return 1
+        if not known:
             print(f"boxdawn guard undo: no snapshots of {_shown(store.project)}", file=sys.stderr)
             return 1
-        if not any(r["n"] == int(argv[2]) for r in store.snapshots()):
+        if not any(r["n"] == int(argv[2]) for r in known):
             print(f"boxdawn guard undo: no snapshot {int(argv[2])}", file=sys.stderr)
             return 1
         if not os.path.lexists(store.project):
@@ -906,7 +988,17 @@ def _cli(argv: list[str]) -> int:
         if not free:
             print("boxdawn guard undo: a snapshot is being taken; try again in a moment", file=sys.stderr)
             return 1
-        highest = max(r["n"] for r in store.snapshots())
+        try:  # read again with the lock held: a snapshot may have been taken since the look above
+            highest = max((r["n"] for r in store.snapshots()), default=0)
+        except OSError:
+            highest = max(r["n"] for r in known)
+
+        def where_now() -> str:
+            try:
+                taken = [r for r in store.snapshots() if r["n"] > highest]  # the present, if this call got that far
+            except OSError:
+                return " Whether the state before this attempt was saved is not known: see `undo list`."
+            return f" The state before this attempt is snapshot {taken[-1]['n']}" if taken else ""
         try:
             target, present, skipped = store.restore(int(argv[2]))
         except LookupError as exc:
@@ -924,11 +1016,15 @@ def _cli(argv: list[str]) -> int:
                 if len(names) > NAMED:
                     print(f"  {label}: and {len(names) - NAMED} more", file=sys.stderr)
             return 1
+        except KeyboardInterrupt:
+            where = where_now()
+            print("boxdawn guard undo: interrupted. Some files may have been put back and others not."
+                  f"{where + '.' if where.startswith(' The') else where}", file=sys.stderr)
+            return 1
         except Exception as exc:  # noqa: BLE001 - say where things stand instead of a traceback
             # Files are written in one place only, and a stop there is the case above.
-            taken = [r for r in store.snapshots() if r["n"] > highest]  # the present, if this call got that far
-            where = (f" The state before this attempt is snapshot {taken[-1]['n']}; nothing was written."
-                     if taken else " Nothing was written.")
+            where = where_now()
+            where = f"{where}; nothing was written." if where.startswith(" The") else where or " Nothing was written."
             print(f"boxdawn guard undo: stopped ({type(exc).__name__}: {_shown(exc)}).{where}", file=sys.stderr)
             return 1
         finally:
@@ -937,7 +1033,8 @@ def _cli(argv: list[str]) -> int:
         back = total - len(skipped)
         if back:
             print(f"{back} of the {total} files in snapshot {target['n']} are as they were then. "
-                  f"The state just before this is snapshot {present['n']}. Files made since stay in place.")
+                  f"The state just before this is snapshot {present['n']}. "
+                  f"Files that are not in snapshot {target['n']} stay in place.")
         else:
             print(f"Nothing was put back: snapshot {target['n']} holds {total} files"
                   + (" and each was left as it is." if total else "."), file=sys.stderr)

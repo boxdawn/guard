@@ -61,7 +61,7 @@ def test_going_back_works_while_several_files_are_held_open(project, capsys):
         capsys.readouterr()
         assert undo._cli(["undo", "restore", "1", project]) == 0, capsys.readouterr()
     assert _read(project, "src/app.py") == b"print('v2, not committed')\n"
-    assert "could not be read" in undo._left_out(_store(project).snapshots()[0])
+    assert "could not be saved" in undo._left_out(_store(project).snapshots()[0])
 
 
 def test_rows_written_at_once_from_several_processes_are_all_kept(project, tmp_path):
