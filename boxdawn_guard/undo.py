@@ -42,21 +42,25 @@ Known limits:
   job), and the next holder of the lock clears every lock file git left behind
   in the store. A git that someone else runs on the store at the same time is
   not seen, and its locks are cleared under it. A process killed while it is
-  starting a git (a few milliseconds each time; measured: 7 to 9 of 100 hooks
+  starting a git (a few milliseconds each time; measured: about 1 in 10 hooks
   killed mid-run) leaves that git behind, stopped before its first instruction:
-  it holds nothing and does nothing, and stays until it is ended or the
-  machine restarts.
+  it does nothing and holds only its own program file (git cannot be updated
+  or removed while one stands), and stays until it is ended or the machine
+  restarts.
 - A hook that Claude Code itself stops (over the hook's time limit) leaves no
   row for its command. The plugin's own hook has no time limit and blocks the
   command when it fails.
 - While another program holds the record so that it cannot be read or written
   (a backup or scanning tool, for moments), a snapshot waits briefly, then
-  fails; if the record cannot be written at all, the command has no row.
+  fails; if the record cannot be written at all, the command has no row, and
+  a snapshot that was taken just then is in the store without being listed
+  (the next clean-up drops it).
 - A file that is a symbolic link: not checked (the store keeps `symlinks =
   false`, so it most likely comes back as a plain file holding the target).
 - A command can wait for the record up to `LOG_WAIT` seconds more than
   `HOOK_BUDGET`, when another process is writing or holding it at that moment.
-- Snapshots older than `KEEP_SECONDS` are dropped at session start, and the
+- Snapshots older than `KEEP_SECONDS` are dropped at session start only (a
+  long session keeps what it takes, past the limits too), per project, and the
   oldest ones while the store takes more than `MAX_STORE_BYTES` (measured as
   it lies on disk, before git packs it); the newest always stays.
 - A project with tens of thousands of folders: finding the folders to leave
@@ -883,12 +887,13 @@ def before_command(payload: dict, data_dir: str | None) -> None:
             store.release()
     except subprocess.TimeoutExpired:
         finish_later = True
-        store.note({"unprotected": f"the snapshot took over {HOOK_BUDGET:g}s (waiting included); "
-                                   "finishing in the background", **why})
     except Exception as exc:  # noqa: BLE001 - whatever it was, the record must say this command had no snapshot
         store.note({"unprotected": f"the snapshot failed ({type(exc).__name__}: {str(exc)[:200]})", **why})
     if finish_later:
+        # Started before the row is written: a record that cannot be written must not cost the snapshot too.
         start_in_background(project, why["before"])
+        store.note({"unprotected": f"the snapshot took over {HOOK_BUDGET:g}s (waiting included); "
+                                   "finishing in the background", **why})
 
 
 def start(project: str, data_dir: str, note: str = "session start", late_for: str | None = None) -> str:
