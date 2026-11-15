@@ -41,9 +41,11 @@ Known limits:
 - The store's git processes end with the process that runs them (a Windows
   job), and the next holder of the lock clears every lock file git left behind
   in the store. A git that someone else runs on the store at the same time is
-  not seen, and its locks are cleared under it. A process killed in the moment
-  (well under a millisecond) between starting a git and putting it in the job
-  leaves that git behind, stopped before its first instruction.
+  not seen, and its locks are cleared under it. A process killed while it is
+  starting a git (a few milliseconds each time; measured: 7 to 9 of 100 hooks
+  killed mid-run) leaves that git behind, stopped before its first instruction:
+  it holds nothing and does nothing, and stays until it is ended or the
+  machine restarts.
 - A hook that Claude Code itself stops (over the hook's time limit) leaves no
   row for its command. The plugin's own hook has no time limit and blocks the
   command when it fails.
@@ -53,7 +55,10 @@ Known limits:
 - A file that is a symbolic link: not checked (the store keeps `symlinks =
   false`, so it most likely comes back as a plain file holding the target).
 - A command can wait for the record up to `LOG_WAIT` seconds more than
-  `HOOK_BUDGET`, when another process is writing it at that moment.
+  `HOOK_BUDGET`, when another process is writing or holding it at that moment.
+- Snapshots older than `KEEP_SECONDS` are dropped at session start, and the
+  oldest ones while the store takes more than `MAX_STORE_BYTES` (measured as
+  it lies on disk, before git packs it); the newest always stays.
 - A project with tens of thousands of folders: finding the folders to leave
   out takes longer than a command may wait, so commands there are covered by
   the snapshots taken in the background only, and the list says so.
@@ -331,6 +336,7 @@ class Store:
         self.log = os.path.join(self.root, key + ".jsonl")
         self.lock = os.path.join(self.root, key + ".lock")
         self._held: int | None = None  # the open lock file while this holds the lock
+        self.record_by: float | None = None  # `time.monotonic()` after which no row waits for the record
 
     # -- git ---------------------------------------------------------------
     @staticmethod
@@ -473,7 +479,7 @@ class Store:
             f.writelines(lines)
 
     @contextlib.contextmanager
-    def _log_turn(self):
+    def _log_turn(self, deadline: float | None = None):
         """One writer of the record at a time. Appends from several processes are not whole on
         Windows: rows were lost. Held only for a write; after `LOG_WAIT` the write goes ahead."""
         os.makedirs(self.root, mode=0o700, exist_ok=True)
@@ -483,7 +489,7 @@ class Store:
             yield  # no way to take turns: write anyway
             return
         # Like the store's lock (`acquire`): a writer that died leaves nothing to clear.
-        deadline, mine = time.monotonic() + LOG_WAIT, False
+        deadline, mine = time.monotonic() + LOG_WAIT if deadline is None else deadline, False
         try:
             while not mine:
                 mine = _take(fd)
@@ -499,10 +505,21 @@ class Store:
 
     def note(self, row: dict) -> None:
         deadline = time.monotonic() + LOG_WAIT  # the wait for the turn and the tries share it
-        with self._log_turn():
+        if self.record_by is not None:  # a command's rows, one after a failed other, share one wait
+            deadline = min(deadline, self.record_by)
+        with self._log_turn(deadline):
             while True:
                 try:
-                    self._write_new(self.log, [json.dumps({"at": round(time.time(), 1), **row}) + "\n"], append=True)
+                    # A row cut short by a crash has no line end: this one must not be joined to it.
+                    lead = ""
+                    try:
+                        with open(self.log, "rb") as f:
+                            f.seek(-1, os.SEEK_END)
+                            lead = "" if f.read(1) == b"\n" else "\n"
+                    except OSError:
+                        pass  # no record yet, or an empty one
+                    self._write_new(self.log, [lead + json.dumps({"at": round(time.time(), 1), **row}) + "\n"],
+                                    append=True)
                     return
                 except PermissionError:  # Windows: another program holds the record for a moment
                     if time.monotonic() >= deadline:
@@ -853,6 +870,7 @@ def before_command(payload: dict, data_dir: str | None) -> None:
         return
     finish_later = False
     started = time.perf_counter()
+    store.record_by = time.monotonic() + HOOK_BUDGET + LOG_WAIT
     try:
         while not store.acquire():
             if time.perf_counter() - started + 0.05 >= HOOK_BUDGET:
@@ -903,8 +921,11 @@ def start(project: str, data_dir: str, note: str = "session start", late_for: st
             store.release()
     except Exception as exc:  # noqa: BLE001 - runs unattended; say what happened and leave
         what = "the snapshot left for later" if late_for is not None else "the snapshot at session start"
-        store.note({"unprotected": f"{what} failed ({type(exc).__name__}: {str(exc)[:200]})",
-                    **({"before": late_for} if late_for is not None else {})})
+        try:
+            store.note({"unprotected": f"{what} failed ({type(exc).__name__}: {str(exc)[:200]})",
+                        **({"before": late_for} if late_for is not None else {})})
+        except Exception:  # noqa: BLE001 - the record cannot be written either: the answer below still says it
+            return f"failed: {type(exc).__name__}: {exc} (and the record could not be written)"
         return f"failed: {type(exc).__name__}: {exc}"
 
 
