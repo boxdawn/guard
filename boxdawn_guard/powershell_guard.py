@@ -26,7 +26,7 @@ from typing import Callable, Optional
 
 from boxdawn_guard import secret_files
 from boxdawn_guard.command_guard import (
-    CommandRules, Value, Verdict, _MAX_DEPTH, _Judge, _code_or_file,
+    CommandRules, Value, Verdict, _MAX_DEPTH, _Judge, _code_or_file, _powershell_option,
 )
 
 Parse = Callable[[str], dict]
@@ -484,9 +484,14 @@ class _PowerShell:
     def _powershell_exe(self, args: list[Value], fed: bool, text: Value, depth: int) -> None:
         j = self.j
         lowered = [a.lower() if a else a for a in args]
+        value_next = False
         for i, a in enumerate(lowered):
+            if value_next:  # `-ExecutionPolicy Bypass`: the option's value, not a script file
+                value_next = False
+                continue
             if a is None:
                 continue
+            value_next = _powershell_option(a) == "value"
             flag = a.lstrip("-/")
             if a[:1] not in "-/" or not flag:
                 return  # a script file: what it runs is not on the line
