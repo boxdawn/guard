@@ -11,7 +11,10 @@ Not in it, and named in the record: folders in `HEAVY`, nested repositories,
 a folder that cannot be listed, on Windows a folder that is a link or
 junction, a file over `MAX_FILE_BYTES`, a file that could not be saved (one
 another program holds open, or a name git does not take, such as `nul` or
-`aux.txt`).
+`aux.txt`), a pipe, a socket or a device (they are not files). While a pipe or
+a device stands under the name `.gitattributes`, `.gitignore` or `.gitmodules`,
+no snapshot is taken at all (git would open it and wait for ever), and the
+record says so for each command.
 Never in it, and not named: any `.git` (the project's commits, stashes and
 branches do not come back), empty folders.
 
@@ -35,7 +38,12 @@ Known limits:
   `HOOK_BUDGET`, then goes on without one, and the list says so.
 - What comes back is the bytes of each file: not its read-only or hidden
   attribute, its modified time, its alternate data streams, or a hard link
-  (it comes back as a file of its own).
+  (it comes back as a file of its own). Off Windows, of its permissions only
+  whether it can be run comes back: a file that was 0600, and one that was
+  only changed, comes back with the permissions a new file gets (0644 with the
+  usual umask), a folder that had to be made again likewise; extended
+  attributes and the owner are not kept. "As they were then" in what a restore
+  prints is about the bytes.
 - A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
   in the snapshots, and comes back under it.
 - On Windows the store's git processes end with the process that runs them (a
@@ -60,8 +68,10 @@ Known limits:
   fails; if the record cannot be written at all, the command has no row, and
   a snapshot that was taken just then is in the store without being listed
   (the next clean-up drops it).
-- A file that is a symbolic link: not checked (the store keeps `symlinks =
-  false`, so it most likely comes back as a plain file holding the target).
+- A symbolic link: on Linux it is saved as the link it is, whatever it points
+  to, and comes back as that link (checked on Linux; on macOS only by the
+  suite). On Windows: not checked (most likely it comes back as a plain file
+  holding the target).
 - A command can wait for the record up to `LOG_WAIT` seconds more than
   `HOOK_BUDGET`, when another process is writing or holding it at that moment.
 - Snapshots older than `KEEP_SECONDS` are dropped at session start only (a
@@ -107,6 +117,7 @@ NAMED = 50               # how many left-out paths one row of the record names
 _ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"  # files go in and come out byte for byte
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's id for a tree with nothing in it
 _REPARSE = 0x400         # FILE_ATTRIBUTE_REPARSE_POINT: a Windows symlink or junction
+_GIT_READS = frozenset({".gitattributes", ".gitignore", ".gitmodules"})  # opened by git wherever it finds them
 
 
 def enabled() -> bool:
@@ -282,14 +293,15 @@ def _take(fd: int) -> bool:
 
 
 def _give(fd: int) -> None:
+    """Every caller closes the file next, and that lets the lock go. Off Windows nothing else
+    is done here: unlocking would also take the lock from a git that was handed this open file
+    and is still running (after Ctrl+C in its holder, say), while closing leaves it with that git."""
+    if os.name != "nt":
+        return
     try:
         os.lseek(fd, 0, os.SEEK_SET)
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     except OSError:
         pass  # closing the file lets it go in any case
 
@@ -383,7 +395,13 @@ def _refused(project: str, data_dir: str) -> str | None:
         return "a network path"
     if os.path.dirname(project) == project:
         return "a whole drive"
-    if _inside(os.path.realpath(os.path.expanduser("~")), project):
+    homes = [os.path.expanduser("~")]
+    try:  # the account's own home too: `HOME` may have been pointed somewhere else
+        import pwd
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        pass
+    if any(home and _inside(os.path.realpath(home), project) for home in homes):
         return "the home folder or above it"
     if _inside(os.path.realpath(data_dir), project):
         return "around the snapshot store"
@@ -408,6 +426,7 @@ class Store:
         self.log = os.path.join(self.root, key + ".jsonl")
         self.lock = os.path.join(self.root, key + ".lock")
         self._held: int | None = None  # the open lock file while this holds the lock
+        self._special: list[str] = []  # pipes, sockets and devices the last walk of the project met
         self.record_by: float | None = None  # `time.monotonic()` after which no row waits for the record
 
     # -- git ---------------------------------------------------------------
@@ -624,6 +643,7 @@ class Store:
     def _folders_left_out(self, left) -> dict[str, str]:
         """Folders the snapshot does not go into, found without following a link."""
         out: dict[str, str] = {}
+        self._special = []
         stack = [""]
         while stack:
             left()
@@ -641,11 +661,25 @@ class Store:
                 try:
                     link = entry.is_symlink() or bool(
                         getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & _REPARSE)
+                    if os.name != "nt" and entry.name in _GIT_READS:
+                        # git opens these in every folder it goes through, and waits for ever on a pipe.
+                        plain = entry.is_file(follow_symlinks=False) or entry.is_dir(follow_symlinks=False)
+                        if link:  # an older git follows the link
+                            try:
+                                plain = not os.path.lexists(os.path.realpath(entry.path)) \
+                                    or stat.S_ISREG(os.stat(entry.path).st_mode) or os.path.isdir(entry.path)
+                            except OSError:
+                                plain = True  # cannot be reached: git cannot open it either
+                        if not plain:
+                            raise RuntimeError(f"`{child}` is a pipe or a device, and git would wait on it")
                     if link:
                         # Elsewhere git keeps a link as a link. Git for Windows walks into it.
                         if os.name == "nt" and entry.is_dir():
                             out[child] = "link"
                         continue
+                    if os.name != "nt" and not entry.is_dir(follow_symlinks=False) \
+                            and not entry.is_file(follow_symlinks=False):
+                        self._special.append(child)  # a pipe, a socket, a device: git saves no such thing
                     if not entry.is_dir(follow_symlinks=False) or entry.name == ".git":
                         continue
                 except OSError:
@@ -785,7 +819,7 @@ class Store:
             raise RuntimeError("the record of snapshots is damaged")  # a row past this would not be listed
         self.git("update-ref", f"refs/snap/{n}", commit, timeout=left())
         row = {"n": n, "commit": commit, "tree": tree, "seconds": round(time.perf_counter() - started, 3), **why}
-        for name, paths in (("too_large", too_big), ("unreadable", unreadable),
+        for name, paths in (("too_large", too_big), ("unreadable", unreadable), ("special", sorted(self._special)),
                             ("folders", [f"{rel} ({kind})" for rel, kind in sorted(folders.items())])):
             if paths:
                 row[name] = paths[:NAMED]
@@ -1007,7 +1041,8 @@ def start(project: str, data_dir: str, note: str = "session start", late_for: st
 
 def _left_out(row: dict) -> str:
     parts = []
-    for key, label in (("too_large", "too large"), ("unreadable", "could not be saved"), ("folders", "folders")):
+    for key, label in (("too_large", "too large"), ("unreadable", "could not be saved"),
+                       ("special", "not files (pipes, sockets, devices)"), ("folders", "folders")):
         names = row.get(key)
         if isinstance(names, list) and names and all(isinstance(x, str) for x in names):
             more = row.get(key + "_more")
