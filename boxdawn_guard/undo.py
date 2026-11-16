@@ -38,10 +38,15 @@ Known limits:
   (it comes back as a file of its own).
 - A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
   in the snapshots, and comes back under it.
-- The store's git processes end with the process that runs them (a Windows
-  job), and the next holder of the lock clears every lock file git left behind
+- On Windows the store's git processes end with the process that runs them (a
+  job). Elsewhere a git is handed the open lock file and so keeps the lock
+  taken until it, and anything it started, has ended: a hook that is killed
+  mid-snapshot leaves its git running to its end on macOS (on Linux the system
+  ends it, though not what it started), and until then later commands go on
+  without a snapshot and the list says another one was still being taken. The
+  next holder of the lock clears every lock file git left behind
   in the store. A git that someone else runs on the store at the same time is
-  not seen, and its locks are cleared under it. A process killed while it is
+  not seen, and its locks are cleared under it. On Windows, a process killed while it is
   starting a git (a few milliseconds each time; measured: about 1 in 10 hooks
   killed mid-run) leaves that git behind, stopped before its first instruction:
   it does nothing and holds only its own program file (git cannot be updated
@@ -97,7 +102,7 @@ KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds the snapshot itself may take; the hook around it adds up to a second
 LOG_WAIT = 2.0           # seconds a row waits for another writer of the record
-SUPPORTED = ("win32",)   # where this was measured; elsewhere it stays off and says so
+SUPPORTED = ("win32", "darwin", "linux")  # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
 _ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"  # files go in and come out byte for byte
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's id for a tree with nothing in it
@@ -198,15 +203,41 @@ def _start_in_job(proc: subprocess.Popen) -> None:
         ntdll.NtResumeProcess(int(proc._handle))
 
 
-def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: float | None):
-    """Like `subprocess.run`, but a process over its time is stopped with its children, and on
-    Windows it ends when this process ends (see `_job`)."""
+def _ends_with_parent(parent: int):
+    """For the new process, before it becomes git (Linux): the system ends it when the process
+    that started it ends, however that ends. macOS has no such call; see `_run`."""
+    def setup() -> None:
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+        except Exception:  # noqa: BLE001 - the lock it holds (see `_run`) is what keeps the store whole
+            return
+        if os.getppid() != parent:  # it ended before the call above was made
+            os._exit(1)
+    return setup
+
+
+def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: float | None,
+         lock: int | None = None):
+    """Like `subprocess.run`, but a process over its time is stopped with its children, and a
+    git must not go on writing the store next to another holder of the lock after the one that
+    started it is gone (a hook that Claude Code stops, say):
+    - Windows: it ends when this process ends (see `_job`).
+    - Elsewhere: it is handed the open lock file (`lock`), so the lock stays taken for as long as
+      it or anything it started runs, and the next snapshot waits for it or goes on without one.
+      On Linux the system also ends it when this process ends. On macOS it runs to its end."""
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x4 if os.name == "nt" else 0  # 0x4: CREATE_SUSPENDED
+    more: dict = {}
     if os.name == "nt":
         _job()  # made before the process is: the time it stands suspended and outside the job stays short
+    else:
+        if lock is not None:
+            more["pass_fds"] = (lock,)
+        if sys.platform.startswith("linux"):
+            more["preexec_fn"] = _ends_with_parent(os.getpid())
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
-                            start_new_session=os.name != "nt")
+                            start_new_session=os.name != "nt", **more)
     if os.name == "nt":
         _start_in_job(proc)
     try:
@@ -261,6 +292,43 @@ def _give(fd: int) -> None:
             fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass  # closing the file lets it go in any case
+
+
+def _append(path: str, data: bytes) -> None:
+    """One write at the end of the file that the system keeps whole next to another process's.
+    `O_APPEND` is that everywhere but on Windows, where the C library seeks to the end and then
+    writes: two processes that did so at once wrote over each other, and a row was lost (a writer
+    that had waited `LOG_WAIT` for its turn writes without it). A handle opened for appending
+    only is the system's own append there. The file is made with mode 0600 if it is not there."""
+    if os.name != "nt":
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_char_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    # FILE_APPEND_DATA | SYNCHRONIZE; shared for reading, writing and deleting; OPEN_ALWAYS.
+    handle = kernel.CreateFileW(_long(path), 0x0004 | 0x00100000, 0x1 | 0x2 | 0x4, None, 4, 0x80, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        # A sharing violation or no access is what `open` raises PermissionError for: the callers wait on that.
+        raise PermissionError(code, ctypes.FormatError(code), path) if code in (5, 32, 33) else ctypes.WinError(code)
+    try:
+        written = wintypes.DWORD(0)
+        if not kernel.WriteFile(handle, data, len(data), ctypes.byref(written), None) or written.value != len(data):
+            code = ctypes.get_last_error()
+            raise PermissionError(code, ctypes.FormatError(code), path) if code in (5, 32, 33) else ctypes.WinError(code)
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def _long(path: str) -> str:
@@ -367,7 +435,7 @@ class Store:
         code, out, err = _run(
             [self._exe(), *[part for item in fixed for part in ("-c", item)],
              f"--git-dir={self.shadow}", f"--work-tree={self.project}", *args],
-            cwd=self.project, env=env, stdin=stdin, timeout=timeout)
+            cwd=self.project, env=env, stdin=stdin, timeout=timeout, lock=self._held)
         if check and code != 0:
             name = next((a for a in args if not a.startswith("-")), args[0])
             raise RuntimeError(f"git {name}: {err.decode('utf-8', 'replace')[-300:]}")
@@ -379,7 +447,7 @@ class Store:
             return
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         code, _, err = _run([self._exe(), "init", "-q", "--bare", self.shadow], cwd=self.root, env=self._env(),
-                            stdin=None, timeout=None)
+                            stdin=None, timeout=None, lock=self._held)
         if code != 0:
             raise RuntimeError(f"git init: {err.decode('utf-8', 'replace')[-300:]}")
         os.makedirs(info, exist_ok=True)
@@ -415,7 +483,8 @@ class Store:
         return True
 
     def _clear_git_locks(self) -> None:
-        """Every git of the store runs in its holder's job (`_job`) and ends with it: with the lock
+        """Every git of the store ends with its holder (Windows, `_job`) or holds the lock itself
+        until it ends (elsewhere, `_run`): with the lock
         ours, no git of the store is running, and a lock file git left behind (its holder was
         stopped mid-way, by Claude Code ending a hook, say) is only in the way. Not the index's
         alone: one left under `refs/` stopped every later snapshot and restore, one on
@@ -478,8 +547,10 @@ class Store:
         """Mode 0600, and never through a link someone put at that path."""
         if os.path.islink(path) or (not append and os.path.lexists(path)):
             os.remove(path)
-        flags = os.O_CREAT | os.O_WRONLY | (os.O_APPEND if append else os.O_EXCL)
-        with os.fdopen(os.open(path, flags, 0o600), "a" if append else "w", encoding="utf-8") as f:
+        if append:
+            _append(path, "".join(lines).encode("utf-8"))
+            return
+        with os.fdopen(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
             f.writelines(lines)
 
     @contextlib.contextmanager
