@@ -844,7 +844,7 @@ class _Judge:
         self._output(dest)
         try:
             descriptor = node.child_by_field_name("descriptor")
-            stdout = "&" not in op and (descriptor is None or descriptor.text == b"1")
+            stdout = descriptor is None or descriptor.text == b"1"  # `>`, `>>`, `&>`, `1>`; not `2>`
             if stdout and any(posixpath.basename(n or "") in _FETCHERS for n in self._names_in(_redirect_body(node))):
                 self._note_fetched(dest, dest_node.text.decode("utf-8", "replace"))  # `curl … > x.sh`
         except Exception:  # noqa: BLE001 - it only adds an ask
@@ -866,7 +866,7 @@ class _Judge:
         if value in ("", "-") or value in self.rules.harmless_devices or re.search(r"[*?\[]", value):
             return set()
         keys: set = set()
-        for base in dict.fromkeys(self.workdirs or [self.cwd]):
+        for base in islice(dict.fromkeys(self.workdirs or [self.cwd]), _FOLDERS_MOST):
             if base is None and not (value.startswith(("/", "~")) or _posix(value) != value):
                 keys.add(("relative", self._fold(posixpath.normpath(value))))
             else:
@@ -874,9 +874,9 @@ class _Judge:
         return keys
 
     def _note_fetched(self, value: Value, raw: Optional[str] = None) -> None:
-        keys = self._file_keys(value, raw)
+        keys = self._file_keys(value, raw) if len(self.fetched) < _FETCHED_MOST else set()
         if keys:
-            self.fetched.append((keys, value if value is not None else (raw or "").strip()))
+            self.fetched.append((keys, value if value is not None else (raw or "").strip().strip("\"'")))
 
     def _runs_fetched(self, value: Value, raw: Optional[str] = None) -> None:
         keys = self._file_keys(value, raw) if self.fetched else set()
@@ -914,10 +914,11 @@ class _Judge:
         rest = args
         r = self.rules
         while name is not None and (name in r.wrappers or name in r.privilege):  # as `_judge` goes through them
-            if name == "su" or name == "xargs":
-                return  # `su -c` text is judged as its own line; xargs takes its words from stdin
+            if name == "su":
+                return  # `su -c` text is judged as its own line
             if name in r.privilege:
-                rest = _strip_options(rest, takes_value={"-u", "-g", "-U", "-C", "-h", "-p"})
+                rest = _strip_options(rest, takes_value={"-u", "-g", "-U", "-C", "-h", "-p", "--user", "--group",
+                                                         "--other-user", "--chdir", "--host", "--prompt"})
             else:
                 rest = _unwrap(name, rest)
             if not rest:
@@ -928,7 +929,26 @@ class _Judge:
                 name = posixpath.basename(name.replace("\\", "/"))
         keep = len(rest)
         raws = raws[len(raws) - keep:] if keep <= len(args) and args[len(args) - keep:] == rest else None
+        if name == "tee" and self._fed_by_a_download(node):  # `curl … | tee x.sh`
+            for target in _operands(rest):
+                self._note_fetched(target)
         self.fetch_step(word, rest, raws)
+
+    def _fed_by_a_download(self, node: Node) -> bool:
+        """An earlier stage of the pipeline this command is in downloads."""
+        stage, pipeline = node, node.parent
+        while pipeline is not None and pipeline.type != "pipeline":
+            if pipeline.type in ("program", "list", "subshell", "compound_statement"):
+                return False
+            stage, pipeline = pipeline, pipeline.parent
+        if pipeline is None:
+            return False
+        for earlier in pipeline.named_children:
+            if earlier.id == stage.id:
+                return False
+            if any(posixpath.basename(n or "") in _FETCHERS for n in self._names_in(earlier)):
+                return True
+        return False
 
     def fetch_step(self, word: Value, args: list[Value], raws: Optional[list] = None, notes: bool = True) -> None:
         """One command: does it run a file an earlier command of this line
@@ -953,14 +973,14 @@ class _Judge:
         name = _INTERPRETER_NAMES.sub(lambda m: m.group(1), name)  # python3.12, pypy3, nodejs
         name = {"py": "python", "nodejs": "node", "pypy": "python"}.get(name, name)
         if self.fetched:
-            if re.search(r"[/\\]", word) or word.startswith("~"):
+            if (re.search(r"[/\\]", word) or word.startswith("~")) and not _DOCUMENT.search(word):
                 self._runs_fetched(word)  # `./x.sh`; a bare name is looked up on PATH, not here
             if name in ("cmd", "pwsh", "powershell"):
                 first = _first_word_of_code(name, args)  # `cmd /c x.bat`, `powershell -Command ./x.ps1`
                 if first is not None:
                     self._runs_fetched(first)
             if name in self.rules.interpreters and _code_on_line(name, args, self.rules) is None:
-                for at in _script_candidates(name, args, self.rules):
+                for at in _script_candidates(name, args, self.rules, raws):
                     self._runs_fetched(args[at], raws[at])
         if notes and name in _FETCHERS:
             for at, value in _fetch_outputs(name, args):
@@ -1701,6 +1721,11 @@ _POWERSHELL_VALUE_NAMES = (  # (name, fewest letters that still mean it)
     ("psconsolefile", 2), ("custompipename", 2), ("settingsfile", 2), ("encodedarguments", 8), ("ea", 2),
 )
 _INTERPRETER_NAMES = re.compile(r"^(python|pypy|ruby|perl|php|lua|node)[\d.]+$")  # python3.12, node18
+# Opening one of these runs nothing of its own.
+_DOCUMENT = re.compile(r"(?i)\.(png|jpe?g|gif|bmp|svg|webp|ico|tiff?|heic|pdf|html?|txt|md|csv|tsv|json|ya?ml|xml|log|"
+                       r"docx?|xlsx?|pptx?|epub|mp[34]|mov|avi|mkv|wav|flac|zip|tar|gz|tgz|7z)$")
+_FETCHED_MOST = 64   # downloads kept for one line; past that the line is not followed further
+_FOLDERS_MOST = 32   # folders a relative name is tried in
 
 
 def _redirect_body(node: Node) -> Node:
@@ -1811,15 +1836,18 @@ def _first_word_of_code(name: str, args: list[Value]) -> Value:
         else:
             found = _powershell_option(a) == "command"
         if found:
-            code = args[i + 1]
-            if code is None:
+            if args[i + 1] is None:
                 return None
+            code = " ".join(a for a in args[i + 1:i + 4] if a is not None)  # one string, or words of their own
             words = code.strip().lstrip("&").split()
+            if words[:1] in (["call"], ["."], ["start"]) and len(words) > 1:  # `cmd /c call x.bat`, `pwsh -c '. ./x.ps1'`
+                words = words[1:]
             return words[0].strip("'\"") if words else None
     return None
 
 
-def _script_candidates(name: str, args: list[Value], rules: CommandRules) -> list[int]:
+def _script_candidates(name: str, args: list[Value], rules: CommandRules,
+                       raws: Optional[list] = None) -> list[int]:
     """Where the script file can be among an interpreter's arguments: the
     first word that is not an option or an option's value, and before it any
     word known only at run time (`python3 $FLAGS x.py`: it may be an option,
@@ -1835,6 +1863,9 @@ def _script_candidates(name: str, args: list[Value], rules: CommandRules) -> lis
         a = args[i]
         if a is None:
             found.append(i)  # the same file only if it is written the same way
+            raw = (raws[i] if raws and i < len(raws) else None) or ""
+            if not re.fullmatch(r"""["']?\$(?:\w+|\{\w+\}|[@*])["']?""", raw.strip()):
+                return found  # `"$DIR/check.py"`: more than a bare variable is the script, not an option
             i += 1
             continue
         if powershell:
@@ -1844,7 +1875,9 @@ def _script_candidates(name: str, args: list[Value], rules: CommandRules) -> lis
             if kind == "command":
                 return []  # code, read elsewhere
             if kind is not None:
-                i += 2 if kind == "value" else 1
+                following = args[i + 1] if i + 1 < len(args) else None
+                # the next word is the value only when it is not an option itself (`-ep -File x.ps1`)
+                i += 2 if kind == "value" and not (following or "").startswith(("-", "/")) else 1
                 continue
             return found + [i]
         if a == "--":
