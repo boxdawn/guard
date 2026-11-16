@@ -41,6 +41,7 @@ _TABLE = (
     ("`{}` runs code known only at run time", "`{0}`: 실행할 코드에 미리 알 수 없는 값이 들어 있습니다"),
     ("output of another command is run as `{}` code", "다른 명령의 출력을 `{0}` 코드로 실행합니다"),
     ("text known only at run time is fed into `{}` as code", "실행해야만 알 수 있는 내용이 `{0}` 에 코드로 들어갑니다"),
+    ("`{}` is downloaded and then run by this same command", "`{0}`: 이 명령이 내려받은 파일을 곧바로 실행합니다"),
     # rights and scripts
     ("`{}` runs a command with more rights", "`{0}`: 관리자 권한으로 명령을 실행합니다"),
     ("`{}` may run a program with more rights", "`{0}`: 더 높은 권한으로 프로그램을 실행할 수 있습니다"),

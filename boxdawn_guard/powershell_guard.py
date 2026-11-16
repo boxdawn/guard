@@ -135,6 +135,22 @@ _SELF = frozenset({"powershell", "pwsh"})
 _HARMLESS = frozenset({"nul", "$null"})
 _DOTNET = re.compile(r"(?i)\[\s*(?:system\.)?io\.(?:file|directory)\s*\]\s*::\s*"
                      r"(delete|move|replace|copy|create\w*|openwrite|write\w*|append\w*)\s*\(")
+_DOWNLOAD = re.compile(r"(?i)\.\s*DownloadFile(?:Async|TaskAsync)?\s*\(")
+# cmdlet -> (the parameter that names the saved file, fewest letters PowerShell takes for it)
+_FETCH_PARAMS = {
+    "invoke-webrequest": ("outfile", 4), "iwr": ("outfile", 4), "curl": ("outfile", 4), "wget": ("outfile", 4),
+    "invoke-restmethod": ("outfile", 4), "irm": ("outfile", 4),
+    "start-bitstransfer": ("destination", 4),
+}
+_SAVERS = frozenset({"out-file", "set-content", "add-content", "tee-object"})
+_DOCUMENT = re.compile(r"(?i)\.(png|jpe?g|gif|bmp|svg|webp|ico|pdf|html?|txt|md|csv|json|xml|log|"
+                       r"docx?|xlsx?|pptx?|mp[34]|wav|zip)$")
+
+
+def _fetches(name: Optional[str]) -> bool:
+    return name in _FETCH_PARAMS
+
+
 _LITERAL = re.compile(r"""'([^']*)'|"([^"]*)\"""")
 _HERE = re.compile(r"(?i)^\$(?:pwd|\(pwd\)|\(get-location\))[\\/]")
 
@@ -182,12 +198,24 @@ class _PowerShell:
         self.env = self._collect_env(tree)
         j.workdirs = self._collect_workdirs(commands, depth)
         try:
+            saved = self._downloads(text, tree)
+            pipe_fetches = False
             fed_a_secret = listed_a_secret = False
             for c in commands:
+                while saved and saved[0][0] < c["start"]:
+                    j._note_fetched(_native_path(saved.pop(0)[1]))
                 self._command(c, depth)
                 name = _canonical(c["name"])
                 if name is None:
                     continue
+                pipe_fetches = (pipe_fetches and c["pipe_index"] > 0) or _fetches(name)
+                if pipe_fetches and name in _SAVERS:  # `irm … | Out-File x.ps1`
+                    try:
+                        b = self._bind(c, name)
+                        for t in b.get("filepath") or b.get("path") or b.get("literalpath") or []:
+                            j._note_fetched(_native_path(t))
+                    except Exception:  # noqa: BLE001 - it only adds an ask
+                        pass
                 piped = c["pipe_index"] > 0
                 fed_a_secret, listed_a_secret = fed_a_secret and piped, listed_a_secret and piped
                 args = self._native_args(c)
@@ -349,6 +377,7 @@ class _PowerShell:
         if c["op"] == "Dot":
             j.flag("ask", "source.script", f"`. {raw}` runs a script file in this shell")
             return
+        self._fetch(c, raw, name)
         if name in _DESTROYERS:
             j.flag("deny", "destroy.by_design", f"`{raw}` destroys data by design")
             return
@@ -361,6 +390,71 @@ class _PowerShell:
             return
         # Any other cmdlet has no handler there and gets no decision.
         self._native(name, self._native_args(c), c, depth)
+
+    # a file this line downloads, then runs ─────────────────────────────────
+    def _fetch(self, c: dict, raw: str, name: str) -> None:
+        """`.\\x.ps1`, `& $f`, `powershell -File x.ps1`, `bash x.sh` after the line
+        saved that file from the network; and what this command saves itself."""
+        try:
+            j = self.j
+            param = _FETCH_PARAMS.get(name)
+            value = self._param_value(c, *param) if param is not None else False
+            # Windows PowerShell's own `curl` and `wget` are Invoke-WebRequest: given -OutFile,
+            # the letters on the line are not curl.exe's.
+            cmdlet = value is not False and name in ("curl", "wget") and not raw.lower().endswith(".exe")
+            j.fetch_step(_native_path(raw), self._native_args(c), notes=not cmdlet)  # also curl.exe and wget.exe
+            if value is not False and value is not None and value.lower() not in _HARMLESS:
+                j._note_fetched(_native_path(value))
+        except Exception:  # noqa: BLE001 - it only adds an ask; the judgement does not wait on it
+            pass
+
+    def _param_value(self, c: dict, full: str, least: int) -> Value | bool:
+        """The value given to `-<full>`, written out or shortened to no fewer
+        than `least` letters; None if known only at run time, False if absent."""
+        elems = c["elems"]
+        for i, e in enumerate(elems):
+            if "p" not in e:
+                continue
+            given = e["p"].lower().lstrip("-")
+            if len(given) < least or not full.startswith(given):
+                continue
+            if "a" in e:
+                return self._value(e["a"], c["start"])
+            if i + 1 < len(elems) and "p" not in elems[i + 1]:
+                values = self._elem_values(elems[i + 1], c["start"])
+                return values[0] if values else None
+            return None
+        return False
+
+    def _downloads(self, text: str, tree: dict) -> list:
+        """Files the line saves from the network without a command of their own
+        naming them: [(where in the text, the file)], in order.
+        `(New-Object Net.WebClient).DownloadFile($url, 'x.ps1')` is no command, so
+        it is read from the text; `irm … > x.ps1` is a redirect on a pipeline that downloads."""
+        found: list = []
+        try:
+            code = _code_only(text)
+            for m in _DOWNLOAD.finditer(code):
+                paths = _dotnet_paths(text, code, m.end())
+                if len(paths) >= 2 and paths[1] is not None:
+                    found.append((m.start(), paths[1]))
+            commands = tree["commands"]
+            for w in tree["writes"]:
+                before = [i for i, c in enumerate(commands) if c["start"] <= w["start"]]
+                if not before:
+                    continue
+                i = before[-1]
+                pipeline = [commands[i]]
+                while commands[i]["pipe_index"] > 0 and i > 0:
+                    i -= 1
+                    pipeline.append(commands[i])
+                if any(_fetches(_canonical(c["name"])) for c in pipeline):
+                    value = self._value(w["to"], w["start"])
+                    if value is not None and value.lower() not in _HARMLESS:
+                        found.append((w["start"], value))
+        except Exception:  # noqa: BLE001 - it only adds an ask
+            pass
+        return sorted(found)
 
     def _native(self, name: str, args: list[Value], c: Optional[dict], depth: int) -> None:
         j = self.j
@@ -596,6 +690,9 @@ class _PowerShell:
         args: list[Value] = []
         for a in b.get("argumentlist") or []:
             args.extend([None] if a is None else a.split())
+        if not _DOCUMENT.search(program):  # opening a picture or a page runs nothing of its own
+            j._runs_fetched(program)  # `Start-Process x.exe` finds it in this folder too
+            j.fetch_step(program, [_native_path(a) for a in args])
         self._native(_canonical(program), [_native_path(a) for a in args], None, depth)
 
     def _set_location(self, c, b, raw, depth) -> None:
