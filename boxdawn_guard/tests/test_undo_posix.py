@@ -241,6 +241,101 @@ def test_the_accounts_own_home_is_refused_when_HOME_points_elsewhere(places, mon
     assert undo._refused(os.path.dirname(home), data) == "the home folder or above it"
 
 
+# ── what the second review on Linux found ───────────────────────────────────
+HOOK = ("import sys\nfrom boxdawn_guard import undo\n"
+        "undo.before_command({'cwd': sys.argv[1], 'tool_input': {'command': sys.argv[3]}, 'session_id': 's'}, sys.argv[2])\n")
+
+
+def _hook_in_time(project, data, tmp, env, command="echo x", seconds=20):
+    """The hook as its own process: one that waits for ever fails the test instead of stopping the suite."""
+    subprocess.run([sys.executable, "-c", HOOK, project, data, command], env=env, cwd=str(tmp), timeout=seconds, check=True)
+
+
+def _saved_then(project, data, tmp, env):
+    for rel, text in (("a.txt", "one\n"), ("sub/x", "sub-x\n"), ("d/x", "d-x\n")):
+        os.makedirs(os.path.dirname(os.path.join(project, rel)), exist_ok=True)
+        with open(os.path.join(project, rel), "w") as f:
+            f.write(text)
+    _hook_in_time(project, data, tmp, env)  # snapshot 1 holds sub/x and d/x
+
+
+def _nested_repository(project, outside):
+    os.mkdir(os.path.join(project, "sub", ".git"))
+    os.mkfifo(os.path.join(project, "sub", ".gitattributes"))
+
+
+def _cannot_be_listed(project, outside):
+    os.mkfifo(os.path.join(project, "sub", ".gitattributes"))
+    os.chmod(os.path.join(project, "sub"), 0o300)
+
+
+def _moved_out_and_linked_back(project, outside):
+    os.rename(os.path.join(project, "d"), os.path.join(outside, "moved"))
+    os.symlink(os.path.join(outside, "moved"), os.path.join(project, "d"))
+    os.mkfifo(os.path.join(outside, "moved", ".gitattributes"))
+
+
+def _replaced_by_a_link(project, outside):
+    shutil.rmtree(os.path.join(project, "d"))
+    os.makedirs(os.path.join(outside, "other"))
+    with open(os.path.join(outside, "other", "x"), "w") as f:
+        f.write("another x\n")
+    os.mkfifo(os.path.join(outside, "other", ".gitattributes"))
+    os.symlink(os.path.join(outside, "other"), os.path.join(project, "d"))
+
+
+@pytest.fixture(params=["this git", "a git that does not know GIT_ATTR_SOURCE"])
+def git_env(request, tmp_path):
+    """The second: what a git before 2.40 does with the variable, which is nothing."""
+    env = dict(os.environ, PYTHONPATH=SRC, PYTHONDONTWRITEBYTECODE="1", CLAUDE_PLUGIN_OPTION_UNDO="true")
+    env.pop("CLAUDE_PROJECT_DIR", None)
+    if request.param != "this git":
+        older = tmp_path / "older-git"
+        older.mkdir()
+        script = older / "git"
+        script.write_text(f'#!/bin/sh\nunset GIT_ATTR_SOURCE\nexec "{shutil.which("git")}" "$@"\n')
+        script.chmod(0o755)
+        env["PATH"] = f"{older}{os.pathsep}{env['PATH']}"
+    return env
+
+
+@pytest.mark.parametrize("fault", [_nested_repository, _cannot_be_listed, _moved_out_and_linked_back,
+                                   _replaced_by_a_link])
+def test_a_pipe_named_gitattributes_where_the_walk_does_not_go_stops_nothing(places, git_env, fault):
+    """Files saved earlier lay in a folder that was then left out, or under a link: git still
+    opened `.gitattributes` there, waited for ever on a pipe, and kept the lock."""
+    project, data, tmp = places
+    outside = str(tmp / "outside")
+    os.makedirs(outside)
+    env = dict(git_env, CLAUDE_PLUGIN_DATA=data)
+    _saved_then(project, data, tmp, env)
+    fault(project, outside)
+    try:
+        with open(os.path.join(project, "a.txt"), "w") as f:
+            f.write("two\n")
+        _hook_in_time(project, data, tmp, env, "echo two")
+        rows = undo.Store(os.path.realpath(project), data).rows()
+        assert rows[-1].get("n") == 2, rows[-1]
+        assert _free(project, data), "something still holds the lock"
+        back = subprocess.run([sys.executable, "-m", "boxdawn_guard.undo", "undo", "restore", "1", project], env=env,
+                              cwd=str(tmp), capture_output=True, text=True, timeout=30)
+        assert back.returncode == 0, back.stdout + back.stderr
+        assert open(os.path.join(project, "a.txt")).read() == "one\n"
+    finally:
+        if os.path.isdir(os.path.join(project, "sub")):
+            os.chmod(os.path.join(project, "sub"), 0o700)  # so the test's folder can be removed
+
+
+def test_a_snapshot_in_the_background_has_an_end(monkeypatch, places):
+    project, data, _ = places
+    seen = {}
+    monkeypatch.setattr(undo.Store, "snapshot",
+                        lambda self, why, budget=None, empty_ok=False: seen.update(budget=budget) or {"n": 1, "seconds": 0})
+    monkeypatch.setattr(undo.Store, "prune", lambda self: 0)
+    undo.start(project, data)
+    assert seen["budget"] == undo.BACKGROUND_BUDGET and 0 < undo.BACKGROUND_BUDGET < 3600 * 2
+
+
 def test_a_snapshot_and_the_way_back_on_this_system(places, monkeypatch):
     """The whole path the hook takes, with the setting on, on the system the tests run on."""
     project, data, _ = places

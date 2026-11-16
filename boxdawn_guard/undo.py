@@ -29,7 +29,15 @@ Nothing here may change the guard's decision or stop a command: the hook calls
 Known limits:
 - Another program that changes a file, or turns a folder into a link, in the
   moment between the restore's look and its write is not seen: that change is
-  overwritten, or on Windows the write follows the link.
+  overwritten, or the write follows the link and lands outside the project
+  (on every system; measured on Linux: 16 of 250 restores raced on purpose).
+  A link that stands there before the restore looks is never written through.
+- git 2.40 and later is told to read no `.gitattributes` from the project. An
+  older git opens that file in each folder holding a file it saved: files under
+  a folder that is left out, or under a link, leave the index before git looks,
+  and a pipe under that name where the walk goes stops the snapshot at once;
+  what is left for an older git is a pipe put there while a snapshot runs. A
+  snapshot in the background is ended after `BACKGROUND_BUDGET`.
 - A file rewritten with the same size and the same modified time may not be
   seen as changed.
 - A file changed by an edit tool is in the snapshot taken before the next Bash
@@ -111,6 +119,7 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds the snapshot itself may take; the hook around it adds up to a second
+BACKGROUND_BUDGET = 1800.0  # seconds a snapshot in the background may take: nothing holds the lock for ever
 LOG_WAIT = 2.0           # seconds a row waits for another writer of the record
 SUPPORTED = ("win32", "darwin", "linux")  # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
@@ -433,8 +442,12 @@ class Store:
     @staticmethod
     def _env() -> dict:
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        # GIT_ATTR_SOURCE (git 2.40 and later; an older git does not know it): attributes are read
+        # from an empty tree, so no `.gitattributes` in the project is opened at all. The files go in
+        # and come out byte for byte whatever such a file says (`_ATTRIBUTES`); opening one is only
+        # a way to be stopped by a pipe under that name.
         env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                   GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+                   GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_ATTR_SOURCE=_EMPTY_TREE)
         return env
 
     def _exe(self) -> str:
@@ -759,18 +772,25 @@ class Store:
             for rel in folders:
                 if "\n" not in rel:
                     f.write("/" + "".join("\\" + c if c in "\\*?[]" else c for c in rel) + "/\n")
-        changed = self._changed(exclude_file, left())
         links: dict[str, bool] = {}
         add, drop, too_big, unreadable = [], [], [], []
-        if folders:
-            # Saved before the folder was left out (it became a repository, a link, ...) and not
-            # changed since: the record names the folder as not in the snapshot, so its files go too.
-            fold = str.casefold if os.name == "nt" else (lambda p: p)
-            under = tuple(fold(rel) + "/" for rel in folders)
-            listed = set(changed)
-            cached = self.git("ls-files", "-z", timeout=left())
-            drop += [p for p in sorted({os.fsdecode(x) for x in cached.split(b"\0") if x})
-                     if fold(p).startswith(under) and p not in listed]
+        # Files saved before their folder was left out (it became a repository, cannot be listed
+        # any more, ...) or before a link came to stand above them: the record names the folder
+        # as not in the snapshot, so its files go too. They leave the index BEFORE git looks at
+        # the project: git opens `.gitattributes` in every folder that holds a file it knows,
+        # and a pipe under that name in a folder the walk above did not enter made it wait for ever.
+        fold = str.casefold if os.name == "nt" else (lambda p: p)
+        under = tuple(fold(rel) + "/" for rel in folders)
+        cached = self.git("ls-files", "-z", timeout=left())
+        for i, rel in enumerate(sorted({os.fsdecode(x) for x in cached.split(b"\0") if x})):
+            if i % 256 == 255:
+                left()
+            if (under and fold(rel).startswith(under)) or self._link_above(rel, links):
+                drop.append(rel)
+        if drop:
+            self.git("update-index", "--force-remove", "-z", "--stdin",
+                     stdin=b"\0".join(map(os.fsencode, drop)), timeout=left())
+        changed = self._changed(exclude_file, left())
         for i, rel in enumerate(changed):
             if i % 256 == 255:
                 left()
@@ -1021,7 +1041,7 @@ def start(project: str, data_dir: str, note: str = "session start", late_for: st
                                            "being taken", "before": late_for})
             return "another snapshot is being taken"
         try:
-            row = store.snapshot({"note": note})
+            row = store.snapshot({"note": note}, budget=BACKGROUND_BUDGET)
             try:
                 cleaned = f"{store.prune()} old dropped"
             except Exception as exc:  # noqa: BLE001 - the snapshot is taken; the clean-up is tried next time
