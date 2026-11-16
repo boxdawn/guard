@@ -20,7 +20,7 @@ import re
 import shutil
 import sys
 
-from boxdawn_guard import block_log, messages_ko, secret_files
+from boxdawn_guard import block_log, messages_ko, secret_files, undo
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -29,6 +29,21 @@ from boxdawn_guard.powershell_guard import evaluate_powershell
 # Reading with these is no less a read, but they get no `onFailure: block`: a
 # broken guard must not stop a session from opening any file.
 _FILE_TOOLS = {"Read": ("file_path",), "Grep": ("path", "glob")}
+# The guard's own `undo` command line, as it is usually typed. Not a wall: a line that hides it is not seen.
+_UNDO = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\b")
+_UNDO_RESTORE = re.compile(r"(?i)bdxguard(?:\.exe)?[\"']?\s+undo\s+restore\b")
+# A line that is nothing but the guard's own `undo list` or `undo restore <n>`, with at most a
+# folder after it: only such a line goes without a snapshot. (No `$` or backquote in the words:
+# inside double quotes the shell would run what they hold. Spaces and tabs only, never a line
+# break, inside or around them: a second line is a second command.)
+# The program is a plain path whose last part is `bdxguard`: no braces (a PowerShell script block,
+# Bash brace words), no `=` (a Bash variable set before it, such as PATH), no wildcards.
+_PLAIN = r"""[^\s"'$`;&|<>(){}=*?\[\]]"""            # outside quotes
+_QUOTED = r"""[^"'$`;&|<>(){}=*?\[\]\r\n]"""          # inside quotes: spaces are part of the path
+_BDX = r"""bdxguard(?:\.exe)?"""
+_PROGRAM = (rf"""(?:"(?:{_QUOTED}*[\\/])?{_BDX}"|'(?:{_QUOTED}*[\\/])?{_BDX}'|(?:{_PLAIN}*[\\/])?{_BDX})""")
+_WORD = r"""(?:"[^"$`\r\n{}]*"|'[^'\r\n{}]*'|[^\s"'$`;&|<>(){}]+)"""
+_UNDO_ONLY = re.compile(rf"(?i)[ \t]*(?:&[ \t]*)?{_PROGRAM}[ \t]+undo[ \t]+(?:list|restore[ \t]+[0-9]+)(?:[ \t]+{_WORD})?[ \t]*")
 
 
 def _globs(pattern: str) -> list[str]:
@@ -261,6 +276,27 @@ def decide(payload: dict) -> dict | None:
     else:
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
             tool_input["command"], known_env=known_env, **where)
+        if undo.enabled() and _UNDO_RESTORE.search(tool_input["command"]) and \
+                (verdict is None or verdict.decision != "deny"):
+            # Going back writes over the project's files: the person says so, the agent does not.
+            # What else the line was asked about stays in front of the person, and in the record.
+            asked = verdict is not None and verdict.decision is not None
+            reasons = [*(verdict.reasons if asked else []), "this puts the project's files back from a snapshot"]
+            if where["unattended"] and "nobody is present to approve it" not in reasons:
+                reasons.append("nobody is present to approve it")
+            if asked and bundle_exp is not None:
+                block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
+            # A line let through as it is would have had secret files kept out of its grep: so here too.
+            kept_out = {} if asked or tool != "Bash" or verdict is None else \
+                (_grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd")) or {}).get(
+                    "hookSpecificOutput", {})
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny" if where["unattended"] else "ask",
+                "permissionDecisionReason": "Boxdawn guard: " + "; ".join(
+                    map(messages_ko.translate, reasons) if _korean() else reasons),
+                **{k: v for k, v in kept_out.items() if k in ("updatedInput", "additionalContext")},
+            }}
     if verdict is None or verdict.decision is None:
         if tool == "Bash":
             return _grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd"))
@@ -275,6 +311,22 @@ def decide(payload: dict) -> dict | None:
     }}
 
 
+def _snapshot_before(payload: dict, out: dict | None) -> None:
+    """`undo` on: a snapshot of the project before a command that was not denied.
+    The decision is already made and stays as it is, whatever happens here."""
+    if not undo.enabled() or payload.get("tool_name") not in ("Bash", "PowerShell"):
+        return
+    if out is not None and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
+        return
+    command = (payload.get("tool_input") or {}).get("command")
+    if isinstance(command, str) and _UNDO.search(command) and _UNDO_ONLY.fullmatch(command):
+        return  # only the guard's own `undo list` or `undo restore`: restore takes its own snapshot first
+    try:
+        undo.before_command(payload, os.environ.get("CLAUDE_PLUGIN_DATA"))
+    except Exception:  # noqa: BLE001 - a snapshot that fails must not stop or change a command
+        pass
+
+
 def main() -> int:
     payload = None
     try:
@@ -284,6 +336,7 @@ def main() -> int:
         raw = stdin.buffer.read().decode("utf-8") if hasattr(stdin, "buffer") else stdin.read()
         payload = json.loads(raw or "{}")
         out = decide(payload)
+        _snapshot_before(payload, out)
     except Exception as exc:  # noqa: BLE001 - a broken guard must not wave a call through
         tool = payload.get("tool_name") if isinstance(payload, dict) else None
         if isinstance(tool, str) and tool in _FILE_TOOLS:
