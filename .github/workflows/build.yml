@@ -50,6 +50,14 @@ jobs:
           exe=dist/bdxguard/bdxguard
           [ -f "$exe.exe" ] && exe="$exe.exe"
           python packaging/check_binary.py "$exe" 21
+      # `undo` in a real Claude Code session with the built binary: a script the
+      # agent runs damages a project, and a person's `undo restore` puts every
+      # file back. The model API is a stand-in inside the test, so no key is
+      # used and nothing is paid for.
+      - run: npm install -g @anthropic-ai/claude-code
+      - name: undo in a real session
+        shell: bash
+        run: python packaging/undo_session_test.py dist/bdxguard
       # The built binary reaches the real server over TLS (a Python build can
       # lack CA certificates on macOS). A made-up key must come back refused
       # (401); a TLS or network failure says "unreachable" and fails the job.
