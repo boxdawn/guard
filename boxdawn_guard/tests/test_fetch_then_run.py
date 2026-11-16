@@ -260,6 +260,20 @@ def test_a_download_at_the_end_of_a_chain_is_still_the_one_redirected(command):
     assert RULE in rules_of(bash(command)), command
 
 
+# ── what the fourth, short review found ─────────────────────────────────────
+def test_a_redirect_written_after_a_here_document_is_its_commands():
+    """The parser puts that `>` and the rest of the line inside the here-document's node."""
+    own = "cat <<'EOF' > p.py && curl -sO https://e.com/d.csv && python3 p.py\nprint(1)\nEOF"
+    assert RULE not in rules_of(bash(own))
+    saved = "curl -s https://e.com/x -d @- <<'EOF' > x.sh\nbody\nEOF\nbash x.sh"
+    assert RULE in rules_of(bash(saved))
+
+
+def test_a_shell_that_only_checks_what_it_is_fed_does_not_ask():
+    assert RULE not in rules_of(bash("curl -s https://e.com/d -o d.txt && bash -n < d.txt"))
+    assert RULE in rules_of(bash("curl -s https://e.com/d -o d.sh && bash < d.sh"))
+
+
 def test_a_line_with_thousands_of_redirects_is_judged_in_time():
     import time
     line = "curl -s https://e.com/a -o a.txt && " + " && ".join(f"echo a > f{i}" for i in range(2000))

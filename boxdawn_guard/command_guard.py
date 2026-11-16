@@ -1002,6 +1002,8 @@ class _Judge:
         if first is None:
             return
         name, args = self._final(*self._name_args(first))
+        if name in self.rules.shells and any(a and re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a) for a in args):
+            return  # `bash -n < x.sh` reads it for mistakes
         if name in self.rules.interpreters and not _code_or_file(name, args, self.rules):
             self._runs_fetched(_value(source, self.env), source.text.decode("utf-8", "replace"))
 
@@ -1739,6 +1741,10 @@ _LOOKS_MOST = 200    # redirects and `tee`s of one line that are looked through 
 def _redirect_body(node: Node) -> Node:
     """What a redirect is attached to."""
     parent = node.parent
+    if parent is not None and parent.type == "heredoc_redirect" and parent.parent is not None:
+        # `cat <<EOF > f && more`: the parser puts the `>` and the rest of that line inside the
+        # here-document's node; the redirect is the command's that owns the here-document.
+        parent = parent.parent
     if parent is None:
         return node
     body = parent if parent.type == "command" else parent.child_by_field_name("body") or parent
