@@ -294,6 +294,7 @@ class _Judge:
     grep_ends: list[int] = field(default_factory=list)
     fetched: list = field(default_factory=list)  # [(keys of a file this line downloaded, the name shown)]
     fetch_said: set = field(default_factory=set)
+    fetch_looks: int = 0
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -845,10 +846,16 @@ class _Judge:
         try:
             descriptor = node.child_by_field_name("descriptor")
             stdout = descriptor is None or descriptor.text == b"1"  # `>`, `>>`, `&>`, `1>`; not `2>`
-            if stdout and any(posixpath.basename(n or "") in _FETCHERS for n in self._names_in(_redirect_body(node))):
+            if stdout and self._may_look() and any(posixpath.basename(n or "") in _FETCHERS for n in self._names_in(_redirect_body(node))):
                 self._note_fetched(dest, dest_node.text.decode("utf-8", "replace"))  # `curl … > x.sh`
         except Exception:  # noqa: BLE001 - it only adds an ask
             pass
+
+    def _may_look(self) -> bool:
+        """Looking through a part of the line for a download costs time on each redirect and
+        each `tee`: a line with thousands of them is not followed past `_LOOKS_MOST`."""
+        self.fetch_looks += 1
+        return self.fetch_looks <= _LOOKS_MOST
 
     def _names_in(self, body: Node) -> list[Value]:
         """The command behind each wrapper, for every command in this part of the line."""
@@ -929,7 +936,7 @@ class _Judge:
                 name = posixpath.basename(name.replace("\\", "/"))
         keep = len(rest)
         raws = raws[len(raws) - keep:] if keep <= len(args) and args[len(args) - keep:] == rest else None
-        if name == "tee" and self._fed_by_a_download(node):  # `curl … | tee x.sh`
+        if name == "tee" and self._may_look() and self._fed_by_a_download(node):  # `curl … | tee x.sh`
             for target in _operands(rest):
                 self._note_fetched(target)
         self.fetch_step(word, rest, raws)
@@ -977,7 +984,7 @@ class _Judge:
                 self._runs_fetched(word)  # `./x.sh`; a bare name is looked up on PATH, not here
             if name in ("cmd", "pwsh", "powershell"):
                 first = _first_word_of_code(name, args)  # `cmd /c x.bat`, `powershell -Command ./x.ps1`
-                if first is not None:
+                if first is not None and not _DOCUMENT.search(first):  # `cmd /c start out.html` opens it
                     self._runs_fetched(first)
             if name in self.rules.interpreters and _code_on_line(name, args, self.rules) is None:
                 for at in _script_candidates(name, args, self.rules, raws):
@@ -1726,6 +1733,7 @@ _DOCUMENT = re.compile(r"(?i)\.(png|jpe?g|gif|bmp|svg|webp|ico|tiff?|heic|pdf|ht
                        r"docx?|xlsx?|pptx?|epub|mp[34]|mov|avi|mkv|wav|flac|zip|tar|gz|tgz|7z)$")
 _FETCHED_MOST = 64   # downloads kept for one line; past that the line is not followed further
 _FOLDERS_MOST = 32   # folders a relative name is tried in
+_LOOKS_MOST = 200    # redirects and `tee`s of one line that are looked through for a download
 
 
 def _redirect_body(node: Node) -> Node:
@@ -1733,7 +1741,11 @@ def _redirect_body(node: Node) -> Node:
     parent = node.parent
     if parent is None:
         return node
-    return parent if parent.type == "command" else parent.child_by_field_name("body") or parent
+    body = parent if parent.type == "command" else parent.child_by_field_name("body") or parent
+    # The parser hangs the redirect of `a && b > f` on the whole chain; the shell gives it to `b`.
+    while body.type == "list" and body.named_children:
+        body = body.named_children[-1]
+    return body
 
 
 def _url_name(url: str) -> Optional[str]:

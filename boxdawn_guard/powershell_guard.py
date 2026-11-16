@@ -150,8 +150,9 @@ def _fetches(name: Optional[str]) -> bool:
 
 
 def _one_statement(code: str, a: int, b: int) -> bool:
-    """No `;` or line break between two places in the line (strings and comments blanked)."""
-    return not re.search(r"[;\r\n]", code[min(a, b):max(a, b)])
+    """No `;` or line break between two places in the line (strings and comments blanked).
+    A line break right after `|` goes on with the same pipeline."""
+    return not re.search(r"[;\r\n]", re.sub(r"\|[ \t]*\r?\n", "| ", code[min(a, b):max(a, b)]))
 
 
 _LITERAL = re.compile(r"""'([^']*)'|"([^"]*)\"""")
