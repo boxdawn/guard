@@ -357,3 +357,176 @@ def test_a_snapshot_and_the_way_back_on_this_system(places, monkeypatch):
     assert undo._cli(["undo", "restore", "1", project]) == 0
     assert open(os.path.join(project, "a.txt")).read() == "one\n"
     assert open(os.path.join(project, "sub", ".env")).read() == "KEY=1\n"
+
+
+# ── what the third review on Linux found ────────────────────────────────────
+def _deleted_in_a_nested_repository(project):
+    os.mkdir(os.path.join(project, "sub", ".git"))
+    os.mkfifo(os.path.join(project, "sub", ".gitattributes"))
+    os.remove(os.path.join(project, "sub", "x"))
+
+
+def _deleted_in_a_folder_that_cannot_be_listed(project):
+    os.mkfifo(os.path.join(project, "sub", ".gitattributes"))
+    os.remove(os.path.join(project, "sub", "x"))
+    os.chmod(os.path.join(project, "sub"), 0o300)
+
+
+@pytest.mark.parametrize("fault", [_deleted_in_a_nested_repository, _deleted_in_a_folder_that_cannot_be_listed])
+def test_a_restore_does_not_write_next_to_a_pipe_named_gitattributes(places, git_env, fault):
+    """A saved file was gone from a left-out folder that held such a pipe: the restore's git
+    wrote it back, and one that does not know GIT_ATTR_SOURCE opened the pipe and never ended."""
+    project, data, tmp = places
+    env = dict(git_env, CLAUDE_PLUGIN_DATA=data)
+    _saved_then(project, data, tmp, env)
+    fault(project)
+    try:
+        with open(os.path.join(project, "a.txt"), "w") as f:
+            f.write("two\n")
+        back = subprocess.run([sys.executable, "-m", "boxdawn_guard.undo", "undo", "restore", "1", project], env=env,
+                              cwd=str(tmp), capture_output=True, text=True, timeout=30)
+        assert back.returncode == 0, back.stdout + back.stderr
+        assert open(os.path.join(project, "a.txt")).read() == "one\n"
+        assert "left as it is: sub/x (a pipe, a socket or a device named .gitattributes" in back.stdout, back.stdout
+        assert not os.path.lexists(os.path.join(project, "sub", "x"))
+        assert _free(project, data), "something still holds the lock"
+    finally:
+        os.chmod(os.path.join(project, "sub"), 0o700)  # so the test's folder can be removed
+
+
+def test_a_pipe_as_the_accounts_own_attributes_file_stops_nothing(places, git_env):
+    """`~/.config/git/attributes` is read by every git unless it is told another file."""
+    project, data, tmp = places
+    home = tmp / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    os.mkfifo(home / ".config" / "git" / "attributes")
+    env = dict(git_env, CLAUDE_PLUGIN_DATA=data, HOME=str(home))
+    env.pop("XDG_CONFIG_HOME", None)
+    _saved_then(project, data, tmp, env)
+    with open(os.path.join(project, "a.txt"), "w") as f:
+        f.write("two\n")
+    _hook_in_time(project, data, tmp, env, "echo two")
+    rows = undo.Store(os.path.realpath(project), data).rows()
+    assert [r.get("n") for r in rows] == [1, 2], rows
+    back = subprocess.run([sys.executable, "-m", "boxdawn_guard.undo", "undo", "restore", "1", project], env=env,
+                          cwd=str(tmp), capture_output=True, text=True, timeout=30)
+    assert back.returncode == 0, back.stdout + back.stderr
+    assert _free(project, data), "something still holds the lock"
+
+
+def test_a_git_that_never_answers_init_is_stopped(places, monkeypatch, tmp_path):
+    project, data, _ = places
+    slow = tmp_path / "slow-git"
+    slow.mkdir()
+    script = slow / "git"
+    script.write_text('#!/bin/sh\nexec sleep 600\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{slow}{os.pathsep}{os.environ['PATH']}")
+    store = undo.Store(os.path.realpath(project), data)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        store._init(0.5)
+    assert time.monotonic() - started < 10
+
+
+def test_a_background_snapshot_stopped_over_its_time_says_so_in_words(places, monkeypatch):
+    """The exception's own text is git's whole command line, cut off before "timed out"."""
+    project, data, _ = places
+
+    def too_slow(self, why, budget=None, empty_ok=False):
+        raise subprocess.TimeoutExpired(["/usr/bin/git"] + ["-c", "core.autocrlf=false"] * 40, 5.0)
+    monkeypatch.setattr(undo.Store, "snapshot", too_slow)
+    said = undo.start(project, data)
+    row = undo.Store(os.path.realpath(project), data).rows()[-1]
+    for text in (said, row["unprotected"]):
+        assert f"took over {undo.BACKGROUND_BUDGET:g} s and was stopped" in text and "core.autocrlf" not in text, text
+
+
+def test_a_pipe_as_the_accounts_own_ignore_file_stops_no_restore(places, git_env):
+    """`git diff` reads `~/.config/git/ignore` unless it is told another file."""
+    project, data, tmp = places
+    home = tmp / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    os.mkfifo(home / ".config" / "git" / "ignore")
+    env = dict(git_env, CLAUDE_PLUGIN_DATA=data, HOME=str(home))
+    env.pop("XDG_CONFIG_HOME", None)
+    _saved_then(project, data, tmp, env)
+    with open(os.path.join(project, "a.txt"), "w") as f:
+        f.write("two\n")
+    back = subprocess.run([sys.executable, "-m", "boxdawn_guard.undo", "undo", "restore", "1", project], env=env,
+                          cwd=str(tmp), capture_output=True, text=True, timeout=30)
+    assert back.returncode == 0, back.stdout + back.stderr
+    assert open(os.path.join(project, "a.txt")).read() == "one\n"
+    assert _free(project, data), "something still holds the lock"
+
+
+def _git_word(args):
+    """The git command among `args` (after `-c name=value` pairs and other options)."""
+    words = iter(args)
+    for a in words:
+        if a == "-c":
+            next(words)
+        elif not a.startswith("-"):
+            return a
+
+
+def test_every_git_of_a_restore_and_of_the_clean_up_has_a_time_limit(places, monkeypatch):
+    project, data, _ = places
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "true")
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", data)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    with open(os.path.join(project, "a.txt"), "w") as f:
+        f.write("one\n")
+    undo.before_command({"cwd": project, "tool_input": {"command": "echo x"}, "session_id": "s"}, data)
+    os.remove(os.path.join(project, "a.txt"))
+    store = undo.Store(os.path.realpath(project), data)
+    seen = []
+    real = undo.Store.git
+
+    def spy(self, *args, timeout=None, **more):
+        seen.append((_git_word(args), timeout))
+        return real(self, *args, timeout=timeout, **more)
+    monkeypatch.setattr(undo.Store, "git", spy)
+    assert store.acquire()
+    try:
+        store.restore(1)
+        monkeypatch.setattr(undo, "KEEP_SECONDS", -1)  # every snapshot but the newest is old: the clean-up drops and sweeps
+        store.prune()
+    finally:
+        store.release()
+    names = {name for name, _ in seen}
+    assert {"checkout", "diff", "ls-tree", "commit-tree", "for-each-ref", "update-ref", "gc"} <= names, names
+    assert [name for name, t in seen if t is None] == [], seen
+
+
+def test_a_restore_whose_git_does_not_end_is_stopped_and_says_what_it_wrote(places, monkeypatch, tmp_path):
+    project, data, _ = places
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "true")
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", data)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    with open(os.path.join(project, "a.txt"), "w") as f:
+        f.write("one\n")
+    undo.before_command({"cwd": project, "tool_input": {"command": "echo x"}, "session_id": "s"}, data)
+    os.remove(os.path.join(project, "a.txt"))
+    slow = tmp_path / "slow-git"
+    slow.mkdir()
+    script = slow / "git"
+    script.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = checkout ] && exec sleep 600; done\n'
+                      f'exec "{shutil.which("git")}" "$@"\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{slow}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(undo, "BACKGROUND_BUDGET", 2.0)
+    store = undo.Store(os.path.realpath(project), data)
+    assert store.acquire()
+    started = time.monotonic()
+    try:
+        with pytest.raises(undo.PartialRestore) as stopped:
+            store.restore(1)
+    finally:
+        store.release()
+    assert time.monotonic() - started < 20
+    assert "did not finish in 2 s" in str(stopped.value) and "checkout" not in str(stopped.value)
+    assert stopped.value.done == [] and stopped.value.rest == ["a.txt"]
+    assert not os.path.exists(os.path.join(project, "a.txt"))
+    assert not os.path.exists(os.path.join(store.shadow, "index.lock"))
+    assert _free(project, data)
