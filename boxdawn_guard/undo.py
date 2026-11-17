@@ -11,7 +11,14 @@ Not in it, and named in the record: folders in `HEAVY`, nested repositories,
 a folder that cannot be listed, on Windows a folder that is a link or
 junction, a file over `MAX_FILE_BYTES`, a file that could not be saved (one
 another program holds open, or a name git does not take, such as `nul` or
-`aux.txt`).
+`aux.txt`), a pipe, a socket or a device (they are not files). While a pipe, a
+socket or a device stands under the name `.gitattributes`, `.gitignore` or
+`.gitmodules` where the walk goes, no snapshot is taken at all, and the record
+says so for each command. (Measured with git 2.43 made to ignore
+`GIT_ATTR_SOURCE`, standing in for an older git: it opens a pipe named
+`.gitattributes` and waits for ever; the other names and git 2.43 as it is did
+not wait. The check is wider than that: any of the three names, in any case of
+letters, a socket and a link to one too, whatever the git.)
 Never in it, and not named: any `.git` (the project's commits, stashes and
 branches do not come back), empty folders.
 
@@ -26,7 +33,27 @@ Nothing here may change the guard's decision or stop a command: the hook calls
 Known limits:
 - Another program that changes a file, or turns a folder into a link, in the
   moment between the restore's look and its write is not seen: that change is
-  overwritten, or on Windows the write follows the link.
+  overwritten, or the write follows the link and lands outside the project
+  (on every system; measured on Linux: 16 of 250 restores raced on purpose).
+  A link that stands there before the restore looks is never written through.
+- git 2.41 and later is told to read no `.gitattributes` from the project
+  (`GIT_ATTR_SOURCE`). An older git opens that file in each folder holding a
+  file it saves or writes: files under a folder that is left out, or under a
+  link, leave the index before git looks; a pipe under that name where the walk
+  goes stops the snapshot at once. What is left for an older git is a pipe put
+  there while a snapshot or a restore runs: that git is ended after
+  `BACKGROUND_BUDGET`, and until then it holds the lock.
+- With any git, a restore does not write a file while a pipe, a socket or a
+  device (or a link to one) named `.gitattributes` stands in its folder or one
+  above it, also in a folder that is left out: the file is named as left as it
+  is. (A git that knows `GIT_ATTR_SOURCE` would have put it back.)
+- Every git this starts has a time limit (`BACKGROUND_BUDGET` at most), the
+  ones of a restore and of the clean-up too.
+- A project so large that its first snapshot takes longer than
+  `BACKGROUND_BUDGET` gets no snapshot at all: every attempt starts from
+  nothing, and the list says each time that it was stopped. Measured on Linux
+  with small files: 160,000 files took 316 s, and the time grew about fourfold
+  with each doubling.
 - A file rewritten with the same size and the same modified time may not be
   seen as changed.
 - A file changed by an edit tool is in the snapshot taken before the next Bash
@@ -35,13 +62,23 @@ Known limits:
   `HOOK_BUDGET`, then goes on without one, and the list says so.
 - What comes back is the bytes of each file: not its read-only or hidden
   attribute, its modified time, its alternate data streams, or a hard link
-  (it comes back as a file of its own).
+  (it comes back as a file of its own). Off Windows, of its permissions only
+  whether it can be run comes back: a file that was 0600, and one that was
+  only changed, comes back with the permissions a new file gets (0644 with the
+  usual umask), a folder that had to be made again likewise; extended
+  attributes and the owner are not kept. "As they were then" in what a restore
+  prints is about the bytes.
 - A file renamed only in case (`Readme.md` to `README.md`) keeps its old name
   in the snapshots, and comes back under it.
-- The store's git processes end with the process that runs them (a Windows
-  job), and the next holder of the lock clears every lock file git left behind
+- On Windows the store's git processes end with the process that runs them (a
+  job). Elsewhere a git is handed the open lock file and so keeps the lock
+  taken until it, and anything it started, has ended: a hook that is killed
+  mid-snapshot leaves its git running to its end on macOS (on Linux the system
+  ends it, though not what it started), and until then later commands go on
+  without a snapshot and the list says another one was still being taken. The
+  next holder of the lock clears every lock file git left behind
   in the store. A git that someone else runs on the store at the same time is
-  not seen, and its locks are cleared under it. A process killed while it is
+  not seen, and its locks are cleared under it. On Windows, a process killed while it is
   starting a git (a few milliseconds each time; measured: about 1 in 10 hooks
   killed mid-run) leaves that git behind, stopped before its first instruction:
   it does nothing and holds only its own program file (git cannot be updated
@@ -55,8 +92,10 @@ Known limits:
   fails; if the record cannot be written at all, the command has no row, and
   a snapshot that was taken just then is in the store without being listed
   (the next clean-up drops it).
-- A file that is a symbolic link: not checked (the store keeps `symlinks =
-  false`, so it most likely comes back as a plain file holding the target).
+- A symbolic link: on Linux it is saved as the link it is, whatever it points
+  to, and comes back as that link (checked on Linux; on macOS only by the
+  suite). On Windows: not checked (most likely it comes back as a plain file
+  holding the target).
 - A command can wait for the record up to `LOG_WAIT` seconds more than
   `HOOK_BUDGET`, when another process is writing or holding it at that moment.
 - Snapshots older than `KEEP_SECONDS` are dropped at session start only (a
@@ -96,12 +135,14 @@ MAX_FILE_BYTES = 50 * 1024 * 1024
 KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
 HOOK_BUDGET = 3.0        # seconds the snapshot itself may take; the hook around it adds up to a second
+BACKGROUND_BUDGET = 1800.0  # seconds a snapshot in the background, or one git of a restore or the clean-up, may take
 LOG_WAIT = 2.0           # seconds a row waits for another writer of the record
-SUPPORTED = ("win32",)   # where this was measured; elsewhere it stays off and says so
+SUPPORTED = ("win32", "darwin", "linux")  # where this was measured; elsewhere it stays off and says so
 NAMED = 50               # how many left-out paths one row of the record names
 _ATTRIBUTES = "* -text -filter -ident -working-tree-encoding\n"  # files go in and come out byte for byte
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's id for a tree with nothing in it
 _REPARSE = 0x400         # FILE_ATTRIBUTE_REPARSE_POINT: a Windows symlink or junction
+_GIT_READS = frozenset({".gitattributes", ".gitignore", ".gitmodules"})  # opened by git wherever it finds them
 
 
 def enabled() -> bool:
@@ -198,15 +239,41 @@ def _start_in_job(proc: subprocess.Popen) -> None:
         ntdll.NtResumeProcess(int(proc._handle))
 
 
-def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: float | None):
-    """Like `subprocess.run`, but a process over its time is stopped with its children, and on
-    Windows it ends when this process ends (see `_job`)."""
+def _ends_with_parent(parent: int):
+    """For the new process, before it becomes git (Linux): the system ends it when the process
+    that started it ends, however that ends. macOS has no such call; see `_run`."""
+    def setup() -> None:
+        try:
+            import ctypes
+            ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+        except Exception:  # noqa: BLE001 - the lock it holds (see `_run`) is what keeps the store whole
+            return
+        if os.getppid() != parent:  # it ended before the call above was made
+            os._exit(1)
+    return setup
+
+
+def _run(cmd: list[str], *, cwd: str, env: dict, stdin: bytes | None, timeout: float | None,
+         lock: int | None = None):
+    """Like `subprocess.run`, but a process over its time is stopped with its children, and a
+    git must not go on writing the store next to another holder of the lock after the one that
+    started it is gone (a hook that Claude Code stops, say):
+    - Windows: it ends when this process ends (see `_job`).
+    - Elsewhere: it is handed the open lock file (`lock`), so the lock stays taken for as long as
+      it or anything it started runs, and the next snapshot waits for it or goes on without one.
+      On Linux the system also ends it when this process ends. On macOS it runs to its end."""
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x4 if os.name == "nt" else 0  # 0x4: CREATE_SUSPENDED
+    more: dict = {}
     if os.name == "nt":
         _job()  # made before the process is: the time it stands suspended and outside the job stays short
+    else:
+        if lock is not None:
+            more["pass_fds"] = (lock,)
+        if sys.platform.startswith("linux"):
+            more["preexec_fn"] = _ends_with_parent(os.getpid())
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
-                            start_new_session=os.name != "nt")
+                            start_new_session=os.name != "nt", **more)
     if os.name == "nt":
         _start_in_job(proc)
     try:
@@ -251,16 +318,54 @@ def _take(fd: int) -> bool:
 
 
 def _give(fd: int) -> None:
+    """Every caller closes the file next, and that lets the lock go. Off Windows nothing else
+    is done here: unlocking would also take the lock from a git that was handed this open file
+    and is still running (after Ctrl+C in its holder, say), while closing leaves it with that git."""
+    if os.name != "nt":
+        return
     try:
         os.lseek(fd, 0, os.SEEK_SET)
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     except OSError:
         pass  # closing the file lets it go in any case
+
+
+def _append(path: str, data: bytes) -> None:
+    """One write at the end of the file that the system keeps whole next to another process's.
+    `O_APPEND` is that everywhere but on Windows, where the C library seeks to the end and then
+    writes: two processes that did so at once wrote over each other, and a row was lost (a writer
+    that had waited `LOG_WAIT` for its turn writes without it). A handle opened for appending
+    only is the system's own append there. The file is made with mode 0600 if it is not there."""
+    if os.name != "nt":
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                   wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_char_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    # FILE_APPEND_DATA | SYNCHRONIZE; shared for reading, writing and deleting; OPEN_ALWAYS.
+    handle = kernel.CreateFileW(_long(path), 0x0004 | 0x00100000, 0x1 | 0x2 | 0x4, None, 4, 0x80, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        # A sharing violation or no access is what `open` raises PermissionError for: the callers wait on that.
+        raise PermissionError(code, ctypes.FormatError(code), path) if code in (5, 32, 33) else ctypes.WinError(code)
+    try:
+        written = wintypes.DWORD(0)
+        if not kernel.WriteFile(handle, data, len(data), ctypes.byref(written), None) or written.value != len(data):
+            code = ctypes.get_last_error()
+            raise PermissionError(code, ctypes.FormatError(code), path) if code in (5, 32, 33) else ctypes.WinError(code)
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def _long(path: str) -> str:
@@ -295,6 +400,15 @@ def _is_folder(path: str) -> bool:
     return st is not None and stat.S_ISDIR(st.st_mode)
 
 
+def _git_would_wait(path: str) -> bool:
+    """A pipe, a socket or a device at `path`, or a link to one (an older git follows the link)."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False  # not there, or not to be reached: git cannot open it either
+    return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode))
+
+
 def _shown(text) -> str:
     """Command text goes to a terminal: a newline, a carriage return or an escape in it
     must not draw a line of its own."""
@@ -315,7 +429,13 @@ def _refused(project: str, data_dir: str) -> str | None:
         return "a network path"
     if os.path.dirname(project) == project:
         return "a whole drive"
-    if _inside(os.path.realpath(os.path.expanduser("~")), project):
+    homes = [os.path.expanduser("~")]
+    try:  # the account's own home too: `HOME` may have been pointed somewhere else
+        import pwd
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        pass
+    if any(home and _inside(os.path.realpath(home), project) for home in homes):
         return "the home folder or above it"
     if _inside(os.path.realpath(data_dir), project):
         return "around the snapshot store"
@@ -340,14 +460,19 @@ class Store:
         self.log = os.path.join(self.root, key + ".jsonl")
         self.lock = os.path.join(self.root, key + ".lock")
         self._held: int | None = None  # the open lock file while this holds the lock
+        self._special: list[str] = []  # pipes, sockets and devices the last walk of the project met
         self.record_by: float | None = None  # `time.monotonic()` after which no row waits for the record
 
     # -- git ---------------------------------------------------------------
     @staticmethod
     def _env() -> dict:
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+        # GIT_ATTR_SOURCE (git 2.41 and later; an older git does not know it): attributes are read
+        # from an empty tree, so no `.gitattributes` in the project is opened at all. The files go in
+        # and come out byte for byte whatever such a file says (`_ATTRIBUTES`); opening one is only
+        # a way to be stopped by a pipe under that name.
         env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
-                   GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0")
+                   GIT_ATTR_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_ATTR_SOURCE=_EMPTY_TREE)
         return env
 
     def _exe(self) -> str:
@@ -362,24 +487,27 @@ class Store:
         # converted or hooked.
         fixed = ["core.autocrlf=false", "core.safecrlf=false", "core.longpaths=true", "core.fsmonitor=false",
                  "core.ignoreStat=false", "core.trustctime=true", "core.checkStat=default",
-                 f"core.fileMode={'false' if os.name == 'nt' else 'true'}", f"core.hooksPath={os.devnull}", "gc.auto=0", "advice.addIgnoredFile=false",
+                 f"core.fileMode={'false' if os.name == 'nt' else 'true'}", f"core.hooksPath={os.devnull}",
+                 # Else the account's own attributes and ignore files are read (a pipe there: no end).
+                 f"core.attributesFile={os.devnull}", f"core.excludesFile={os.devnull}",
+                 "gc.auto=0", "advice.addIgnoredFile=false",
                  "advice.addEmbeddedRepo=false"]
         code, out, err = _run(
             [self._exe(), *[part for item in fixed for part in ("-c", item)],
              f"--git-dir={self.shadow}", f"--work-tree={self.project}", *args],
-            cwd=self.project, env=env, stdin=stdin, timeout=timeout)
+            cwd=self.project, env=env, stdin=stdin, timeout=timeout, lock=self._held)
         if check and code != 0:
             name = next((a for a in args if not a.startswith("-")), args[0])
             raise RuntimeError(f"git {name}: {err.decode('utf-8', 'replace')[-300:]}")
         return out if check else (code, out, err)
 
-    def _init(self) -> None:
+    def _init(self, timeout: float | None = None) -> None:
         info = os.path.join(self.shadow, "info")
         if os.path.isfile(os.path.join(self.shadow, "HEAD")) and os.path.isfile(os.path.join(info, "attributes")):
             return
         os.makedirs(self.root, mode=0o700, exist_ok=True)
         code, _, err = _run([self._exe(), "init", "-q", "--bare", self.shadow], cwd=self.root, env=self._env(),
-                            stdin=None, timeout=None)
+                            stdin=None, timeout=timeout, lock=self._held)
         if code != 0:
             raise RuntimeError(f"git init: {err.decode('utf-8', 'replace')[-300:]}")
         os.makedirs(info, exist_ok=True)
@@ -387,7 +515,7 @@ class Store:
             f.write(_ATTRIBUTES)
 
     def _names(self, commit: str) -> set[str]:
-        out = self.git("ls-tree", "-r", "-z", "--name-only", commit)
+        out = self.git("ls-tree", "-r", "-z", "--name-only", commit, timeout=BACKGROUND_BUDGET)
         return {os.fsdecode(p) for p in out.split(b"\0") if p}
 
     # -- one writer at a time ---------------------------------------------
@@ -415,7 +543,8 @@ class Store:
         return True
 
     def _clear_git_locks(self) -> None:
-        """Every git of the store runs in its holder's job (`_job`) and ends with it: with the lock
+        """Every git of the store ends with its holder (Windows, `_job`) or holds the lock itself
+        until it ends (elsewhere, `_run`): with the lock
         ours, no git of the store is running, and a lock file git left behind (its holder was
         stopped mid-way, by Claude Code ending a hook, say) is only in the way. Not the index's
         alone: one left under `refs/` stopped every later snapshot and restore, one on
@@ -478,8 +607,10 @@ class Store:
         """Mode 0600, and never through a link someone put at that path."""
         if os.path.islink(path) or (not append and os.path.lexists(path)):
             os.remove(path)
-        flags = os.O_CREAT | os.O_WRONLY | (os.O_APPEND if append else os.O_EXCL)
-        with os.fdopen(os.open(path, flags, 0o600), "a" if append else "w", encoding="utf-8") as f:
+        if append:
+            _append(path, "".join(lines).encode("utf-8"))
+            return
+        with os.fdopen(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600), "w", encoding="utf-8") as f:
             f.writelines(lines)
 
     @contextlib.contextmanager
@@ -553,6 +684,7 @@ class Store:
     def _folders_left_out(self, left) -> dict[str, str]:
         """Folders the snapshot does not go into, found without following a link."""
         out: dict[str, str] = {}
+        self._special = []
         stack = [""]
         while stack:
             left()
@@ -570,11 +702,25 @@ class Store:
                 try:
                     link = entry.is_symlink() or bool(
                         getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0) & _REPARSE)
+                    if os.name != "nt" and entry.name.lower() in _GIT_READS:
+                        # git opens these in every folder it goes through, and waits for ever on a pipe.
+                        plain = entry.is_file(follow_symlinks=False) or entry.is_dir(follow_symlinks=False)
+                        if link:  # an older git follows the link
+                            try:
+                                plain = not os.path.lexists(os.path.realpath(entry.path)) \
+                                    or stat.S_ISREG(os.stat(entry.path).st_mode) or os.path.isdir(entry.path)
+                            except OSError:
+                                plain = True  # cannot be reached: git cannot open it either
+                        if not plain:
+                            raise RuntimeError(f"`{child}` is a pipe or a device, and git would wait on it")
                     if link:
                         # Elsewhere git keeps a link as a link. Git for Windows walks into it.
                         if os.name == "nt" and entry.is_dir():
                             out[child] = "link"
                         continue
+                    if os.name != "nt" and not entry.is_dir(follow_symlinks=False) \
+                            and not entry.is_file(follow_symlinks=False):
+                        self._special.append(child)  # a pipe, a socket, a device: git saves no such thing
                     if not entry.is_dir(follow_symlinks=False) or entry.name == ".git":
                         continue
                 except OSError:
@@ -587,6 +733,18 @@ class Store:
                 else:
                     stack.append(child)
         return out
+
+    def _pipe_above(self, rel: str, seen: dict[str, bool]) -> bool:
+        """A pipe or a device named `.gitattributes` in the project folder or a folder on the
+        way to `rel`: a git that does not know `GIT_ATTR_SOURCE` opens it to write `rel`."""
+        parts = rel.split("/")[:-1]
+        for i in range(len(parts) + 1):
+            key = "/".join(parts[:i])
+            if key not in seen:
+                seen[key] = _git_would_wait(os.path.join(self.project, *parts[:i], ".gitattributes"))
+            if seen[key]:
+                return True
+        return False
 
     def _link_above(self, rel: str, seen: dict[str, bool]) -> bool:
         parts = rel.split("/")[:-1]
@@ -647,25 +805,32 @@ class Store:
                 raise subprocess.TimeoutExpired("snapshot", budget)
             return remaining
 
-        self._init()
+        self._init(left())
         folders = self._folders_left_out(left)
         exclude_file = os.path.join(self.shadow, "info", "exclude")
         with open(exclude_file, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
             for rel in folders:
                 if "\n" not in rel:
                     f.write("/" + "".join("\\" + c if c in "\\*?[]" else c for c in rel) + "/\n")
-        changed = self._changed(exclude_file, left())
         links: dict[str, bool] = {}
         add, drop, too_big, unreadable = [], [], [], []
-        if folders:
-            # Saved before the folder was left out (it became a repository, a link, ...) and not
-            # changed since: the record names the folder as not in the snapshot, so its files go too.
-            fold = str.casefold if os.name == "nt" else (lambda p: p)
-            under = tuple(fold(rel) + "/" for rel in folders)
-            listed = set(changed)
-            cached = self.git("ls-files", "-z", timeout=left())
-            drop += [p for p in sorted({os.fsdecode(x) for x in cached.split(b"\0") if x})
-                     if fold(p).startswith(under) and p not in listed]
+        # Files saved before their folder was left out (it became a repository, cannot be listed
+        # any more, ...) or before a link came to stand above them: the record names the folder
+        # as not in the snapshot, so its files go too. They leave the index BEFORE git looks at
+        # the project: git opens `.gitattributes` in every folder that holds a file it knows,
+        # and a pipe under that name in a folder the walk above did not enter made it wait for ever.
+        fold = str.casefold if os.name == "nt" else (lambda p: p)
+        under = tuple(fold(rel) + "/" for rel in folders)
+        cached = self.git("ls-files", "-z", timeout=left())
+        for i, rel in enumerate(sorted({os.fsdecode(x) for x in cached.split(b"\0") if x})):
+            if i % 256 == 255:
+                left()
+            if (under and fold(rel).startswith(under)) or self._link_above(rel, links):
+                drop.append(rel)
+        if drop:
+            self.git("update-index", "--force-remove", "-z", "--stdin",
+                     stdin=b"\0".join(map(os.fsencode, drop)), timeout=left())
+        changed = self._changed(exclude_file, left())
         for i, rel in enumerate(changed):
             if i % 256 == 255:
                 left()
@@ -714,7 +879,7 @@ class Store:
             raise RuntimeError("the record of snapshots is damaged")  # a row past this would not be listed
         self.git("update-ref", f"refs/snap/{n}", commit, timeout=left())
         row = {"n": n, "commit": commit, "tree": tree, "seconds": round(time.perf_counter() - started, 3), **why}
-        for name, paths in (("too_large", too_big), ("unreadable", unreadable),
+        for name, paths in (("too_large", too_big), ("unreadable", unreadable), ("special", sorted(self._special)),
                             ("folders", [f"{rel} ({kind})" for rel, kind in sorted(folders.items())])):
             if paths:
                 row[name] = paths[:NAMED]
@@ -732,11 +897,13 @@ class Store:
         target = next((r for r in self.snapshots() if r["n"] == n), None)
         if target is None:
             raise LookupError(f"no snapshot {n}")
-        present = self.snapshot({"note": f"before going back to {n}"}, empty_ok=True)
+        # Every git here has a time limit: one that waits on something holds the lock.
+        present = self.snapshot({"note": f"before going back to {n}"}, budget=BACKGROUND_BUDGET, empty_ok=True)
         saved_now = self._names(present["commit"])
-        differs = self.git("diff", "--name-only", "-z", present["commit"])
+        differs = self.git("diff", "--name-only", "-z", present["commit"], timeout=BACKGROUND_BUDGET)
         differs = {os.fsdecode(p) for p in differs.split(b"\0") if p}
         links: dict[str, bool] = {}
+        pipes: dict[str, bool] = {}
         write, skipped = [], {}
         for rel in sorted(self._names(target["commit"])):
             full = os.path.join(self.project, rel)
@@ -752,15 +919,24 @@ class Store:
                      and not _is_folder(os.path.join(self.project, a)) for a in above):
                 # Writing it would delete that file, which "files made since stay" says does not happen.
                 skipped[rel] = "a file now stands where its folder was"
+            elif os.name != "nt" and self._pipe_above(rel, pipes):
+                skipped[rel] = "a pipe, a socket or a device named .gitattributes stands in its folder or one above"
             else:
                 write.append(rel)
         if write:
             try:
                 self.git("--literal-pathspecs", "checkout", target["commit"], "--pathspec-from-file=-",
-                         "--pathspec-file-nul", stdin=b"\0".join(map(os.fsencode, write)))
-            except RuntimeError as exc:  # some files may be written: say which
+                         "--pathspec-file-nul", stdin=b"\0".join(map(os.fsencode, write)),
+                         timeout=BACKGROUND_BUDGET)
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:  # some files may be written: say which
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    exc = RuntimeError(f"git did not finish in {BACKGROUND_BUDGET:g} s and was stopped")
+                    try:  # the git that was stopped left its lock; the store's lock is still held
+                        os.remove(os.path.join(self.shadow, "index.lock"))
+                    except OSError:
+                        pass
                 try:
-                    still = self.git("diff", "--name-only", "-z", target["commit"])
+                    still = self.git("diff", "--name-only", "-z", target["commit"], timeout=60)
                     still = {os.fsdecode(p) for p in still.split(b"\0") if p}
                     done = [rel for rel in write if rel not in still and not _is_folder(os.path.join(self.project, rel))]
                 except Exception:  # noqa: BLE001 - the first error is the one to report
@@ -791,12 +967,14 @@ class Store:
 
         def sweep() -> None:
             listed = {r["n"] for r in self.snapshots(wait=0.5)}
-            refs = self.git("for-each-ref", "--format=%(refname)", "refs/snap/").decode().split()
+            refs = self.git("for-each-ref", "--format=%(refname)", "refs/snap/",
+                            timeout=BACKGROUND_BUDGET).decode().split()
             gone = [ref for ref in refs
                     if not (re.fullmatch(r"refs/snap/[0-9]{1,9}", ref) and int(ref[10:]) in listed)]
             if gone:
-                self.git("update-ref", "--stdin", stdin="".join(f"delete {ref}\n" for ref in gone).encode())
-                self.git("gc", "--prune=now", "-q")
+                self.git("update-ref", "--stdin", stdin="".join(f"delete {ref}\n" for ref in gone).encode(),
+                         timeout=BACKGROUND_BUDGET)
+                self.git("gc", "--prune=now", "-q", timeout=BACKGROUND_BUDGET)
 
         def drop(rows: list[dict]) -> None:
             """The record first, then the snapshots: a record that could not be rewritten
@@ -897,7 +1075,7 @@ def before_command(payload: dict, data_dir: str | None) -> None:
 
 
 def start(project: str, data_dir: str, note: str = "session start", late_for: str | None = None) -> str:
-    """In the background: a snapshot with no time limit, then the clean-up. `late_for`: the
+    """In the background: a snapshot that may take `BACKGROUND_BUDGET`, then the clean-up. `late_for`: the
     command whose snapshot did not fit its budget; if this one cannot be taken either, the
     record says so."""
     project = os.path.realpath(project)
@@ -916,7 +1094,7 @@ def start(project: str, data_dir: str, note: str = "session start", late_for: st
                                            "being taken", "before": late_for})
             return "another snapshot is being taken"
         try:
-            row = store.snapshot({"note": note})
+            row = store.snapshot({"note": note}, budget=BACKGROUND_BUDGET)
             try:
                 cleaned = f"{store.prune()} old dropped"
             except Exception as exc:  # noqa: BLE001 - the snapshot is taken; the clean-up is tried next time
@@ -926,17 +1104,21 @@ def start(project: str, data_dir: str, note: str = "session start", late_for: st
             store.release()
     except Exception as exc:  # noqa: BLE001 - runs unattended; say what happened and leave
         what = "the snapshot left for later" if late_for is not None else "the snapshot at session start"
+        said = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if isinstance(exc, subprocess.TimeoutExpired):  # its own text is git's whole command line
+            said = f"it took over {BACKGROUND_BUDGET:g} s and was stopped"
         try:
-            store.note({"unprotected": f"{what} failed ({type(exc).__name__}: {str(exc)[:200]})",
+            store.note({"unprotected": f"{what} failed ({said})",
                         **({"before": late_for} if late_for is not None else {})})
         except Exception:  # noqa: BLE001 - the record cannot be written either: the answer below still says it
-            return f"failed: {type(exc).__name__}: {exc} (and the record could not be written)"
-        return f"failed: {type(exc).__name__}: {exc}"
+            return f"failed: {said} (and the record could not be written)"
+        return f"failed: {said}"
 
 
 def _left_out(row: dict) -> str:
     parts = []
-    for key, label in (("too_large", "too large"), ("unreadable", "could not be saved"), ("folders", "folders")):
+    for key, label in (("too_large", "too large"), ("unreadable", "could not be saved"),
+                       ("special", "not files (pipes, sockets, devices)"), ("folders", "folders")):
         names = row.get(key)
         if isinstance(names, list) and names and all(isinstance(x, str) for x in names):
             more = row.get(key + "_more")
@@ -1049,6 +1231,8 @@ def _cli(argv: list[str]) -> int:
             return 1
         except Exception as exc:  # noqa: BLE001 - say where things stand instead of a traceback
             # Files are written in one place only, and a stop there is the case above.
+            if isinstance(exc, subprocess.TimeoutExpired):  # its own text is git's whole command line
+                exc = RuntimeError(f"git did not finish in {BACKGROUND_BUDGET:g} s and was stopped")
             where = where_now()
             where = f"{where}; nothing was written." if where.startswith(" The") else where or " Nothing was written."
             print(f"boxdawn guard undo: stopped ({type(exc).__name__}: {_shown(exc)}).{where}", file=sys.stderr)
