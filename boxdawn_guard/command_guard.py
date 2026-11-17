@@ -118,7 +118,7 @@ RULE_IDS = frozenset({
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
     "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
     "db.reset", "git.discard_changes", "git.stash_drop", "rm.history", "iac.auto_approve",
-    "mirror.delete", "gh.delete",
+    "mirror.delete", "gh.delete", "fetch.then_run",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -292,6 +292,9 @@ class _Judge:
     made_links: list[str] = field(default_factory=list)  # by this same command: not on disk yet
     reals: dict = field(default_factory=dict)
     grep_ends: list[int] = field(default_factory=list)
+    fetched: list = field(default_factory=list)  # [(keys of a file this line downloaded, the name shown)]
+    fetch_said: set = field(default_factory=set)
+    fetch_looks: int = 0
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -677,6 +680,10 @@ class _Judge:
             self.flag("ask", "name.runtime", "the command name is only known at run time")
             return
         fed, text = self._stdin(node)
+        try:
+            self._fetch_command(node, name, args)
+        except Exception:  # noqa: BLE001 - it only adds an ask; the judgement below does not wait on it
+            pass
         self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
         grep = posixpath.basename(name).lower()
         if depth == 0 and grep in secret_files.GREPS:
@@ -824,13 +831,181 @@ class _Judge:
         op = "".join(c.text.decode() for c in node.children if not c.is_named)
         if "<" in op:
             self._redirected_in(node)
+            try:
+                self._fetched_in(node)
+            except Exception:  # noqa: BLE001 - it only adds an ask
+                pass
             return
         dest_node = node.child_by_field_name("destination")
         if dest_node is None:
             return
         if "&" in op and dest_node.type == "number":
             return  # 2>&1
-        self._output(_value(dest_node, self.env))
+        dest = _value(dest_node, self.env)
+        self._output(dest)
+        try:
+            descriptor = node.child_by_field_name("descriptor")
+            stdout = descriptor is None or descriptor.text == b"1"  # `>`, `>>`, `&>`, `1>`; not `2>`
+            if stdout and self._may_look() and any(posixpath.basename(n or "") in _FETCHERS for n in self._names_in(_redirect_body(node))):
+                self._note_fetched(dest, dest_node.text.decode("utf-8", "replace"))  # `curl … > x.sh`
+        except Exception:  # noqa: BLE001 - it only adds an ask
+            pass
+
+    def _may_look(self) -> bool:
+        """Looking through a part of the line for a download costs time on each redirect and
+        each `tee`: a line with thousands of them is not followed past `_LOOKS_MOST`."""
+        self.fetch_looks += 1
+        return self.fetch_looks <= _LOOKS_MOST
+
+    def _names_in(self, body: Node) -> list[Value]:
+        """The command behind each wrapper, for every command in this part of the line."""
+        return [self._final(*self._name_args(n))[0] for n in _walk(body) if n.type == "command"]
+
+    # a file this line downloads, then runs ─────────────────────────────────
+    def _file_keys(self, value: Value, raw: Optional[str] = None) -> set:
+        """What two words must share to be the same file. A value known only at
+        run time is the same file only when it is written the same way (`"$f"`)."""
+        if value is None:
+            raw = re.sub(r"\$\{(\w+)\}", r"$\1", (raw or "").strip().strip('"'))  # `"${F}"` is `"$F"`
+            return {("as written", raw)} if "$" in raw or "`" in raw else set()
+        if self._windows:
+            value = value.replace("\\", "/")
+        if value in ("", "-") or value in self.rules.harmless_devices or re.search(r"[*?\[]", value):
+            return set()
+        keys: set = set()
+        for base in islice(dict.fromkeys(self.workdirs or [self.cwd]), _FOLDERS_MOST):
+            if base is None and not (value.startswith(("/", "~")) or _posix(value) != value):
+                keys.add(("relative", self._fold(posixpath.normpath(value))))
+            else:
+                keys.add(self._fold(self._absolute(value, base or self.cwd)))
+        return keys
+
+    def _note_fetched(self, value: Value, raw: Optional[str] = None) -> None:
+        keys = self._file_keys(value, raw) if len(self.fetched) < _FETCHED_MOST else set()
+        if keys:
+            self.fetched.append((keys, value if value is not None else (raw or "").strip().strip("\"'")))
+
+    def _runs_fetched(self, value: Value, raw: Optional[str] = None) -> None:
+        keys = self._file_keys(value, raw) if self.fetched else set()
+        for fetched, shown in self.fetched:
+            if keys & fetched:
+                if shown not in self.fetch_said:  # one command can reach here twice
+                    self.fetch_said.add(shown)
+                    self.flag("ask", "fetch.then_run", f"`{shown}` is downloaded and then run by this same command")
+                return
+
+    def _arg_raws(self, node: Node) -> list[Optional[str]]:
+        """The text of each argument as written, one for one with `_name_args`."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return []
+        inner = name_node.named_children[0] if name_node.named_children else name_node
+        name = _value(inner, self.env)
+        raws: list[Optional[str]] = []
+        if name is not None and inner.type not in ("string", "raw_string"):
+            raws += [None] * (len(_braces(name)) - 1)
+        for a in node.children_by_field_name("argument"):
+            value = _value(a, self.env)
+            unquoted = a.type == "concatenation" and any(c.type == "word" and b"{" in c.text for c in a.children)
+            count = len(_braces(value)) if value is not None and unquoted else 1
+            raws += [a.text.decode("utf-8", "replace")] * count
+        return raws
+
+    def _fetch_command(self, node: Node, name: str, args: list[Value]) -> None:
+        name_node = node.child_by_field_name("name")
+        inner = name_node.named_children[0] if name_node.named_children else name_node
+        word = _value(inner, self.env)  # with its folders: `./x.sh`, not `x.sh`
+        if word is not None and inner.type not in ("string", "raw_string"):
+            word = _braces(word)[0]
+        raws: Optional[list] = self._arg_raws(node)
+        rest = args
+        r = self.rules
+        while name is not None and (name in r.wrappers or name in r.privilege):  # as `_judge` goes through them
+            if name == "su":
+                return  # `su -c` text is judged as its own line
+            if name in r.privilege:
+                rest = _strip_options(rest, takes_value={"-u", "-g", "-U", "-C", "-h", "-p", "--user", "--group",
+                                                         "--other-user", "--chdir", "--host", "--prompt"})
+            else:
+                rest = _unwrap(name, rest)
+            if not rest:
+                return
+            word = name = rest[0]
+            rest = rest[1:]
+            if name is not None:
+                name = posixpath.basename(name.replace("\\", "/"))
+        keep = len(rest)
+        raws = raws[len(raws) - keep:] if keep <= len(args) and args[len(args) - keep:] == rest else None
+        if name == "tee" and self._may_look() and self._fed_by_a_download(node):  # `curl … | tee x.sh`
+            for target in _operands(rest):
+                self._note_fetched(target)
+        self.fetch_step(word, rest, raws)
+
+    def _fed_by_a_download(self, node: Node) -> bool:
+        """An earlier stage of the pipeline this command is in downloads."""
+        stage, pipeline = node, node.parent
+        while pipeline is not None and pipeline.type != "pipeline":
+            if pipeline.type in ("program", "list", "subshell", "compound_statement"):
+                return False
+            stage, pipeline = pipeline, pipeline.parent
+        if pipeline is None:
+            return False
+        for earlier in pipeline.named_children:
+            if earlier.id == stage.id:
+                return False
+            if any(posixpath.basename(n or "") in _FETCHERS for n in self._names_in(earlier)):
+                return True
+        return False
+
+    def fetch_step(self, word: Value, args: list[Value], raws: Optional[list] = None, notes: bool = True) -> None:
+        """One command: does it run a file an earlier command of this line
+        downloaded, and (`notes`) does it download one itself. `word` is the
+        command as written, with its folders. This only ever adds an ask: if it
+        cannot read the command, the rest of the judgement goes on without it."""
+        try:
+            self._fetch_step(word, args, raws, notes)
+        except Exception:  # noqa: BLE001 - never the reason a line is judged less
+            pass
+
+    def _fetch_step(self, word: Value, args: list[Value], raws: Optional[list], notes: bool) -> None:
+        if word is None:
+            return
+        if raws is None or len(raws) != len(args):
+            raws = [None] * len(args)
+        name = posixpath.basename(word.replace("\\", "/"))
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        if self._windows:
+            name = name.lower()  # `Python.exe` is `python` there
+        name = _INTERPRETER_NAMES.sub(lambda m: m.group(1), name)  # python3.12, pypy3, nodejs
+        name = {"py": "python", "nodejs": "node", "pypy": "python"}.get(name, name)
+        if self.fetched:
+            if (re.search(r"[/\\]", word) or word.startswith("~")) and not _DOCUMENT.search(word):
+                self._runs_fetched(word)  # `./x.sh`; a bare name is looked up on PATH, not here
+            if name in ("cmd", "pwsh", "powershell"):
+                first = _first_word_of_code(name, args)  # `cmd /c x.bat`, `powershell -Command ./x.ps1`
+                if first is not None and not _DOCUMENT.search(first):  # `cmd /c start out.html` opens it
+                    self._runs_fetched(first)
+            if name in self.rules.interpreters and _code_on_line(name, args, self.rules) is None:
+                for at in _script_candidates(name, args, self.rules, raws):
+                    self._runs_fetched(args[at], raws[at])
+        if notes and name in _FETCHERS:
+            for at, value in _fetch_outputs(name, args):
+                self._note_fetched(args[at] if at is not None else value, raws[at] if at is not None else None)
+
+    def _fetched_in(self, node: Node) -> None:
+        """`bash < x.sh`: the file is the code."""
+        source = node.child_by_field_name("destination")
+        if source is None or not self.fetched:
+            return
+        first = next((n for n in _walk(_redirect_body(node)) if n.type == "command"), None)
+        if first is None:
+            return
+        name, args = self._final(*self._name_args(first))
+        if name in self.rules.shells and any(a and re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a) for a in args):
+            return  # `bash -n < x.sh` reads it for mistakes
+        if name in self.rules.interpreters and not _code_or_file(name, args, self.rules):
+            self._runs_fetched(_value(source, self.env), source.text.decode("utf-8", "replace"))
 
     def _output(self, dest: Value) -> None:
         if dest is None:
@@ -1507,6 +1682,238 @@ def _code_or_file(name: str, args: list[Value], rules: CommandRules) -> bool:
 
 
 _STDIN_FILES = frozenset({"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+
+
+# ── a file the line downloads ───────────────────────────────────────────────
+# Kept in code, not in the rule values: a signed bundle stands in for those
+# whole, and this is how two programs are read, not a list to tune.
+_FETCHERS = frozenset({"curl", "wget"})
+_CURL_VALUE_LETTERS = "AbcCdDeEFHKmoPQrtTuUwxXyYz"  # short options that take a value
+_CURL_VALUE_WORDS = frozenset({
+    "--max-time", "--connect-timeout", "--retry", "--retry-delay", "--retry-max-time", "--header",
+    "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "--form", "--form-string",
+    "--user", "--user-agent", "--request", "--proxy", "--cacert", "--cert", "--key", "--referer",
+    "--cookie", "--cookie-jar", "--write-out", "--range", "--limit-rate", "--config", "--upload-file",
+    "--resolve", "--interface", "--oauth2-bearer", "--proto", "--ciphers", "--dump-header",
+    "--stderr", "--trace", "--trace-ascii", "--netrc-file", "--unix-socket", "--speed-limit", "--speed-time",
+})
+_WGET_VALUE_LETTERS = "oaiBtOTwQPUlARDIXe"
+_WGET_VALUE_WORDS = frozenset({
+    "--output-file", "--append-output", "--input-file", "--base", "--tries", "--timeout", "--wait",
+    "--quota", "--user-agent", "--header", "--level", "--accept", "--reject", "--domains",
+    "--include-directories", "--exclude-directories", "--execute", "--user", "--password",
+    "--post-data", "--post-file", "--limit-rate", "--load-cookies", "--save-cookies", "--referer",
+    "--ca-certificate", "--certificate", "--private-key", "--method", "--body-data", "--body-file",
+})
+# Options whose next word is their value, not the script (`python -W ignore x.py`).
+_SCRIPT_VALUE_FLAGS = {
+    "python": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
+    "python3": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
+    "node": frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader",
+                       "--conditions", "-C", "--env-file", "--title"}),
+    "ruby": frozenset({"-I", "-r", "-C", "-E", "-K", "-x"}),
+    "perl": frozenset({"-I", "-M", "-m", "-x"}),
+    "php": frozenset({"-c", "-d", "-z", "-t", "-S"}),
+    "deno": frozenset({"-c", "--config", "--import-map", "--lock", "--cert", "--location", "--seed",
+                       "--env-file", "--reload", "-r"}),
+    "bun": frozenset({"-c", "--config", "--cwd", "--env-file", "--preload", "-r", "--tsconfig-override"}),
+}
+# Options that only check the file for mistakes.
+_CHECK_ONLY = {
+    "node": frozenset({"--check", "-c"}), "php": frozenset({"-l", "--syntax-check"}),
+    "ruby": frozenset({"-c", "-wc"}), "perl": frozenset({"-c", "-wc"}),
+}
+# powershell.exe options that take a value (any start of the name is accepted), with their short forms.
+_POWERSHELL_VALUE_NAMES = (  # (name, fewest letters that still mean it)
+    ("executionpolicy", 2), ("ep", 2), ("windowstyle", 1), ("version", 1), ("configurationname", 3),
+    ("workingdirectory", 2), ("wd", 2), ("inputformat", 2), ("if", 2), ("outputformat", 1), ("of", 2),
+    ("psconsolefile", 2), ("custompipename", 2), ("settingsfile", 2), ("encodedarguments", 8), ("ea", 2),
+)
+_INTERPRETER_NAMES = re.compile(r"^(python|pypy|ruby|perl|php|lua|node)[\d.]+$")  # python3.12, node18
+# Opening one of these runs nothing of its own.
+_DOCUMENT = re.compile(r"(?i)\.(png|jpe?g|gif|bmp|svg|webp|ico|tiff?|heic|pdf|html?|txt|md|csv|tsv|json|ya?ml|xml|log|"
+                       r"docx?|xlsx?|pptx?|epub|mp[34]|mov|avi|mkv|wav|flac|zip|tar|gz|tgz|7z)$")
+_FETCHED_MOST = 64   # downloads kept for one line; past that the line is not followed further
+_FOLDERS_MOST = 32   # folders a relative name is tried in
+_LOOKS_MOST = 200    # redirects and `tee`s of one line that are looked through for a download
+
+
+def _redirect_body(node: Node) -> Node:
+    """What a redirect is attached to."""
+    parent = node.parent
+    if parent is not None and parent.type == "heredoc_redirect" and parent.parent is not None:
+        # `cat <<EOF > f && more`: the parser puts the `>` and the rest of that line inside the
+        # here-document's node; the redirect is the command's that owns the here-document.
+        parent = parent.parent
+    if parent is None:
+        return node
+    body = parent if parent.type == "command" else parent.child_by_field_name("body") or parent
+    # The parser hangs the redirect of `a && b > f` on the whole chain; the shell gives it to `b`.
+    while body.type == "list" and body.named_children:
+        body = body.named_children[-1]
+    return body
+
+
+def _url_name(url: str) -> Optional[str]:
+    """The file name a URL ends in, as `curl -O` and `wget` take it."""
+    path = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*", "", url) if "://" in url else url.partition("/")[2]
+    path = re.split(r"[?#]", path, maxsplit=1)[0]
+    name = path.rsplit("/", 1)[-1]
+    return name or None
+
+
+def _fetch_outputs(name: str, args: list[Value]) -> list[tuple[Optional[int], Value]]:
+    """The files `curl` or `wget` writes: (index of the argument that names
+    the file, None) or (None, a name worked out from the URL)."""
+    curl = name == "curl"
+    if not curl and "--spider" in args:
+        return []  # looks, saves nothing
+    letters = _CURL_VALUE_LETTERS if curl else _WGET_VALUE_LETTERS
+    words = _CURL_VALUE_WORDS if curl else _WGET_VALUE_WORDS
+    long_out = ("--output",) if curl else ("--output-document",)
+    long_dir = "--output-dir" if curl else "--directory-prefix"
+    named: list[tuple[Optional[int], Value]] = []
+    urls: list[str] = []
+    folder: Value = ""
+    remote = not curl  # wget saves under the URL's name unless -O says otherwise
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a is None:
+            continue
+        if a.startswith("--"):
+            option, eq, value = a.partition("=")
+            if option in long_out:
+                named.append((None, value) if eq else (i if i < len(args) else None, None))
+                i += 0 if eq else 1
+            elif option == long_dir:
+                folder = value if eq else (args[i] if i < len(args) else None)
+                i += 0 if eq else 1
+            elif option in ("--remote-name", "--remote-name-all"):
+                remote = True
+            elif option == "--url" and not eq and i < len(args):
+                if args[i] is not None:
+                    urls.append(args[i])
+                i += 1
+            elif option in words and not eq:
+                i += 1
+        elif a.startswith("-") and len(a) > 1:
+            cluster = a[1:]
+            for k, letter in enumerate(cluster):
+                if curl and letter == "O":
+                    remote = True
+                elif letter in letters:
+                    attached = cluster[k + 1:]
+                    if letter == ("o" if curl else "O"):
+                        named.append((None, attached) if attached else (i if i < len(args) else None, None))
+                    elif not curl and letter == "P":
+                        folder = attached or (args[i] if i < len(args) else None)
+                    if not attached:
+                        i += 1
+                    break
+        else:
+            urls.append(a)
+    named = [(at, value) for at, value in named if at is not None or value is not None]
+    if curl and folder and named:  # `--output-dir d -o x`
+        named = [(None, None if folder is None or (args[at] if at is not None else value) is None
+                  else posixpath.join(folder, args[at] if at is not None else value)) for at, value in named]
+    if named and not curl:
+        return named  # `wget -O x`: everything goes into the one file
+    if remote and folder is not None:
+        for url in urls:
+            last = _url_name(url) or (None if curl else "index.html")
+            if last:
+                named.append((None, posixpath.join(folder, last) if folder else last))
+    return named
+
+
+def _powershell_option(arg: str) -> Optional[str]:
+    """What a powershell.exe option is: "file", "command", "value" (its next
+    word is its value) or "switch"; None when the word is no option. The
+    program takes `-` or `/` and any start of a name that is long enough."""
+    if arg[:1] not in "-/" or len(arg) < 2:
+        return None
+    given = arg[1:].lower()
+    if any(len(given) >= least and full.startswith(given) for full, least in _POWERSHELL_VALUE_NAMES):
+        return "value"
+    if "file".startswith(given):
+        return "file"
+    if "command".startswith(given):
+        return "command"
+    return "switch"
+
+
+def _first_word_of_code(name: str, args: list[Value]) -> Value:
+    """The program `cmd /c …` or `powershell -Command …` starts with, when it is on the line."""
+    for i, a in enumerate(args[:-1]):
+        if a is None:
+            continue
+        if name == "cmd":
+            found = a.lower() in ("/c", "//c", "/k", "//k", "/r", "//r")
+        else:
+            found = _powershell_option(a) == "command"
+        if found:
+            if args[i + 1] is None:
+                return None
+            code = " ".join(a for a in args[i + 1:i + 4] if a is not None)  # one string, or words of their own
+            words = code.strip().lstrip("&").split()
+            if words[:1] in (["call"], ["."], ["start"]) and len(words) > 1:  # `cmd /c call x.bat`, `pwsh -c '. ./x.ps1'`
+                words = words[1:]
+            return words[0].strip("'\"") if words else None
+    return None
+
+
+def _script_candidates(name: str, args: list[Value], rules: CommandRules,
+                       raws: Optional[list] = None) -> list[int]:
+    """Where the script file can be among an interpreter's arguments: the
+    first word that is not an option or an option's value, and before it any
+    word known only at run time (`python3 $FLAGS x.py`: it may be an option,
+    it may be the script). Empty when the interpreter runs no file, or only
+    checks one (`bash -n`, `node --check`, `php -l`)."""
+    takes = _SCRIPT_VALUE_FLAGS.get(name, frozenset())
+    check = _CHECK_ONLY.get(name, frozenset())
+    shell = name in rules.shells
+    powershell = name in ("pwsh", "powershell")
+    found: list[int] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a is None:
+            found.append(i)  # the same file only if it is written the same way
+            raw = (raws[i] if raws and i < len(raws) else None) or ""
+            if not re.fullmatch(r"""["']?\$(?:\w+|\{\w+\}|[@*])["']?""", raw.strip()):
+                return found  # `"$DIR/check.py"`: more than a bare variable is the script, not an option
+            i += 1
+            continue
+        if powershell:
+            kind = _powershell_option(a)
+            if kind == "file":
+                return found + [i + 1] if i + 1 < len(args) else found
+            if kind == "command":
+                return []  # code, read elsewhere
+            if kind is not None:
+                following = args[i + 1] if i + 1 < len(args) else None
+                # the next word is the value only when it is not an option itself (`-ep -File x.ps1`)
+                i += 2 if kind == "value" and not (following or "").startswith(("-", "/")) else 1
+                continue
+            return found + [i]
+        if a == "--":
+            return found + [i + 1] if i + 1 < len(args) else found
+        if a in check or shell and re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a):
+            return []  # reads it for mistakes, does not run it
+        if name in ("python", "python3") and re.fullmatch(r"-[bBdEhiIOqsSuvVx]*m.*", a):
+            return []  # a module, by name
+        if a.startswith("-") and a != "-" or shell and a.startswith("+"):
+            value = a in takes or shell and (a in _SHELL_VALUE_FLAGS or a in ("--rcfile", "--init-file")
+                                             or re.fullmatch(r"[-+][A-Za-z]*[oO]", a) is not None)
+            i += 2 if value else 1
+            continue
+        if name in ("deno", "bun") and a == "run":
+            i += 1
+            continue
+        return found + [i]
+    return found
 
 
 # Short flags run together (`bash -lc`, `perl -le`, `python -Ic`). A shell
