@@ -118,7 +118,7 @@ RULE_IDS = frozenset({
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
     "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
     "db.reset", "git.discard_changes", "git.stash_drop", "rm.history", "iac.auto_approve",
-    "mirror.delete", "gh.delete", "fetch.then_run",
+    "mirror.delete", "gh.delete", "fetch.then_run", "remote.run",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -1349,7 +1349,77 @@ class _Judge:
             if a in r.db_file_flags:
                 self.flag("ask", "db.file", f"`{name}` runs statements from a file")
 
+    def _remote(self, name: str, words: list[Value], shell: bool, depth: int) -> None:
+        """A command run inside a container or on another machine (#37574).
+        Its paths are not this computer's, so it is read on its own, as if
+        from a folder of its own, and what it would hold or block asks."""
+        if not words:
+            return
+        if depth + 1 > _MAX_DEPTH:
+            self.flag("ask", "parse.too_deep", "commands nested too deep to read")
+            return
+        inner = _Judge(cwd=_REMOTE_CWD, home=_REMOTE_HOME, rules=self.rules)
+        inner.workdirs = [inner.cwd]
+        if not shell:
+            name0 = words[0]
+            if name0 is not None:  # `bin/console`, as `_name_args` reads a name
+                name0 = posixpath.basename(name0.replace("\\", "/"))
+                name0 = name0[:-4] if name0.lower().endswith(".exe") else name0
+            inner._judge(name0, words[1:], depth + 1)
+        elif any(w is None for w in words):
+            inner._judge("sh", ["-c", None], depth + 1)
+        else:
+            inner.run(" ".join(words), depth + 1)
+        if inner.decision is None:
+            return
+        self.flag("ask", "remote.run", f"`{name}` runs a risky command inside a container or on another machine")
+        for finding, reason in zip(inner.findings, inner.reasons):
+            # An org's own rule keeps its level; ours ask: where a path lands there is not known here.
+            level = finding.level if finding.rule.startswith("custom.") else "ask"
+            self._record(level, finding.rule, reason, None)
+
+    def _ssh(self, name: str, args: list[Value], depth: int) -> None:
+        """`ssh host cmd …`: the words reach the remote shell as one line.
+        ssh reads its options before and after the host."""
+        i, host, values = 0, False, []
+        while i < len(args):
+            a = args[i]
+            if a is None or not a.startswith("-"):
+                if host:
+                    break
+                host = True
+                i += 1
+                continue
+            i += 1
+            if a == "--":
+                if not host and i < len(args):
+                    host = True
+                    i += 1  # the host
+                break
+            letters = a[1:]
+            for k, ch in enumerate(letters):
+                if ch in _SSH_VALUE_FLAGS:
+                    if k == len(letters) - 1:
+                        values.append((ch, args[i] if i < len(args) else None))
+                        i += 1  # `-p 22`: the value is the next word
+                    else:
+                        values.append((ch, letters[k + 1:]))  # `-p22`
+                    break
+        for ch, value in values:
+            # Run by ssh on this computer, through a shell.
+            m = re.match(r"(?i)\s*(ProxyCommand|LocalCommand|KnownHostsCommand)\s*[= ]\s*(.*)", value or "",
+                         re.S) if ch == "o" else None
+            if value is None and ch == "o":
+                self.flag("ask", "code.runtime", "`ssh` runs code known only at run time")
+            elif m and m.group(2).lower() != "none":
+                self.run(m.group(2), depth + 1)
+        if host:
+            self._remote(name, args[i:], True, depth)
+
     def _infra(self, name: str, args: list[Value], depth: int) -> None:
+        inner = _container_command(name, args)
+        if inner is not None:
+            self._remote(name, inner, False, depth)
         words = [a for a in args if a is not None]
         if name in ("terraform", "tofu"):
             if "destroy" in words or ("apply" in words and "-destroy" in words):
@@ -1484,6 +1554,7 @@ _HANDLERS = {
     "awk": _Judge._awk, "gawk": _Judge._awk, "mawk": _Judge._awk, "nawk": _Judge._awk,
     "wsl": _Judge._wsl, "docker-compose": _Judge._infra,
     "robocopy": _Judge._mirror, "lftp": _Judge._mirror, "gh": _Judge._gh, "firebase": _Judge._firebase,
+    "ssh": _Judge._ssh,
 }
 
 
@@ -2060,6 +2131,69 @@ def _as_shell_code(words: list[Value]) -> list[Value]:
     if not words:
         return []
     return ["sh", "-c", None if any(w is None for w in words) else " ".join(words)]
+
+
+# A command inside a container or on another machine is judged from here: no
+# path of this computer starts with it.
+_REMOTE_CWD = "/boxdawn-remote/cwd"
+_REMOTE_HOME = "/boxdawn-remote/home"
+_SSH_VALUE_FLAGS = frozenset("BbcDEeFIiJLlmOopQRSWw")
+_DOCKER_GLOBAL = {"-H", "--host", "-c", "--context", "--config", "-l", "--log-level",
+                  "--tlscacert", "--tlscert", "--tlskey"}
+_COMPOSE_GLOBAL = {"-f", "--file", "-p", "--project-name", "--project-directory", "--env-file",
+                   "--profile", "--ansi", "--progress", "--parallel"}
+_EXEC_VALUES = {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys", "--index"}
+_RUN_VALUES = _EXEC_VALUES | {"-l", "--label", "-p", "--publish", "-v", "--volume", "--entrypoint", "--name",
+                              "--cap-add", "--cap-drop", "--env-from-file", "--pull"}
+_KUBECTL_VALUES = {"-n", "--namespace", "--context", "--kubeconfig", "-s", "--server", "--cluster",
+                   "--user", "--token", "-c", "--container", "-f", "--filename", "--pod-running-timeout",
+                   "--as", "--as-group", "--request-timeout", "-v"}
+
+
+def _strip_cluster(args: list[Value], takes_value: set[str]) -> list[Value]:
+    """`_strip_options`, where a cluster ending in a letter that takes a
+    value (`-itu root`) takes the next word, as Go's flag packages read it."""
+    letters = {o[1] for o in takes_value if len(o) == 2}
+    i = 0
+    while i < len(args) and args[i] is not None and args[i].startswith("-"):
+        a = args[i]
+        i += 2 if a in takes_value or (not a.startswith("--") and len(a) > 2 and a[-1] in letters
+                                         and all(c not in letters for c in a[1:-1])) else 1
+    return args[i:]
+
+
+def _container_command(name: str, args: list[Value]) -> Optional[list[Value]]:
+    """The words `docker exec`, `docker compose exec|run` or `kubectl exec`
+    runs inside the container, as given (no shell). None: not one of these."""
+    if name == "kubectl":
+        rest = _strip_options(args, _KUBECTL_VALUES)
+        if rest[:1] != ["exec"]:
+            return None
+        rest = rest[1:]
+        if "--" in rest:
+            return rest[rest.index("--") + 1:]
+        return _strip_cluster(_strip_cluster(rest, _KUBECTL_VALUES)[1:], _KUBECTL_VALUES)  # after the pod
+    if name == "docker":
+        rest = _strip_options(args, _DOCKER_GLOBAL)
+        if rest[:2] == ["container", "exec"]:
+            rest = rest[1:]
+        if rest[:1] == ["exec"]:
+            return _strip_cluster(rest[1:], _EXEC_VALUES)[1:]  # the container
+        if rest[:1] != ["compose"]:
+            return None
+        rest = rest[1:]
+    elif name != "docker-compose":
+        return None
+    rest = _strip_options(rest if name == "docker" else args, _COMPOSE_GLOBAL)
+    if rest[:1] not in (["exec"], ["run"]):
+        return None
+    sub = rest[0]
+    rest = rest[1:]
+    after = _strip_cluster(rest, _EXEC_VALUES if sub == "exec" else _RUN_VALUES)
+    entry = _option_values(rest[:len(rest) - len(after)], ("--entrypoint",)) if sub == "run" else []
+    if entry and entry[-1] is not None:
+        entry = entry[-1].split()  # compose splits it into words
+    return entry[-1:] if entry == [None] else entry + after[1:]  # after the service
 
 
 _TMUX_RUNS = frozenset({"new", "new-session", "new-window", "neww", "split-window", "splitw",
