@@ -117,7 +117,7 @@ RULE_IDS = frozenset({
     "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
     "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
-    "db.reset", "git.discard_changes", "git.stash_drop", "rm.history", "iac.auto_approve",
+    "db.reset", "git.discard_changes", "git.stash_drop", "git.stash", "rm.history", "iac.auto_approve",
     "mirror.delete", "gh.delete", "fetch.then_run", "remote.run",
 })
 # Where the target sits, never what it is. "project_root" is the project
@@ -1343,6 +1343,17 @@ class _Judge:
             self.flag("ask", "git.discard_changes", "`git rm -r .` deletes every tracked file")
         elif sub == "stash" and rest[:1] in (["drop"], ["clear"]):
             self.flag("ask", "git.stash_drop", f"`git stash {rest[0]}` deletes stashed work")
+        elif sub == "stash" and {"-h", "--help"} & set(rest):
+            pass
+        elif sub == "stash" and rest[:1] in (["pop"], ["apply"], ["branch"]):
+            # Puts back the newest stash, which may be someone else's or an old one, and
+            # without --index drops what was staged.
+            self.flag("ask", "git.stash", f"`git stash {rest[0]}` writes a stash, maybe not this one, over the files")
+        elif sub == "stash" and (not rest or rest[0] is None or rest[0].startswith("-")
+                                 or rest[0] not in ("list", "show", "create", "store")):
+            # `git stash`, `push`, `save`: uncommitted work, maybe the user's or another
+            # agent's, leaves the folder.
+            self.flag("ask", "git.stash", "`git stash` takes uncommitted changes out of the folder")
 
     def _git_path_kind(self, base: str | None):
         """What a git path names on disk: "dir", "file", or None when it is not there."""

@@ -218,7 +218,7 @@ ASK += ["npx prisma migrate reset --force", "pnpm prisma migrate reset --force",
 DENY += ["gh repo delete a/b --yes"]
 NONE += ["npx prisma migrate dev", "npx prisma generate", "npx prisma db push", "php artisan migrate",
          "python manage.py migrate", "alembic upgrade head", "git checkout main", "git checkout -b feat",
-         "git restore --staged a.py", "git checkout -- src/a.py", "git restore a.py b.py", "git stash", "git stash pop", "git rm --cached -r .",
+         "git restore --staged a.py", "git checkout -- src/a.py", "git restore a.py b.py", "git stash list", "git stash show -p", "git rm --cached -r .",
          "git rm old.txt", "rm .gitignore", "rm -rf node_modules", "docker compose down",
          "terraform apply", "terraform plan", "gh api repos/a/b", "gh pr list", "robocopy src dst /E",
          "git commit -m 'prisma migrate reset'", "firebase deploy"]
