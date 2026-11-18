@@ -53,7 +53,7 @@ static class BdxPsParse
         o.Append("],\"assignments\":[");
         first = true;
         foreach (var a in ast.FindAll(a => a is AssignmentStatementAst || a is ForEachStatementAst
-                                           || IsIncrement(a), true))
+                                           || a is ParameterAst || IsIncrement(a), true))
         {
             if (!first) o.Append(',');
             first = false;
@@ -142,6 +142,9 @@ static class BdxPsParse
         }
         var f = a as ForEachStatementAst;
         if (f != null) { name = f.Variable.VariablePath.UserPath; op = "ForEach"; }
+        // `function f($p)`, `param($p)`: inside, `$p` is what the caller passed.
+        var pa = a as ParameterAst;
+        if (pa != null) { name = pa.Name.VariablePath.UserPath; op = "Parameter"; }
         var u = a as UnaryExpressionAst;
         if (u != null)
         {

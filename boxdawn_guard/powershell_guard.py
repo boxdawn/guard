@@ -59,6 +59,8 @@ def parse(command: str) -> dict:
 _ALIASES = {
     "rm": "remove-item", "del": "remove-item", "erase": "remove-item", "rd": "remove-item",
     "ri": "remove-item", "rmdir": "remove-item",
+    "sv": "set-variable", "set": "set-variable", "nv": "new-variable", "rv": "remove-variable",
+    "clv": "clear-variable",
     "clc": "clear-content", "sc": "set-content", "ac": "add-content", "tee": "tee-object",
     "iex": "invoke-expression", "start": "start-process", "saps": "start-process",
     "cd": "set-location", "sl": "set-location", "chdir": "set-location",
@@ -253,15 +255,19 @@ class _PowerShell:
             for e in c["elems"]:
                 if "p" in e and _resolve_param(e["p"], {}, {}) in _VARIABLE_PARAMS:
                     return {}
-        poisoned = {a["var"].lower() for a in tree["assignments"]
-                    if a["var"] and not (a["top"] and a["op"] == "Equals")}
-        if any(a["var"] is None for a in tree["assignments"]):
+                if "p" in e and name == "tee-object" and e["p"].lower().startswith("v"):
+                    return {}  # `Tee-Object -Variable x`
+        # A read-only name keeps its value: the assignment fails and the line goes on.
+        assignments = [a for a in tree["assignments"] if a["var"] is None or _var_key(a["var"]) not in _READ_ONLY]
+        poisoned = {_var_key(a["var"]) for a in assignments
+                    if a["var"] and (not (a["top"] and a["op"] == "Equals") or _var_key(a["var"]) in _AUTOMATIC)}
+        if any(a["var"] is None for a in assignments):
             return {}
         env: dict[str, list] = {"home": [(-1, self.home)]}
         for k, v in self.known_env.items():
             env["env:" + k] = [(-1, v)]
-        for a in sorted(tree["assignments"], key=lambda a: a["pos"]):
-            name = a["var"].lower()
+        for a in sorted(assignments, key=lambda a: a["pos"]):
+            name = _var_key(a["var"])
             if name in poisoned or not (a["top"] and a["op"] == "Equals"):
                 continue
             env.setdefault(name, []).append((a["pos"], self._value_in(a["value"], a["pos"], env)))
@@ -287,7 +293,7 @@ class _PowerShell:
             if isinstance(p, str):
                 out.append(p)
                 continue
-            name = p["var"].lower()
+            name = _var_key(p["var"])
             if name == "null":
                 continue
             seen = [v for pos, v in env.get(name, []) if pos < at]
@@ -340,7 +346,7 @@ class _PowerShell:
                     bound.setdefault(canon, []).extend(self._elem_values(elems[i], c["start"]))
                     i += 1
             else:
-                bound[canon] = not _is_false(e.get("a"))
+                bound[canon] = _switch(e, makes_safe=canon in _SAFE_SWITCHES)
         slots = [p for p in positional if p not in bound]
         if free and slots:
             # A single open slot takes every argument (`rm a b`); with more,
@@ -794,6 +800,43 @@ def _canonical(name: Optional[str]) -> Optional[str]:
     if n.endswith(".exe"):
         n = n[:-4]
     return _ALIASES.get(n, n)
+
+
+# Read-only: `$HOME = 'x'` fails, the line goes on and `$HOME` stays the home folder.
+_READ_ONLY = frozenset({
+    "home", "pshome", "pid", "host", "shellid", "psversiontable", "executioncontext", "psculture",
+    "psuiculture", "true", "false", "?",
+})
+# Set by PowerShell itself: `$_`, `$args`, `$input` … are something else where they are read.
+_AUTOMATIC = frozenset({
+    "_", "psitem", "args", "input", "this", "matches", "lastexitcode", "error", "foreach", "switch",
+    "psboundparameters", "myinvocation", "pscmdlet", "psscriptroot", "pscommandpath", "sender",
+    "eventargs", "event", "eventsubscriber", "stacktrace", "pwd", "nestedpromptlevel", "profile",
+    "consolefilename", "pssenderinfo", "psdebugcontext",
+})
+# Not in either list: `$IsWindows`, `$IsCoreCLR`, `$^`, `$$` … take what is put in
+# them in Windows PowerShell 5.1 (measured), so that value is the one read.
+_SCOPES = ("global:", "script:", "local:", "private:", "variable:")
+
+
+def _var_key(name: str) -> str:
+    """`$global:x`, `${variable:x}` and `$x` are one variable at the top of a line."""
+    key = name.lower()
+    while key.startswith(_SCOPES):
+        key = key.split(":", 1)[1]
+    return key
+# A switch that makes the command do nothing (or nothing harmful) counts only
+# when it is surely on: `-WhatIf:0` runs the command.
+_SAFE_SWITCHES = frozenset({"whatif", "noclobber"})
+
+
+def _switch(e: dict, makes_safe: bool) -> bool:
+    if "a" not in e:
+        return True
+    if makes_safe:
+        arg = e["a"]
+        return bool(arg) and len(arg) == 1 and isinstance(arg[0], dict) and arg[0]["var"].lower() == "true"
+    return not _is_false(e["a"])
 
 
 def _is_false(arg) -> bool:
