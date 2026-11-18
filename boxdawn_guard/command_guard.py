@@ -1292,9 +1292,19 @@ class _Judge:
 
     def _git(self, name: str, args: list[Value], depth: int) -> None:
         i = 0
+        # Paths are looked up on disk only from the folder the line starts in.
+        base: str | None = self.cwd if set(self.workdirs or [self.cwd]) == {self.cwd} and not (
+            "GIT_WORK_TREE" in self.env or "GIT_WORK_TREE" in self.known_env) else None
         while i < len(args):
             a = args[i]
+            if a is not None and a.startswith("--work-tree="):
+                base = None
             if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                if a == "--work-tree":
+                    base = None
+                if a == "-C":
+                    d = args[i + 1] if i + 1 < len(args) else None
+                    base = None if d is None or base is None else self._absolute(d, base)
                 i += 2
                 continue
             if a is not None and a.startswith("-"):
@@ -1324,10 +1334,8 @@ class _Judge:
             self.flag("ask", "git.branch_delete", "`git branch -D` deletes an unmerged branch")
         elif sub in ("filter-branch", "filter-repo"):
             self.flag("ask", "git.rewrite_history", f"`git {sub}` rewrites history")
-        elif (sub == "checkout" and "--" in rest and _broad_paths(rest[rest.index("--") + 1:])) or (
-                sub == "restore" and not {"--staged", "-S"} & set(rest) and _broad_paths(_operands(rest))) or (
-                sub == "checkout" and {"-f", "--force"} & set(rest)):
-            # `git checkout -- .` / `git restore .` overwrite edits the way `reset --hard` does.
+        elif sub in ("checkout", "restore", "switch") and _discards_changes(sub, rest, self._git_path_kind(base)):
+            # `git checkout -- .` / `git restore src` overwrite edits the way `reset --hard` does.
             # One named file (`git checkout -- a.py`) is how an agent undoes its own edit: no decision.
             self.flag("ask", "git.discard_changes", f"`git {sub}` overwrites uncommitted changes")
         elif sub == "rm" and ("r" in flags or "-r" in rest) and any(
@@ -1335,6 +1343,18 @@ class _Judge:
             self.flag("ask", "git.discard_changes", "`git rm -r .` deletes every tracked file")
         elif sub == "stash" and rest[:1] in (["drop"], ["clear"]):
             self.flag("ask", "git.stash_drop", f"`git stash {rest[0]}` deletes stashed work")
+
+    def _git_path_kind(self, base: str | None):
+        """What a git path names on disk: "dir", "file", or None when it is not there."""
+        def kind(path: str) -> str | None:
+            if base is None:
+                return None
+            native = self._native(self._absolute(path, base))
+            try:
+                return "dir" if os.path.isdir(native) else "file" if os.path.isfile(native) else None
+            except (OSError, ValueError):
+                return None
+        return kind
 
     def _db(self, name: str, args: list[Value]) -> None:
         r = self.rules
@@ -2114,6 +2134,69 @@ _DB_RESETS = (
     r"\bknex\s+migrate:rollback\b.*--all\b", r"\bsequelize(-cli)?\s+db:drop\b", r"\btypeorm\s+schema:drop\b",
     r"^dropdb\b",
 )
+
+
+_CHECKOUT_VALUES = {"-b", "-B", "--orphan", "--conflict", "-t", "--track"}
+_RESTORE_VALUES = {"-s", "--source", "--conflict"}
+
+
+def _discards_changes(sub: str, rest: list[Value], kind) -> bool:
+    """`git checkout|restore|switch` that overwrites edits in more than one named file.
+    `kind(path)` says whether the path is a folder or a file on disk."""
+    words = set(rest)
+    if sub != "restore" and ("--force" in words or "f" in _short_flags(rest)) or "--discard-changes" in words:
+        return True
+    if any(a is not None and a.startswith("--pathspec-from-file") for a in rest):
+        return True
+    if sub == "switch":
+        return False
+    if sub == "restore":
+        staged = {"--staged", "-S"} & words
+        worktree = {"--worktree", "-W"} & words
+        return (not staged or bool(worktree)) and _folder_paths(_operands(rest, _RESTORE_VALUES), kind)
+    # checkout
+    if "--" in rest:
+        return _folder_paths(rest[rest.index("--") + 1:], kind)
+    if {"-b", "-B", "--orphan"} & words or any(a and a.startswith("--orphan=") for a in rest):
+        return False
+    operands = _operands(rest, _CHECKOUT_VALUES)
+    if not operands:
+        return False
+    if len(operands) == 1:
+        # `git checkout main` is a branch, `git checkout .` a path; `src` is a
+        # path when it is a folder here or starts `./`. `"$BRANCH"`: a branch.
+        p = operands[0]
+        if p is None:
+            return False
+        if p.startswith(("./", ".\\")) or kind(p) == "dir":
+            return _folder_paths([p], kind)
+        return _broad_paths([p])
+    # `git checkout HEAD src`: what follows the first is paths, and the first
+    # too when it is a folder here (`git checkout src a.py`).
+    first = operands[0]
+    if first is not None and kind(first) == "dir":
+        return True
+    return _folder_paths(operands[1:], kind)
+
+
+def _folder_paths(paths: list[Value], kind) -> bool:
+    """`_broad_paths`, or a folder on disk, or a glob (`*.py`), or - when the
+    path is not on disk - a name with no file extension (`src`, `lib/x`):
+    more than an agent's one edit."""
+    if _broad_paths(paths):
+        return True
+    for p in paths:
+        if p.startswith(":") or any(c in p for c in "*?["):
+            return True
+        found = kind(p)
+        if found == "dir":
+            return True
+        if found == "file":
+            continue
+        last = p.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if "." not in last:
+            return True
+    return False
 
 
 def _broad_paths(paths: list[Value]) -> bool:
