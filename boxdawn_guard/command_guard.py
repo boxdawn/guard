@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import posixpath
 import re
+import shlex
 from dataclasses import dataclass, field
 from glob import escape as glob_escape, iglob
 from itertools import islice
@@ -117,7 +118,7 @@ RULE_IDS = frozenset({
     "docker.prune", "secret.read", "secret.send", "link.same_command", "rm.filtered_recurse",
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
     "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
-    "db.reset", "git.discard_changes", "git.stash_drop", "git.stash", "rm.history", "iac.auto_approve",
+    "db.reset", "git.discard_changes", "git.stash_drop", "git.stash", "git.alias", "git.config_command", "rm.history", "iac.auto_approve",
     "mirror.delete", "gh.delete", "fetch.then_run", "remote.run",
 })
 # Where the target sits, never what it is. "project_root" is the project
@@ -1295,11 +1296,17 @@ class _Judge:
         # Paths are looked up on disk only from the folder the line starts in.
         base: str | None = self.cwd if set(self.workdirs or [self.cwd]) == {self.cwd} and not (
             "GIT_WORK_TREE" in self.env or "GIT_WORK_TREE" in self.known_env) else None
+        configs: list[Value] = []  # `-c key=value`
         while i < len(args):
             a = args[i]
             if a is not None and a.startswith("--work-tree="):
                 base = None
+            if a is not None and a.startswith("--config-env="):
+                # `--config-env=alias.x=VAR`: the key is known, the value is in the environment
+                configs.append("\0" + a.partition("=")[2].partition("=")[0])
             if a in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                if a == "-c":
+                    configs.append(args[i + 1] if i + 1 < len(args) else "")
                 if a == "--work-tree":
                     base = None
                 if a == "-C":
@@ -1317,8 +1324,14 @@ class _Judge:
         if sub is None:
             self.flag("ask", "git.runtime", "the git subcommand is known only at run time")
             return
+        if configs:
+            # The alias is judged as what it stands for, and the name as written still is:
+            # a `git-<name>` program on PATH comes before an alias.
+            self._git_inline_config(name, configs, sub, rest, depth)
         flags = _short_flags(rest)
-        if sub == "push":
+        if sub == "config":
+            self._git_config(rest, depth)
+        elif sub == "push":
             if "--force" in rest or "f" in flags or any(a and a.startswith("+") for a in rest):
                 self.flag("deny", "git.push_force", "`git push --force` rewrites history others share")
             elif any(a and (a.startswith("--force-with-lease") or a == "--force-if-includes") for a in rest):
@@ -1366,6 +1379,123 @@ class _Judge:
             except (OSError, ValueError):
                 return None
         return kind
+
+    def _aside(self, judge) -> None:
+        """Judge something more without using up this line's record of what it
+        downloaded: that record has a size limit the line itself needs."""
+        kept = (list(self.fetched), set(self.fetch_said), self.fetch_looks)
+        try:
+            judge()
+        finally:
+            self.fetched, self.fetch_said, self.fetch_looks = kept[0], kept[1], kept[2]
+
+    def _git_inline_config(self, name: str, configs: list[Value], sub: str, rest: list[Value],
+                           depth: int) -> None:
+        """`git -c alias.x='stash pop' x`, `git -c core.pager='…' log`: what the
+        alias stands for, and what a setting makes git run."""
+        self._aside(lambda: self._git_inline_config_now(name, configs, sub, rest, depth))
+
+    def _git_inline_config_now(self, name: str, configs: list[Value], sub: str, rest: list[Value],
+                               depth: int) -> None:
+        aliases: dict[str, Value] = {}
+        for c in configs:
+            if c is None:
+                continue  # `-c "user.email=$E"`: an unknown setting, most often harmless
+            if c.startswith("\0"):  # `--config-env`: a known key, a value from the environment
+                key = c[1:].lower()
+                if key.startswith("alias."):
+                    aliases[key[len("alias."):]] = None
+                elif _git_runs(key, "!x"):
+                    self.flag("ask", "code.runtime", "`git` runs code known only at run time")
+                continue
+            key, eq, value = c.partition("=")
+            key = key.lower()
+            if key.startswith("alias."):
+                aliases[key[len("alias."):]] = value if eq else ""
+            elif eq and _git_run_text(key, value):
+                self.run(_git_run_text(key, value), depth + 1)  # run by git on this computer, through a shell
+        if sub in _GIT_COMMANDS or sub.lower() not in aliases:
+            return  # git does not let an alias stand in for its own commands
+        if depth + 1 > _MAX_DEPTH:
+            self.flag("ask", "parse.too_deep", "commands nested too deep to read")
+            return
+        value = aliases[sub.lower()]
+        if value is None:
+            self.flag("ask", "git.runtime", "the git subcommand is known only at run time")
+            return
+        if value.startswith("!"):
+            # git puts the words after the alias at the end of its shell command
+            tail = " ".join('"$_bdx_unknown"' if r is None else shlex.quote(r) for r in rest)
+            self.run(value[1:] + (" " + tail if tail else ""), depth + 1)
+            return
+        try:
+            words: list[Value] = shlex.split(value)
+        except ValueError:
+            self.flag("ask", "git.runtime", "the git subcommand is known only at run time")
+            return
+        # The same settings hold for what the alias stands for (`alias.a=b`, `alias.b=…`).
+        again: list[Value] = [w for c in configs for w in ("-c", c)]
+        self._git(name, again + words + rest, depth + 1)
+
+    def _git_config(self, rest: list[Value], depth: int) -> None:
+        """`git config alias.nuke 'reset --hard'` makes `git nuke` do that later,
+        in this session or another; `git config core.pager '…'` makes git run it."""
+        words = list(rest)
+        if words[:1] in (["set"], ["--add"], ["--replace-all"]):
+            words = words[1:]
+        elif words[:1] and words[0] is not None and not words[0].startswith("-") and words[0] in (
+                "get", "list", "unset", "rename-section", "remove-section", "edit"):
+            return
+        operands: list[Value] = []
+        i = 0
+        while i < len(words):
+            a = words[i]
+            if a is not None and a.startswith("-"):
+                if a.startswith(("--get", "--unset", "--list", "--remove-section", "--rename-section",
+                                 "--edit")) or a in ("-l", "-e"):
+                    return
+                i += 2 if a in ("-f", "--file", "--blob", "--type", "--default", "--comment", "--value") else 1
+                continue
+            operands.append(a)
+            i += 1
+        if len(operands) < 2 or operands[0] is None:
+            return
+        key, value = operands[0].lower(), operands[1]
+        alias = key.startswith("alias.")
+        if not alias and not _git_runs(key, "!x" if value is None else value):  # unknown: only for a key git runs
+            return
+
+        def say() -> None:
+            if alias:
+                self.flag("ask", "git.alias",
+                          f"`git config {operands[0]}` makes `git {operands[0][len('alias.'):]}` run a risky command")
+            else:
+                self.flag("ask", "git.config_command", f"`git config {operands[0]}` sets a risky command for git to run")
+
+        if value is None:
+            say()
+            return
+        if depth + 1 > _MAX_DEPTH:
+            self.flag("ask", "parse.too_deep", "commands nested too deep to read")
+            return
+        inner = _Judge(cwd=self.cwd, home=self.home, rules=self.rules)
+        inner.workdirs = [inner.cwd]
+        if not alias:
+            inner.run(_git_run_text(key, value) or "", depth + 1)
+        elif value.startswith("!"):
+            inner.run(value[1:], depth + 1)
+        else:
+            try:
+                inner._git("git", shlex.split(value), depth + 1)
+            except ValueError:
+                inner.flag("ask", "git.runtime", "the git subcommand is known only at run time")
+        if inner.decision is None:
+            return
+        say()
+        for finding, reason in zip(inner.findings, inner.reasons):
+            # It runs later, maybe elsewhere: ours ask; an org's own rule keeps its level.
+            level = finding.level if finding.rule.startswith("custom.") else "ask"
+            self._record(level, finding.rule, reason, None)
 
     def _db(self, name: str, args: list[Value]) -> None:
         r = self.rules
@@ -2149,6 +2279,54 @@ _DB_RESETS = (
 
 _CHECKOUT_VALUES = {"-b", "-B", "--orphan", "--conflict", "-t", "--track"}
 _RESTORE_VALUES = {"-s", "--source", "--conflict"}
+
+
+# git runs these settings' values through a shell.
+_GIT_RUNS = re.compile(r"core\.(sshcommand|pager|editor|fsmonitor|askpass|gitproxy|alternaterefscommand)"
+                       r"|sequence\.editor|diff\.external|interactive\.difffilter|sendemail\.sendmailcmd"
+                       r"|gpg(\.\w+)?\.program|gpg\.ssh\.defaultkeycommand|pager\.[\w-]+"
+                       r"|diff\.[^.]+\.(textconv|command)|(diff|merge)tool\.[^.]+\.cmd|(browser|man)\.[^.]+\.cmd"
+                       r"|trailer\.[^.]+\.(command|cmd)|remote\.[^.]+\.(uploadpack|receivepack)"
+                       r"|sendemail\.(tocmd|cccmd|headercmd)|hook\.[^.]+\.command"
+                       r"|merge\.[^.]+\.driver|filter\.[^.]+\.(clean|smudge|process)|uploadpack\.packobjectshook")
+
+
+def _git_run_text(key: str, value: str) -> Optional[str]:
+    """The shell command git runs for a setting, or None when it runs none.
+    `core.fsmonitor` and `pager.x` also take true/false."""
+    v = value.strip()
+    if key == "credential.helper" or re.fullmatch(r"credential\..+\.helper", key):
+        if not v:
+            return None
+        # `!cmd` as written, an absolute path as is, a name as `git credential-<name>`
+        return v[1:] if v.startswith("!") else v if v.startswith("/") else "git credential-" + v
+    if re.fullmatch(r"submodule\..+\.update", key):
+        return v[1:] if v.startswith("!") else None
+    if not _GIT_RUNS.fullmatch(key) or v.lower() in ("", "true", "false", "yes", "no", "on", "off", "0", "1"):
+        return None
+    if re.fullmatch(r"gpg(\.\w+)?\.program", key):
+        return shlex.quote(v)  # a program, run without a shell: spaces and brackets are its name
+    return v
+
+
+def _git_runs(key: str, value: str) -> bool:
+    return _git_run_text(key, value) is not None
+
+
+# git's own commands: an alias of the same name is ignored.
+_GIT_COMMANDS = frozenset("""
+add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-mailmap
+check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit commit-graph
+commit-tree config count-objects credential describe diagnose diff diff-files diff-index diff-tree difftool
+fast-export fast-import fetch fetch-pack fmt-merge-msg for-each-ref for-each-repo format-patch
+fsck gc get-tar-commit-id grep hash-object help hook http-backend index-pack init interpret-trailers
+log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-tree
+mktag mktree multi-pack-index mv name-rev notes pack-objects pack-redundant pack-refs patch-id prune prune-packed
+pull push range-diff read-tree rebase reflog remote repack replace rerere reset restore rev-list
+rev-parse revert rm send-pack shortlog show show-branch show-index show-ref sparse-checkout stash
+status stripspace submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref
+update-server-info var verify-commit verify-pack verify-tag version whatchanged worktree write-tree
+""".split())
 
 
 def _discards_changes(sub: str, rest: list[Value], kind) -> bool:

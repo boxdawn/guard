@@ -18,6 +18,9 @@ _TABLE = (
     ("the PowerShell reader of this guard is missing", "차단기의 PowerShell 판독기가 없습니다"),
     ("the command name is only known at run time", "무슨 명령이 실행될지 미리 알 수 없습니다"),
     ("the git subcommand is known only at run time", "실행해야만 git 하위 명령을 알 수 있습니다"),
+    ("`git config {}` makes `git {}` run a risky command",
+     "`git config {0}`: 이 설정 뒤 `git {1}` 이 위험한 명령을 실행합니다"),
+    ("`git config {}` sets a risky command for git to run", "`git config {0}`: git 이 실행할 위험한 명령을 설정합니다"),
     ("nobody is present to approve it", "승인할 사람이 없습니다"),
     ("this puts the project's files back from a snapshot", "사진에서 프로젝트 파일을 되돌리는 명령입니다"),
     # secret files
