@@ -296,6 +296,11 @@ class _Judge:
     fetched: list = field(default_factory=list)  # [(keys of a file this line downloaded, the name shown)]
     fetch_said: set = field(default_factory=set)
     fetch_looks: int = 0
+    # What the command being judged reads on stdin, for `_remote`: (how, the text if known),
+    # how = "pipe" (another command's output) or "fed" (heredoc / herestring), or None.
+    stdin_now: tuple = (None, None)
+    stdin_base: tuple = (None, None)  # what a command with no stdin of its own reads (a remote line's)
+    piped: set = field(default_factory=set)  # ids of the commands on this line that read a pipe
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -333,9 +338,10 @@ class _Judge:
         root = tree.root_node
         if root.has_error:
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
-        outer = (self.env, self.workdirs)
+        outer = (self.env, self.workdirs, self.piped)
         self.env = self._collect_env(root)
         self._collect_workdirs(root, depth)
+        self.piped = _piped_commands(root)
         try:
             for node in _walk(root):
                 if node.type == "command":
@@ -345,7 +351,7 @@ class _Judge:
                 elif node.type == "pipeline":
                     self._pipeline(node)
         finally:
-            self.env, self.workdirs = outer
+            self.env, self.workdirs, self.piped = outer
 
     # variables ──────────────────────────────────────────────────────────
     def _collect_env(self, root: Node) -> dict:
@@ -685,7 +691,12 @@ class _Judge:
             self._fetch_command(node, name, args)
         except Exception:  # noqa: BLE001 - it only adds an ask; the judgement below does not wait on it
             pass
-        self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
+        outer_stdin = self.stdin_now
+        self.stdin_now = ("fed", text) if fed else ("pipe", None) if node.id in self.piped else self.stdin_base
+        try:
+            self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
+        finally:
+            self.stdin_now = outer_stdin
         grep = posixpath.basename(name).lower()
         if depth == 0 and grep in secret_files.GREPS:
             recursive, paths, includes = secret_files.grep_reads(args)
@@ -733,6 +744,7 @@ class _Judge:
                 self._env(args, rest, depth, stdin_fed, stdin_text)
                 return
             if name == "xargs":
+                self.stdin_now = (None, None)  # what it runs reads /dev/null
                 if rest:
                     self._judge(rest[0], rest[1:] + [None], depth)
                 return
@@ -1513,24 +1525,57 @@ class _Judge:
     def _remote(self, name: str, words: list[Value], shell: bool, depth: int) -> None:
         """A command run inside a container or on another machine (#37574).
         Its paths are not this computer's, so it is read on its own, as if
-        from a folder of its own, and what it would hold or block asks."""
-        if not words:
+        from a folder of its own, and what it would hold or block asks.
+        What this command reads on stdin reaches the remote command too: run
+        as code there when it is a shell or interpreter reading it."""
+        how, text = self.stdin_now
+        if not words and not (shell and how):
             return
         if depth + 1 > _MAX_DEPTH:
             self.flag("ask", "parse.too_deep", "commands nested too deep to read")
             return
         inner = _Judge(cwd=_REMOTE_CWD, home=_REMOTE_HOME, rules=self.rules)
         inner.workdirs = [inner.cwd]
-        if not shell:
+        # A command there with no stdin of its own reads this one (`ssh jump ssh host`).
+        inner.stdin_base = (how, text)
+        readers: list[tuple[str, list[Value]]] = []  # what reads stdin as code there
+        if not words:
+            readers.append(("sh", []))  # `ssh host`: the login shell reads stdin
+        elif not shell:
             name0 = words[0]
             if name0 is not None:  # `bin/console`, as `_name_args` reads a name
                 name0 = posixpath.basename(name0.replace("\\", "/"))
                 name0 = name0[:-4] if name0.lower().endswith(".exe") else name0
+            inner.stdin_now = (how, text)
             inner._judge(name0, words[1:], depth + 1)
+            readers.append((name0, words[1:]))
         elif any(w is None for w in words):
             inner._judge("sh", ["-c", None], depth + 1)
         else:
-            inner.run(" ".join(words), depth + 1)
+            line = " ".join(words)
+            inner.run(line, depth + 1)
+            if how:
+                for n in _walk(_PARSER.parse(line.encode("utf-8")).root_node):
+                    if n.type == "command":
+                        readers.append(inner._final(*inner._name_args(n)))
+        said = set()  # the same text read by many readers is judged once (`ssh h 'sh;sh;…'`)
+        for name0, args in readers if how else ():
+            name0, args = inner._final(name0, args)
+            if name0 is None or name0 not in self.rules.interpreters or _code_or_file(name0, args, self.rules):
+                continue
+            key = "sh" if name0 in self.rules.shells else name0
+            if key in said:
+                continue
+            said.add(key)
+            if how == "pipe":
+                inner.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{name0}` code")
+            elif text is None:
+                inner.flag("ask", "code.stdin_runtime", f"text known only at run time is fed into `{name0}` as code")
+            elif name0 in self.rules.shells:
+                inner.stdin_base = (None, None)  # the text is that shell's stdin, read as its code
+                inner.run(text, depth + 1)
+            else:
+                inner._scan_code(name0, text)
         if inner.decision is None:
             return
         self.flag("ask", "remote.run", f"`{name}` runs a risky command inside a container or on another machine")
@@ -1559,6 +1604,8 @@ class _Judge:
                 break
             letters = a[1:]
             for k, ch in enumerate(letters):
+                if ch in "nf":  # stdin from /dev/null
+                    self.stdin_now = (None, None)
                 if ch in _SSH_VALUE_FLAGS:
                     if k == len(letters) - 1:
                         values.append((ch, args[i] if i < len(args) else None))
@@ -1580,6 +1627,8 @@ class _Judge:
     def _infra(self, name: str, args: list[Value], depth: int) -> None:
         inner = _container_command(name, args)
         if inner is not None:
+            if not _exec_reads_stdin(name, args, inner):
+                self.stdin_now = (None, None)
             self._remote(name, inner, False, depth)
         words = [a for a in args if a is not None]
         if name in ("terraform", "tofu"):
@@ -1896,6 +1945,23 @@ def _operands(args: list[Value], takes_value: frozenset[str] | set[str] = frozen
         else:
             out.append(a)
     return out
+
+
+def _piped_commands(root: Node) -> set:
+    """Ids of the commands that read the output of another one: in a stage
+    after the first of a pipeline, or the first after a heredoc start
+    (`cat <<EOF | ssh h`), as `_pipeline` reads the stages it calls fed;
+    a command in a group or subshell there too (`cat x | (cd /tmp && ssh h)`).
+    One walk of the line, so a long line is not climbed once per command."""
+    ids: set = set()
+    for line in _walk(root):
+        if line.type != "pipeline":
+            continue
+        stages = list(line.named_children)
+        after_heredoc = line.parent is not None and line.parent.type == "heredoc_redirect"
+        for stage in stages if after_heredoc else stages[1:]:
+            ids.update(n.id for n in _walk(stage) if n.type == "command")
+    return ids
 
 
 def _positional(args: list[Value]) -> list[Value]:
@@ -2466,6 +2532,17 @@ def _container_command(name: str, args: list[Value]) -> Optional[list[Value]]:
     if entry and entry[-1] is not None:
         entry = entry[-1].split()  # compose splits it into words
     return entry[-1:] if entry == [None] else entry + after[1:]  # after the service
+
+
+def _exec_reads_stdin(name: str, args: list[Value], inner: list[Value]) -> bool:
+    """`docker exec` and `kubectl exec` pass stdin on only with `-i`;
+    `docker compose exec|run` pass it on unless told otherwise."""
+    options = args[:len(args) - len(inner)]
+    if name == "docker-compose" or "compose" in options:
+        return True
+    return any(a is None or a in ("-i", "--interactive", "--stdin") or re.fullmatch(r"-[A-Za-z]*i[A-Za-z]*", a)
+               or (a.startswith(("--interactive=", "--stdin=", "-i=")) and a.split("=", 1)[1].lower() != "false")
+               for a in options)
 
 
 _TMUX_RUNS = frozenset({"new", "new-session", "new-window", "neww", "split-window", "splitw",
