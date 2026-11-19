@@ -89,6 +89,11 @@ _PATHS = {"path": _V, "literalpath": _V, "filter": _V, "include": _V, "exclude":
           "force": _S, "credential": _V, "stream": _V}
 _PATH_ALIASES = {"pspath": "literalpath", "lp": "literalpath"}
 
+_ALIAS_PARAMS = {"name": _V, "value": _V, "description": _V, "option": _V, "scope": _V, "force": _S,
+                 "passthru": _S}
+_ALIAS_SPEC = (_ALIAS_PARAMS, {}, ("name", "value"))
+_SETS_ALIAS = frozenset({"set-alias", "sal", "new-alias", "nal"})
+
 # name -> (parameters, aliases, positional order)
 _SPECS: dict[str, tuple[dict, dict, tuple]] = {
     "remove-item": ({**_PATHS, "recurse": _S}, _PATH_ALIASES, ("path",)),
@@ -190,6 +195,8 @@ class _PowerShell:
     def __init__(self, judge: _Judge, parse: Parse, known_env: dict, home: str) -> None:
         self.j, self.parse, self.known_env, self.home = judge, parse, known_env, home
         self.env: dict[str, list] = {}
+        # `Set-Alias` on this line: (where, name or None when unknown, command or None)
+        self.aliases: list[tuple[int, Optional[str], Value]] = []
 
     def run(self, text: str, depth: int) -> None:
         j = self.j
@@ -199,9 +206,10 @@ class _PowerShell:
         tree = self.parse(text)
         if tree["errors"]:
             j.flag("ask", "parse.unreadable", "the PowerShell syntax could not be read")
-        outer = (self.env, j.workdirs)
+        outer = (self.env, j.workdirs, self.aliases)
         commands = tree["commands"]
         self.env = self._collect_env(tree)
+        self._resolve_aliases(commands)
         j.workdirs = self._collect_workdirs(commands, depth)
         try:
             saved = self._downloads(text, tree)
@@ -214,6 +222,7 @@ class _PowerShell:
                 except Exception:  # noqa: BLE001 - it only adds an ask
                     saved = []
                 self._command(c, depth)
+                self._as_alias(c, depth)
                 name = _canonical(c["name"])
                 if name is None:
                     continue
@@ -241,7 +250,98 @@ class _PowerShell:
             for w in tree["writes"]:
                 self._writes(self._value(w["to"], w["start"]), "output")
         finally:
-            self.env, j.workdirs = outer
+            self.env, j.workdirs, self.aliases = outer
+
+    # aliases ────────────────────────────────────────────────────────────
+    def _resolve_aliases(self, commands: list) -> None:
+        """Collect the aliases this line sets: `Set-Alias g Remove-Item`,
+        `New-Item alias:g -Value …`. One the line inherits counts from its start."""
+        found = [(-1, n, t) for _, n, t in self.aliases]
+        for c in commands:
+            name = _canonical(c["name"])
+            at = c["start"]
+            if name in _SETS_ALIAS:
+                b = self._bind(c, name, _ALIAS_SPEC)
+                target = (b.get("value") or [None])[0]
+                for n in b.get("name") or [None]:
+                    found.append((at, None if n is None else n.lower(), target))
+            elif name in ("import-alias", "ipal"):
+                found.append((at, None, None))
+            elif name in ("new-item", "set-item", "si"):
+                path, value = self._item_path_value(c)
+                # A path known only at run time is far more often a file: not read as an alias.
+                if path is None or not path.lower().lstrip("\\/").startswith("alias:"):
+                    continue
+                n = path.lower().lstrip("\\/")[len("alias:"):].strip("\\/")
+                found.append((at, n or None, value))
+        self.aliases = found
+        if any(n is None for _, n, _ in found):
+            self.j.flag("ask", "name.runtime", "the command name is only known at run time")
+
+    def _item_path_value(self, c: dict) -> tuple[Value, Value]:
+        """`New-Item alias:g -Value x`, `Set-Item -Path alias:\\g x`."""
+        free: list[Value] = []
+        named: dict[str, Value] = {}
+        elems, i = c["elems"], 0
+        while i < len(elems):
+            e = elems[i]
+            i += 1
+            if "p" not in e:
+                free.extend(self._elem_values(e, c["start"]))
+                continue
+            p = e["p"].lower()
+            if "a" in e:
+                v = self._value(e["a"], c["start"])
+            elif i < len(elems) and "p" not in elems[i]:
+                v = self._elem_values(elems[i], c["start"])[0]
+                i += 1
+            else:
+                continue
+            for full in ("path", "literalpath", "value", "target"):
+                if full.startswith(p) and len(p) >= 2 or p in ("lp", "pspath"):
+                    named.setdefault("path" if full in ("path", "literalpath") or p in ("lp", "pspath")
+                                     else "value", v)
+                    break
+        path = named.get("path", free[0] if free else None)
+        value = named.get("value", free[1] if len(free) > 1 else None)
+        return path, value
+
+    def _alias_target(self, c: dict) -> Value | bool:
+        """What an alias set earlier on the line makes this command: a name,
+        None when that is not known, False when it is no alias of this line.
+        A path or a module-qualified name is never an alias."""
+        raw = c["name"]
+        if raw is None or "\\" in raw or "/" in raw or _canonical(raw) in _SETS_ALIAS:
+            return False
+        key, at, hops = raw.lower(), c["start"], 0
+        while hops < 8:
+            defs = [t for pos, n, t in self.aliases if n == key and pos < at]
+            if not defs:
+                break
+            hops += 1
+            if defs[-1] is None:
+                return None
+            key = defs[-1].lower()
+            if "\\" in key or "/" in key:
+                break
+        return key if hops else False
+
+    def _as_alias(self, c: dict, depth: int) -> None:
+        """Judge the command again as what an alias set on this line makes it.
+        It only adds: the name as written is judged too, in case the alias
+        never took (`-WhatIf`, a script block that never ran, a read-only name)."""
+        try:
+            target = self._alias_target(c)
+        except Exception:  # noqa: BLE001 - it only adds an ask
+            target = None
+        if target is False:
+            return
+        if target is None:
+            self.j.flag("ask", "name.runtime", "the command name is only known at run time")
+            return
+        again = dict(c, name=target)
+        again.pop("head_v", None)
+        self.j._aside(lambda: self._command(again, depth))
 
     # values ─────────────────────────────────────────────────────────────
     def _collect_env(self, tree: dict) -> dict:
@@ -322,9 +422,9 @@ class _PowerShell:
         return out
 
     # binding ────────────────────────────────────────────────────────────
-    def _bind(self, c: dict, name: str) -> dict:
+    def _bind(self, c: dict, name: str, spec: Optional[tuple] = None) -> dict:
         """Parameter name -> list of values, or True/False for a switch."""
-        params, aliases, positional = _SPECS[name]
+        params, aliases, positional = spec or _SPECS[name]
         bound: dict = {}
         free: list[list[Value]] = []  # one entry per argument; `a, b` is one
         elems = c["elems"]
