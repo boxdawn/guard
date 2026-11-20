@@ -436,6 +436,21 @@ class _Judge:
                 return True, body.text.decode("utf-8", "replace")
         return False, None
 
+    def _stdin_is_output(self, node: Node) -> bool:
+        """`bash < <(curl …)`: stdin is another command's output, as through a pipe."""
+        redirects = list(node.children_by_field_name("redirect"))
+        if node.parent is not None and node.parent.type == "redirected_statement":
+            redirects += node.parent.children_by_field_name("redirect")
+        for r in redirects:
+            op = "".join(c.text.decode() for c in r.children if not c.is_named)
+            source = r.child_by_field_name("destination")
+            descriptor = r.child_by_field_name("descriptor")
+            if (r.type == "file_redirect" and op == "<" and source is not None
+                    and source.type == "process_substitution"
+                    and (descriptor is None or descriptor.text == b"0")):
+                return True
+        return False
+
     def _scan_code(self, name: str, code: str) -> None:
         for text in secret_files.literals_in_code(code):
             if self._is_secret(text):
@@ -692,7 +707,13 @@ class _Judge:
         except Exception:  # noqa: BLE001 - it only adds an ask; the judgement below does not wait on it
             pass
         outer_stdin = self.stdin_now
-        self.stdin_now = ("fed", text) if fed else ("pipe", None) if node.id in self.piped else self.stdin_base
+        substituted = not fed and self._stdin_is_output(node)
+        if substituted:
+            first, rest = self._final(name, args)
+            if first in self.rules.interpreters and not _code_or_file(first, rest, self.rules):
+                self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{first}` code")
+        piped = node.id in self.piped or substituted
+        self.stdin_now = ("fed", text) if fed else ("pipe", None) if piped else self.stdin_base
         try:
             self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
         finally:
@@ -1613,16 +1634,26 @@ class _Judge:
                     else:
                         values.append((ch, letters[k + 1:]))  # `-p22`
                     break
+        remote = None  # `-o RemoteCommand=…`: the line the remote shell runs when none follows the host
         for ch, value in values:
             # Run by ssh on this computer, through a shell.
-            m = re.match(r"(?i)\s*(ProxyCommand|LocalCommand|KnownHostsCommand)\s*[= ]\s*(.*)", value or "",
-                         re.S) if ch == "o" else None
+            m = re.match(r"(?i)\s*(ProxyCommand|LocalCommand|KnownHostsCommand|RemoteCommand)\s*[= ]\s*(.*)",
+                         value or "", re.S) if ch == "o" else None
             if value is None and ch == "o":
                 self.flag("ask", "code.runtime", "`ssh` runs code known only at run time")
             elif m and m.group(2).lower() != "none":
-                self.run(m.group(2), depth + 1)
+                if m.group(1).lower() == "remotecommand":
+                    remote = m.group(2)
+                else:
+                    self.run(m.group(2), depth + 1)
         if host:
-            self._remote(name, args[i:], True, depth)
+            self._remote(name, args[i:] or ([remote] if remote is not None else []), True, depth)
+
+    def _sshpass(self, name: str, args: list[Value], depth: int) -> None:
+        """`sshpass -p pw ssh host …`: it types the password for the command after its options."""
+        rest = _strip_options(args, {"-p", "-f", "-d", "-P"})
+        if rest:
+            self._judge(rest[0], rest[1:], depth)
 
     def _infra(self, name: str, args: list[Value], depth: int) -> None:
         inner = _container_command(name, args)
@@ -1763,8 +1794,9 @@ _HANDLERS = {
     "adb": _Judge._device, "fastboot": _Judge._device,
     "awk": _Judge._awk, "gawk": _Judge._awk, "mawk": _Judge._awk, "nawk": _Judge._awk,
     "wsl": _Judge._wsl, "docker-compose": _Judge._infra,
+    "podman": _Judge._infra, "podman-compose": _Judge._infra,
     "robocopy": _Judge._mirror, "lftp": _Judge._mirror, "gh": _Judge._gh, "firebase": _Judge._firebase,
-    "ssh": _Judge._ssh,
+    "ssh": _Judge._ssh, "sshpass": _Judge._sshpass,
 }
 
 
@@ -2520,9 +2552,14 @@ def _strip_cluster(args: list[Value], takes_value: set[str]) -> list[Value]:
     return args[i:]
 
 
+_DOCKER_LIKE = {"podman": "docker", "podman-compose": "docker-compose"}
+
+
 def _container_command(name: str, args: list[Value]) -> Optional[list[Value]]:
     """The words `docker exec`, `docker compose exec|run` or `kubectl exec`
-    runs inside the container, as given (no shell). None: not one of these."""
+    runs inside the container, as given (no shell). None: not one of these.
+    podman takes docker's commands."""
+    name = _DOCKER_LIKE.get(name, name)
     if name == "kubectl":
         rest = _strip_options(args, _KUBECTL_VALUES)
         if rest[:1] != ["exec"]:
@@ -2558,7 +2595,7 @@ def _exec_reads_stdin(name: str, args: list[Value], inner: list[Value]) -> bool:
     """`docker exec` and `kubectl exec` pass stdin on only with `-i`;
     `docker compose exec|run` pass it on unless told otherwise."""
     options = args[:len(args) - len(inner)]
-    if name == "docker-compose" or "compose" in options:
+    if _DOCKER_LIKE.get(name, name) == "docker-compose" or "compose" in options:
         return True
     return any(a is None or a in ("-i", "--interactive", "--stdin") or re.fullmatch(r"-[A-Za-z]*i[A-Za-z]*", a)
                or (a.startswith(("--interactive=", "--stdin=", "-i=")) and a.split("=", 1)[1].lower() != "false")
