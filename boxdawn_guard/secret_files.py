@@ -15,10 +15,12 @@ import posixpath
 import re
 from typing import Optional
 
-_NAMES = frozenset({".netrc", "_netrc", ".pypirc", ".npmrc", ".git-credentials"})
+_NAMES = frozenset({".netrc", "_netrc", ".pypirc", ".npmrc", ".git-credentials", ".dockercfg"})
 _DIRS = frozenset({".ssh", ".aws"})
 _ENDINGS = (".aws/credentials", ".docker/config.json", ".kube/config", "gh/hosts.yml",
-            ".claude/.credentials.json")
+            ".claude/.credentials.json", ".config/containers/auth.json")
+# Podman, Buildah and Skopeo log in here on Linux (`$XDG_RUNTIME_DIR/containers/auth.json`).
+_RUNTIME_AUTH = re.compile(r"(.*/)?run/user/\d+/containers/auth\.json")
 _ENV_EXAMPLES = (".example", ".sample", ".template", ".dist")
 _SSH_NOT_SECRET = frozenset({"config", "authorized_keys"})
 _PRIVATE_KEY = re.compile(r"id_(rsa|ed25519|ecdsa|dsa)(\..+)?")
@@ -48,7 +50,7 @@ _GREP_LONG_VALUES = ("--regexp", "--file", "--max-count", "--context", "--after-
                      "--devices", "--include", "--exclude", "--exclude-dir", "--exclude-from", "--label",
                      "--binary-files", "--group-separator")
 GREP_EXCLUDES = (
-    *(f"--exclude={n}" for n in (".env", *sorted(_NAMES), "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+    *(f"--exclude={n}" for n in (".env", *sorted(_NAMES - {".dockercfg"}), "id_rsa",  # the line stays short "id_ed25519", "id_ecdsa", "id_dsa",
                                  ".credentials.json", "hosts.yml")),
     "--exclude='.env.*'", "--exclude='*.[pP]12'", "--exclude='*.[pP][fF][xX]'",
     *(f"--exclude-dir={d}" for d in (".ssh", ".aws", ".docker", ".kube")),
@@ -159,7 +161,7 @@ def secret_folder(root: str) -> Optional[str]:
 # What a pattern is tried against.
 _GLOB_TRIES = (".env", ".env.local", ".netrc", ".pypirc", ".npmrc", ".git-credentials", "_netrc",
                "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", "credentials", "config", "config.json",
-               "hosts.yml", "x.p12", "x.pfx")
+               "hosts.yml", "x.p12", "x.pfx", "auth.json", ".dockercfg")
 
 # These take a path and do not show what is in the file.
 METADATA_ONLY = frozenset({
@@ -214,7 +216,7 @@ def is_secret(path: str, *, glob_matches_dots: bool = False) -> bool:
         return True
     if posixpath.basename(parent) == ".ssh":
         return not (name.endswith(".pub") or name.startswith("known_hosts") or name in _SSH_NOT_SECRET)
-    return any(p == e or p.endswith("/" + e) for e in _ENDINGS)
+    return any(p == e or p.endswith("/" + e) for e in _ENDINGS) or _RUNTIME_AUTH.fullmatch(p) is not None
 
 
 def _glob_is_secret(parent: str, name: str, matches_dots: bool) -> bool:

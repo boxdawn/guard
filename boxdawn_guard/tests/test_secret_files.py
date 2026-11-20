@@ -89,6 +89,10 @@ READS = [
     "cat ~/.npmrc",
     "cat ~/.git-credentials",
     "cat ~/.docker/config.json",
+    "cat ~/.dockercfg",
+    "cat ~/.config/containers/auth.json",
+    "cat /run/user/1000/containers/auth.json",
+    "cat ~/.config/containers/*.json",
     "cat ~/.kube/config",
     "cat ~/.config/gh/hosts.yml",
     "cat ~/.claude/.credentials.json",
@@ -291,6 +295,8 @@ def test_a_reason_stays_local_and_a_finding_has_no_path():
     ("/x/_netrc", True), ("/x/.kube/config", True), ("/x/config", False),
     ("/x/.claude/.credentials.json", True), ("/x/.credentials.json", False),
     ("/x/gh/hosts.yml", True), ("/x/hosts.yml", False),
+    ("/x/.config/containers/auth.json", True), ("/run/user/1000/containers/auth.json", True),
+    ("src/containers/auth.json", False), ("/x/.config/containers/registries.conf", False), ("/x/.dockercfg", True),
     (".e*", True), (".*", True), ("*", False), ("id_*", True), ("*.py", False), ("/x/.ssh/*", True),
 ])
 def test_what_counts_as_a_secret_file(path, secret):
@@ -369,6 +375,7 @@ def excluded(name, excludes=secret_files.SEARCH_EXCLUDES):
     ".env", ".env.local", ".netrc", "_netrc", ".pypirc", ".npmrc", ".git-credentials", "id_rsa", "id_ed25519",
     "id_ecdsa", "id_dsa", "x.p12", "x.pfx", "sub/.env", "home/.ssh/deploy", "home/.aws/credentials",
     "home/.docker/config.json", "home/.kube/config", "home/.config/gh/hosts.yml", "home/.claude/.credentials.json",
+    "home/.config/containers/auth.json", "home/.dockercfg",
 ])
 def test_every_secret_name_has_an_exclude(name):
     assert secret_files.is_secret(name)
