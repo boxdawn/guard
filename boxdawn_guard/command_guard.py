@@ -300,6 +300,7 @@ class _Judge:
     # how = "pipe" (another command's output) or "fed" (heredoc / herestring), or None.
     stdin_now: tuple = (None, None)
     stdin_base: tuple = (None, None)  # what a command with no stdin of its own reads (a remote line's)
+    stdin_local: bool = False  # inside `bash -c '…'` here: stdin_base is this shell's stdin, read here too
     piped: set = field(default_factory=set)  # ids of the commands on this line that read a pipe
 
     def __post_init__(self) -> None:
@@ -448,6 +449,19 @@ class _Judge:
             if (r.type == "file_redirect" and op == "<" and source is not None
                     and source.type == "process_substitution"
                     and (descriptor is None or descriptor.text == b"0")):
+                return True
+        return False
+
+    def _stdin_from_file(self, node: Node) -> bool:
+        """`bash < a.sh`: this command's stdin is a file of its own."""
+        redirects = list(node.children_by_field_name("redirect"))
+        if node.parent is not None and node.parent.type == "redirected_statement":
+            redirects += node.parent.children_by_field_name("redirect")
+        for r in redirects:
+            op = "".join(c.text.decode() for c in r.children if not c.is_named)
+            descriptor = r.child_by_field_name("descriptor")
+            if r.type == "file_redirect" and op in ("<", "<>", "<&") and (
+                    descriptor is None or descriptor.text == b"0"):
                 return True
         return False
 
@@ -713,6 +727,14 @@ class _Judge:
             if first in self.rules.interpreters and not _code_or_file(first, rest, self.rules):
                 self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{first}` code")
         piped = node.id in self.piped or substituted
+        if self.stdin_local and not fed and not piped and not self._stdin_from_file(node):
+            how, base_text = self.stdin_base
+            if how == "fed":
+                fed, text = True, base_text
+            elif how == "pipe":
+                first, rest = self._final(name, args)
+                if first in self.rules.interpreters and not _code_or_file(first, rest, self.rules):
+                    self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{first}` code")
         self.stdin_now = ("fed", text) if fed else ("pipe", None) if piped else self.stdin_base
         try:
             self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
@@ -798,7 +820,14 @@ class _Judge:
                 if code is None:
                     self.flag("ask", "code.runtime", f"`{name}` runs code known only at run time")
                 elif name in r.shells:
-                    self.run(code, depth + 1)
+                    # `… | bash -c 'bash -s'`: a command in there with no stdin of its own reads this shell's
+                    outer = (self.stdin_base, self.stdin_local)
+                    if self.stdin_now[0]:
+                        self.stdin_base, self.stdin_local = self.stdin_now, True
+                    try:
+                        self.run(code, depth + 1)
+                    finally:
+                        self.stdin_base, self.stdin_local = outer
                 else:
                     self._scan_code(name, code)
                 return
