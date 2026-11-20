@@ -122,6 +122,7 @@ _TABLE = (
     ("`rm` removes `{}`, which no build makes again", "`rm`: 다시 만들 수 없는 것을 지웁니다: `{0}`"),
     ("`{} apply -auto-approve` changes infrastructure without a review", "`{0} apply -auto-approve`: 검토 없이 인프라를 바꿉니다"),
     ("`{} down -v` deletes the project's volumes", "`{0} down -v`: 프로젝트 볼륨을 지웁니다"),
+    ("`{} rm -v` deletes the containers' anonymous volumes", "`{0} rm -v`: 컨테이너의 이름 없는 볼륨을 지웁니다"),
     ("`{}` runs a risky command inside a container or on another machine",
      "`{0}`: 컨테이너나 다른 기계 안에서 위험한 명령을 실행합니다"),
     ("`robocopy /MIR` deletes files the source does not have", "`robocopy /MIR`: 원본에 없는 파일을 지웁니다"),

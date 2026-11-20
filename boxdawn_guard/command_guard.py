@@ -1719,6 +1719,8 @@ class _Judge:
             # #63644: the database lived in the volume
             said = f"{name} compose" if kind == "docker" else name
             self.flag("ask", "docker.prune", f"`{said} down -v` deletes the project's volumes")
+        elif kind in ("docker", "docker-compose") and (said := _removes_volumes(name, kind, words)):
+            self.flag("ask", "docker.prune", f"`{said} rm -v` deletes the containers' anonymous volumes")
         if name in ("terraform", "tofu") and "apply" in words and any(
                 w in ("-auto-approve", "--auto-approve") for w in words) and "-destroy" not in words:
             self.flag("ask", "iac.auto_approve", f"`{name} apply -auto-approve` changes infrastructure without a review")
@@ -2584,6 +2586,29 @@ def _strip_cluster(args: list[Value], takes_value: set[str]) -> list[Value]:
 
 
 _DOCKER_LIKE = {"podman": "docker", "podman-compose": "docker-compose"}
+
+
+def _removes_volumes(name: str, kind: str, words: list[str]) -> Optional[str]:
+    """`docker rm -v`, `docker container rm -v`, `docker compose rm -v`: the
+    containers go with the anonymous volumes they made. The command as said, or None."""
+    def past(options: set[str], i: int) -> int:
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in options else 1
+        return i
+
+    i = past(_DOCKER_GLOBAL, 0) if kind == "docker" else 0
+    said = name
+    if kind == "docker" and words[i:i + 1] == ["container"]:
+        said, i = f"{name} container", i + 1
+    elif kind == "docker-compose" or words[i:i + 1] == ["compose"]:
+        if kind == "docker":
+            said, i = f"{name} compose", i + 1
+        i = past(_COMPOSE_GLOBAL, i)
+    if words[i:i + 1] != ["rm"]:
+        return None
+    if any(w in ("--volumes", "--volumes=true") or re.fullmatch(r"-[A-Za-z]*v[A-Za-z]*", w) for w in words[i + 1:]):
+        return said
+    return None
 
 
 def _container_command(name: str, args: list[Value]) -> Optional[list[Value]]:
