@@ -1,7 +1,7 @@
 <div align="center">
   <img src="https://avatars.githubusercontent.com/u/317308737?s=160&v=4" width="80" alt="Boxdawn" />
   <h1>Boxdawn guard</h1>
-  <p><strong>Stops dangerous commands before Claude Code runs them.</strong></p>
+  <p><strong>Checks the Bash and PowerShell commands Claude Code and GitHub Copilot CLI run, before they run: denies or asks with the reason, or leaves no decision.</strong></p>
   <p>
     <a href="https://github.com/boxdawn/guard/releases/latest"><img src="https://img.shields.io/github/v/release/boxdawn/guard?label=release" alt="Latest release" /></a>
     <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="License: FSL-1.1-ALv2" /></a>
@@ -76,7 +76,7 @@ The fixed rules ship inside the plugin and anyone can read them. **Without an AP
 
 With a Boxdawn API key on a paid plan, set in the plugin's settings (`/plugin configure boxdawn-guard@boxdawn`), the guard fetches signed rules from Boxdawn in the background at session start and uses them in place of the fixed ones. The request carries the key only, never a command. Each bundle is signed (Ed25519) and valid for 7 days; a bundle that is missing, expired or fails its signature check means the fixed rules.
 
-## Block record
+## Deny and ask record
 
 On a paid plan, each deny or ask judged on the signed rules is appended as one line to `log/blocks-YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/block_log.py`](boxdawn_guard/block_log.py)). A line holds the tool, the decision, the rule ids and where the target sits (inside the project, outside it, …), never the command or a path. Files older than 30 days are deleted at the next Bash or PowerShell call. At session start, right after the signed rules are fetched, the lines are sent to Boxdawn and then deleted from your machine ([`boxdawn_guard/block_send.py`](boxdawn_guard/block_send.py)); the request carries the key and those lines only. To keep the record on this machine instead, turn on `keep_blocks_local` in the plugin's settings. Without a key, or on the fixed rules, nothing is recorded or sent. Decisions on the `Read` and `Grep` tools are not recorded.
 

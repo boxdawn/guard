@@ -14,8 +14,8 @@
     },
     "keep_blocks_local": {
       "type": "boolean",
-      "title": "Keep the block record on this machine",
-      "description": "On a paid plan the guard sends its block record (tool, deny or ask, rule ids, where the target sits; never a command or a path) to Boxdawn at session start. Turn this on to keep it on this machine only.",
+      "title": "Keep the deny and ask record on this machine",
+      "description": "On a paid plan the guard sends its record of deny and ask decisions (tool, deny or ask, rule ids, where the target sits; never a command or a path) to Boxdawn at session start. Turn this on to keep it on this machine only.",
       "default": false
     },
     "keep_secrets_out_of_grep": {
