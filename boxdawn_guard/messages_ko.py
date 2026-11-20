@@ -124,6 +124,7 @@ _TABLE = (
     ("`{} down -v` deletes the project's volumes", "`{0} down -v`: 프로젝트 볼륨을 지웁니다"),
     ("`{}` runs a risky command inside a container or on another machine",
      "`{0}`: 컨테이너나 다른 기계 안에서 위험한 명령을 실행합니다"),
+    ("`{}` inside the container is `{}` on this computer", "컨테이너 안 `{0}` 은 이 컴퓨터의 `{1}` 입니다"),
     ("`robocopy /MIR` deletes files the source does not have", "`robocopy /MIR`: 원본에 없는 파일을 지웁니다"),
     ("`lftp mirror --delete` deletes files the source does not have", "`lftp mirror --delete`: 원본에 없는 파일을 지웁니다"),
     ("`gh repo delete` deletes a repository", "`gh repo delete`: 저장소를 지웁니다"),

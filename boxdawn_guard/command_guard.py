@@ -302,6 +302,9 @@ class _Judge:
     stdin_base: tuple = (None, None)  # what a command with no stdin of its own reads (a remote line's)
     stdin_local: bool = False  # inside `bash -c '…'` here: stdin_base is this shell's stdin, read here too
     piped: set = field(default_factory=set)  # ids of the commands on this line that read a pipe
+    # The argument words of the command being judged as written (bash only): `docker run -v
+    # "$PWD":/app` still shows where in the container the mount is when its value is unknown.
+    raw_args: Optional[list[str]] = None
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -736,10 +739,13 @@ class _Judge:
                 if first in self.rules.interpreters and not _code_or_file(first, rest, self.rules):
                     self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{first}` code")
         self.stdin_now = ("fed", text) if fed else ("pipe", None) if piped else self.stdin_base
+        outer_raw = self.raw_args
+        self.raw_args = [a.text.decode("utf-8", "replace") for a in node.children_by_field_name("argument")]
         try:
             self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
         finally:
             self.stdin_now = outer_stdin
+            self.raw_args = outer_raw
         grep = posixpath.basename(name).lower()
         if depth == 0 and grep in secret_files.GREPS:
             recursive, paths, includes = secret_files.grep_reads(args)
@@ -1572,20 +1578,25 @@ class _Judge:
             if a in r.db_file_flags:
                 self.flag("ask", "db.file", f"`{name}` runs statements from a file")
 
-    def _remote(self, name: str, words: list[Value], shell: bool, depth: int) -> None:
+    def _remote(self, name: str, words: list[Value], shell: bool, depth: int,
+                inner: Optional["_Judge"] = None) -> None:
         """A command run inside a container or on another machine (#37574).
         Its paths are not this computer's, so it is read on its own, as if
         from a folder of its own, and what it would hold or block asks.
         What this command reads on stdin reaches the remote command too: run
-        as code there when it is a shell or interpreter reading it."""
+        as code there when it is a shell or interpreter reading it.
+        `inner`: a `_ContainerJudge` for `docker run`, whose mounted paths are
+        this computer's: what lands outside the project there keeps its level."""
         how, text = self.stdin_now
         if not words and not (shell and how):
             return
         if depth + 1 > _MAX_DEPTH:
             self.flag("ask", "parse.too_deep", "commands nested too deep to read")
             return
-        inner = _Judge(cwd=_REMOTE_CWD, home=_REMOTE_HOME, rules=self.rules)
-        inner.workdirs = [inner.cwd]
+        here = inner is not None
+        if inner is None:
+            inner = _Judge(cwd=_REMOTE_CWD, home=_REMOTE_HOME, rules=self.rules)
+            inner.workdirs = [inner.cwd]
         # A command there with no stdin of its own reads this one (`ssh jump ssh host`).
         inner.stdin_base = (how, text)
         readers: list[tuple[str, list[Value]]] = []  # what reads stdin as code there
@@ -1630,9 +1641,14 @@ class _Judge:
             return
         self.flag("ask", "remote.run", f"`{name}` runs a risky command inside a container or on another machine")
         for finding, reason in zip(inner.findings, inner.reasons):
-            # An org's own rule keeps its level; ours ask: where a path lands there is not known here.
-            level = finding.level if finding.rule.startswith("custom.") else "ask"
-            self._record(level, finding.rule, reason, None)
+            # An org's own rule keeps its level; ours ask: where a path lands there is not known here,
+            # unless it is a folder of this computer mounted outside the project.
+            outside = here and finding.target == "outside"
+            level = finding.level if finding.rule.startswith("custom.") or outside else "ask"
+            self._record(level, finding.rule, reason, finding.target if here else None)
+        if here:
+            for dst, src in inner.reached:
+                self.flag("ask", "remote.run", f"`{dst}` inside the container is `{src}` on this computer")
 
     def _ssh(self, name: str, args: list[Value], depth: int) -> None:
         """`ssh host cmd …`: the words reach the remote shell as one line.
@@ -1684,7 +1700,52 @@ class _Judge:
         if rest:
             self._judge(rest[0], rest[1:], depth)
 
+    def _docker_run(self, name: str, args: list[Value], depth: int) -> None:
+        """`docker run`: a new container is thrown away with what it holds, so
+        what runs in it is judged only when a folder of this computer is mounted
+        in it writable. There a path is this computer's (`_ContainerJudge`)."""
+        raw = self.raw_args
+        if raw is None or len(raw) < len(args) or any(
+                a is not None and r != a for a, r in zip(args, raw[len(raw) - len(args):])
+                if not re.search(r"[\"'$\\`{]", r)):
+            raw = None  # not lined up with these words (`xargs`, braces): unknown values stay unknown
+        else:
+            raw = raw[len(raw) - len(args):]
+        # `$PWD` and `$(pwd)` are where the line is; order is not tracked, so each folder it may be in is read.
+        bases = list(dict.fromkeys(self.workdirs or [self.cwd]))[:_FOLDERS_MOST]
+        runs = []
+        for base in bases:
+            text = raw if raw is None or base is None else [_PWD_WORD.sub(lambda _, b=base: b, r) for r in raw]
+            run = _container_run(name, args, text)
+            if run is None:
+                return
+            runs.append(run)
+        words, _, _, interactive = runs[0]
+        mounts = list(dict.fromkeys(
+            (dst, self._mount_source(src) if kind == "bind" else None, kind, src)
+            for _, found, _, _ in runs for dst, src, kind in found))
+        if not mounts:
+            return
+        # Without `-w` it starts where the image says, `/` unless the image sets a folder: `/` is taken.
+        workdirs = list(dict.fromkeys(workdir or "/" for _, _, workdir, _ in runs))
+        inner = _ContainerJudge(cwd=workdirs[0], home="/root", rules=self.rules, host=self, mounts=mounts)
+        inner.workdirs = workdirs
+        if not interactive:
+            self.stdin_now = (None, None)
+        self._remote(name, words, False, depth, inner)
+
+    def _mount_source(self, src: Optional[str]) -> Optional[str]:
+        """The folder of this computer a bind mount names, in the form of `self.cwd`."""
+        if src is None or re.search(r"[$`]", src):
+            return None
+        if src == "~" or src.startswith(("~/", "~\\")):
+            src = self.home + src[1:]
+        src = _posix(src).replace("\\", "/")
+        return _slash(src if src.startswith("/") else posixpath.join(self.cwd, src))
+
     def _infra(self, name: str, args: list[Value], depth: int) -> None:
+        if _DOCKER_LIKE.get(name, name) == "docker":
+            self._docker_run(name, args, depth)
         inner = _container_command(name, args)
         if inner is not None:
             if not _exec_reads_stdin(name, args, inner):
@@ -2631,6 +2692,211 @@ def _exec_reads_stdin(name: str, args: list[Value], inner: list[Value]) -> bool:
     return any(a is None or a in ("-i", "--interactive", "--stdin") or re.fullmatch(r"-[A-Za-z]*i[A-Za-z]*", a)
                or (a.startswith(("--interactive=", "--stdin=", "-i=")) and a.split("=", 1)[1].lower() != "false")
                for a in options)
+
+
+# `docker run` and `podman run` options that take a value (the rest are switches).
+_RUN_TAKES = frozenset({
+    "--add-host", "--annotation", "--attach", "--blkio-weight", "--blkio-weight-device", "--cap-add", "--cap-drop",
+    "--cgroup-parent", "--cgroupns", "--cidfile", "--cpu-period", "--cpu-quota", "--cpu-rt-period",
+    "--cpu-rt-runtime", "--cpu-shares", "--cpus", "--cpuset-cpus", "--cpuset-mems", "--detach-keys", "--device",
+    "--device-cgroup-rule", "--device-read-bps", "--device-read-iops", "--device-write-bps",
+    "--device-write-iops", "--dns", "--dns-opt", "--dns-option", "--dns-search", "--domainname", "--entrypoint",
+    "--env", "--env-file", "--expose", "--gpus", "--group-add", "--health-cmd", "--health-interval",
+    "--health-retries", "--health-start-interval", "--health-start-period", "--health-timeout", "--hostname",
+    "--ip", "--ip6", "--ipc", "--isolation", "--kernel-memory", "--label", "--label-file", "--link",
+    "--link-local-ip", "--log-driver", "--log-opt", "--mac-address", "--memory", "--memory-reservation",
+    "--memory-swap", "--memory-swappiness", "--mount", "--name", "--network", "--net", "--network-alias",
+    "--net-alias", "--oom-score-adj", "--pid", "--pids-limit", "--platform", "--publish", "--pull", "--restart",
+    "--runtime", "--security-opt", "--shm-size", "--stop-signal", "--stop-timeout", "--storage-opt", "--sysctl",
+    "--tmpfs", "--ulimit", "--user", "--userns", "--uts", "--volume", "--volume-driver", "--volumes-from",
+    "--workdir",
+    # podman's own
+    "--arch", "--authfile", "--cgroups", "--cgroup-conf", "--chrootdirs", "--conmon-pidfile", "--creds",
+    "--decryption-key", "--env-merge", "--gidmap", "--group-entry", "--health-on-failure", "--hostuser",
+    "--image-volume", "--init-path", "--log-tag", "--os", "--passwd-entry", "--personality", "--pidfile", "--pod",
+    "--pod-id-file", "--preserve-fds", "--requires", "--sdnotify", "--seccomp-policy", "--secret",
+    "--subgidname", "--subuidname", "--timeout", "--tz", "--uidmap", "--umask", "--variant",
+    "--unsetenv", "--retry", "--retry-delay", "--systemd", "--hosts-file", "--rdt-class", "--shm-size-systemd",
+    "--health-startup-cmd", "--health-startup-interval", "--health-startup-retries",
+    "--health-startup-success", "--health-startup-timeout", "--health-log-destination",
+    "--health-max-log-count", "--health-max-log-size",
+    # docker on Windows
+    "--cpu-count", "--cpu-percent", "--io-maxbandwidth", "--io-maxiops", "--credential-spec",
+})
+_RUN_LETTERS = {"a": "--attach", "c": "--cpu-shares", "e": "--env", "h": "--hostname", "l": "--label",
+                "m": "--memory", "p": "--publish", "u": "--user", "v": "--volume", "w": "--workdir"}
+_PODMAN_GLOBAL = {"--root", "--runroot", "--url", "--connection", "--storage-driver", "--storage-opt",
+                  "--cgroup-manager", "--events-backend", "--network-cmd-path", "--tmpdir", "--identity",
+                  "--module", "--conmon", "--runtime", "--hooks-dir", "--volumepath", "--imagestore",
+                  "--ssh", "--out"}
+# Where the line is, written in a word: `"$PWD":/app`, `$(pwd)/src:/src`.
+_PWD_WORD = re.compile(r"\$PWD\b|\$\{PWD\}|\$\(pwd\)|`pwd`")
+
+
+def _slash(path: str) -> str:
+    """`normpath`, and `//x` (Git Bash's way to keep a path from being converted) is `/x`."""
+    return re.sub(r"^/{2,}", "/", posixpath.normpath(path))
+# A mount's place in the container (None: not known), what it names, and what it is:
+# "bind" (a folder of this computer), "volume" (one docker keeps: a named one or one
+# from another container) or "unknown". Read-only and throwaway mounts are left out.
+_Mount = tuple[Optional[str], Optional[str], str]
+
+
+def _mount_of_volume(text: Optional[str]) -> list[_Mount]:
+    """`-v SRC:DST[:OPTS]`, `-v DST` (a new volume, thrown away), `-v C:\\x:/app`."""
+    if text is None:
+        return [(None, None, "unknown")]
+    m = re.fullmatch(r"((?:[A-Za-z]:)?[^:]*)(?::([^:]*))?(?::([^:]*))?", text)
+    if m is None:
+        return [(None, None, "unknown")]
+    src, dst, opts = m.groups()
+    if dst is None or "ro" in (opts or "").split(","):
+        return []
+    dst = None if re.search(r"[$`]", dst) or not dst.startswith("/") else _slash(dst)
+    if re.search(r"[$`]", src) or re.match(r"[A-Za-z]:|[/\\.~]", src):
+        return [(dst, src, "bind")]
+    return [(dst, src, "volume")]  # a named volume: docker's, holding data
+
+
+def _mount_of_mount(text: Optional[str]) -> list[_Mount]:
+    """`--mount type=bind,source=…,target=…[,readonly]`."""
+    if text is None:
+        return [(None, None, "unknown")]
+    keys: dict[str, str] = {}
+    for part in text.split(","):
+        key, _, value = part.partition("=")
+        keys[key.strip().lower()] = value.strip() if _ else "true"
+    if keys.get("readonly", keys.get("ro", "false")).lower() in ("true", "1"):
+        return []
+    kind = keys.get("type", "volume").lower()
+    dst = keys.get("target", keys.get("destination", keys.get("dst")))
+    src = keys.get("source", keys.get("src"))
+    if kind not in ("bind", "volume") or (kind == "volume" and not src):
+        return []  # tmpfs, image, npipe, or a new volume thrown away with the container
+    dst = None if dst is None or re.search(r"[$`]", dst) or not dst.startswith("/") else _slash(dst)
+    return [(dst, src, kind)]
+
+
+def _container_run(name: str, args: list[Value], raw: Optional[list[str]]
+                   ) -> Optional[tuple[list[Value], list[_Mount], Optional[str], bool]]:
+    """`docker run` (or `container run`, podman's): the words run in the new
+    container, its mounts, the folder it starts in and whether it reads stdin.
+    None: not one, or its options cannot be read."""
+    def text(i: int) -> Optional[str]:
+        if args[i] is not None:
+            return args[i]
+        if raw is None:
+            return None
+        return re.sub(r"[\"']", "", raw[i])  # `"$PWD":/app`: the place in the container is still written
+
+    i = 0
+    while i < len(args) and args[i] is not None and args[i].startswith("-"):
+        i += 2 if args[i] in _DOCKER_GLOBAL or args[i] in _PODMAN_GLOBAL else 1
+    if args[i:i + 2] == ["container", "run"]:
+        i += 1
+    if args[i:i + 1] != ["run"]:
+        return None
+    i += 1
+    mounts: list[_Mount] = []
+    workdir: Optional[str] = None
+    entry: list[Value] = []
+    interactive = False
+    while i < len(args):
+        a = args[i]
+        if a is None and raw is not None and re.match(r"-{1,2}[A-Za-z][\w-]*=", raw[i]):
+            a = text(i)  # `--user=$(id -u)`: the option is written, only its value is not known
+        if a is None:
+            return None  # an option or the image known only at run time
+        if a == "--":
+            i += 1
+            break
+        if not a.startswith("-"):
+            break
+        i += 1
+        if a.startswith("--"):
+            option, eq, value = a.partition("=")
+            if option in _RUN_TAKES and not eq:
+                if i >= len(args):
+                    return None
+                value, i = text(i), i + 1
+            elif option in ("--interactive", "-i"):
+                interactive = value.lower() != "false" if eq else True
+                continue
+            elif option not in _RUN_TAKES:
+                continue  # a switch
+        else:
+            option, value = "", None
+            for k, ch in enumerate(a[1:], start=1):
+                if ch == "i":
+                    interactive = True
+                if ch in _RUN_LETTERS:
+                    option = _RUN_LETTERS[ch]
+                    if k < len(a) - 1:
+                        value = a[k + 1:].lstrip("=")  # `-w/app`, `-v=/x:/y`
+                    elif i < len(args):
+                        value, i = text(i), i + 1
+                    else:
+                        return None
+                    break
+            if not option:
+                continue
+        if option == "--volume":
+            mounts += _mount_of_volume(value)
+        elif option == "--mount":
+            mounts += _mount_of_mount(value)
+        elif option == "--volumes-from":
+            if value is None or not value.endswith(":ro"):
+                mounts.append((None, value, "volume"))
+        elif option == "--workdir":
+            workdir = _slash(value) if value and value.startswith("/") and not re.search(r"[$`]", value) else None
+        elif option == "--entrypoint":
+            entry = [None] if value is None else [value] if value else []
+    if i >= len(args) or args[i] is None:
+        return None  # the image
+    return entry + args[i + 1:], mounts, workdir, interactive
+
+
+@dataclass
+class _ContainerJudge(_Judge):
+    """Judges what runs in a new container. A path there is a folder of this
+    computer only under a mount; the rest goes with the container."""
+    host: Optional[_Judge] = None
+    # (place in the container or None, the folder of this computer or None, kind, the source as written)
+    mounts: list = field(default_factory=list)
+    reached: list = field(default_factory=list)  # (place, source as written) a path here went through
+
+    def _real(self, path: str) -> str:
+        return path  # the container's own files are not on this disk
+
+    def _relation(self, path: str, on_disk: bool = False) -> str:
+        path = _slash(path)
+        order = {"inside": 0, "cwd": 1, "outside": 2, "unknown": 3}
+        worst = "inside"
+        for dst, src, kind, shown in self.mounts:
+            if dst is None:
+                where = "unknown"  # a mount whose place is not known may be any path
+            elif path == dst or path.startswith(dst.rstrip("/") + "/"):
+                where = self._of_host(src, kind, posixpath.join(src, path[len(dst):].lstrip("/")) if src else None)
+            elif dst.startswith(path.rstrip("/") + "/"):
+                where = self._of_host(src, kind, src)  # `rm -rf /` takes the mounted folder with it
+            else:
+                continue
+            if where != "inside" and dst is not None and shown is not None and kind == "bind":
+                self.reached = list(dict.fromkeys(self.reached + [(dst, shown)]))
+            if order[where] > order[worst]:
+                worst = where
+        return worst
+
+    def _of_host(self, src: Optional[str], kind: str, path: Optional[str]) -> str:
+        if kind != "bind" or path is None or self.host is None:
+            return "unknown"  # a volume docker keeps, or a folder known only at run time
+        host = self.host
+        path = _slash(path)
+        where = host._relation(path)
+        if where != "outside":
+            disk = host._relation(host._real(path), on_disk=True)
+            where = disk if disk == "outside" else where
+        return where
 
 
 _TMUX_RUNS = frozenset({"new", "new-session", "new-window", "neww", "split-window", "splitw",
