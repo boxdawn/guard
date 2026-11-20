@@ -17,7 +17,7 @@
 
 ---
 
-Boxdawn guard is a Claude Code plugin that judges every Bash and PowerShell command before it runs. A command that would wipe a directory outside your project, force-push over shared history, drop a database or destroy cloud resources is **denied** or **held for your approval**. Everything else passes to Claude Code's own permission settings, untouched. The guard never says allow.
+Boxdawn guard is a Claude Code plugin that judges every Bash and PowerShell command before it runs. A command that would wipe a directory outside your project, force-push over shared history, drop a database or destroy cloud resources is **denied** or **held for your approval**. Everything else goes to Claude Code's own permission settings. The guard never says allow.
 
 ## Install
 
@@ -43,7 +43,7 @@ When the guard fails, Copilot refuses the command. When a hook runs past Copilot
 
 ## What it does
 
-- **Deny or ask, never allow.** `deny` stops the command with the reason. `ask` shows Claude Code's own "run this?" prompt. No decision leaves the call to your permission settings.
+- **Deny or ask, never allow.** `deny` refuses the command and gives the reason. `ask` shows Claude Code's own "run this?" prompt. No decision is not an approval: the decision goes to your own permission settings, as it would without the guard.
 - **Reads the command the way the shell does.** Bash is parsed into a syntax tree (tree-sitter), so quoting, escapes, variables and `bash -c '…'` don't hide the real command. PowerShell is read by PowerShell's own parser on Windows.
 - **Knows where the target is.** Deleting a build folder inside your project is ordinary; the same command aimed at your home directory, a system path or a disk device is not.
 - **Unattended means stricter.** When nobody can answer a prompt (`bypassPermissions`, `dontAsk`), an `ask` becomes a `deny`.
