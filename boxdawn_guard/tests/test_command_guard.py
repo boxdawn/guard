@@ -212,10 +212,14 @@ ASK += ["npx prisma migrate reset --force", "pnpm prisma migrate reset --force",
         "git checkout -f main", "git stash drop", "git stash clear", "git rm -rf . --quiet",
         "rm -rf .git", "rm -rf sub/.git", "rm -rf .claude/worktrees", "rm -rf .claude/worktrees/feat-x",
         "docker compose down -v", "docker-compose down --volumes", "terraform apply -auto-approve",
+        # podman takes docker's commands
+        "podman system prune -af", "podman volume rm data", "podman volume prune", "podman image prune -a",
+        "podman compose down -v", "podman-compose down --volumes",
         "robocopy 'L:\\' 'F:\\' /MIR", "robocopy src dst /PURGE", "lftp -e 'mirror --reverse --delete dist/ /' ftp.x",
         "gh api repos/a/b --method DELETE", "gh api -X DELETE repos/a/b/releases/1",
         "firebase hosting:disable --project p --force"]
 DENY += ["gh repo delete a/b --yes"]
+NONE += ["podman compose down", "podman ps -a", "podman system df"]
 NONE += ["npx prisma migrate dev", "npx prisma generate", "npx prisma db push", "php artisan migrate",
          "python manage.py migrate", "alembic upgrade head", "git checkout main", "git checkout -b feat",
          "git restore --staged a.py", "git checkout -- src/a.py", "git restore a.py b.py", "git stash list", "git stash show -p", "git rm --cached -r .",

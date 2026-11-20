@@ -1662,6 +1662,7 @@ class _Judge:
                 self.stdin_now = (None, None)
             self._remote(name, inner, False, depth)
         words = [a for a in args if a is not None]
+        kind = _DOCKER_LIKE.get(name, name)  # podman takes docker's commands
         if name in ("terraform", "tofu"):
             if "destroy" in words or ("apply" in words and "-destroy" in words):
                 self.flag("deny", "iac.destroy", f"`{name}` destroys infrastructure")
@@ -1681,13 +1682,14 @@ class _Judge:
                 self.flag("deny", "cloud.delete", f"`aws {service} {op}` deletes cloud resources")
         elif name in ("gcloud", "az") and "delete" in words:
             self.flag("deny", "cloud.delete", f"`{name} … delete` deletes cloud resources")
-        elif name == "docker" and (words[:2] in (["system", "prune"], ["volume", "prune"],
+        elif kind == "docker" and (words[:2] in (["system", "prune"], ["volume", "prune"],
                                                   ["volume", "rm"], ["image", "prune"])):
-            self.flag("ask", "docker.prune", "`docker` prune removes data")
-        elif (name == "docker-compose" or (name == "docker" and words[:1] == ["compose"])) and "down" in words and (
+            self.flag("ask", "docker.prune", f"`{name}` prune removes data")
+        elif (kind == "docker-compose" or (kind == "docker" and words[:1] == ["compose"])) and "down" in words and (
                 "-v" in words or "--volumes" in words):
             # #63644: the database lived in the volume
-            self.flag("ask", "docker.prune", "`docker compose down -v` deletes the project's volumes")
+            said = f"{name} compose" if kind == "docker" else name
+            self.flag("ask", "docker.prune", f"`{said} down -v` deletes the project's volumes")
         if name in ("terraform", "tofu") and "apply" in words and any(
                 w in ("-auto-approve", "--auto-approve") for w in words) and "-destroy" not in words:
             self.flag("ask", "iac.auto_approve", f"`{name} apply -auto-approve` changes infrastructure without a review")
