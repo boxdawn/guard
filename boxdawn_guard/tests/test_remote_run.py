@@ -175,3 +175,100 @@ def test_powershell_reads_it_too(command, inner):
 @pytest.mark.parametrize("command", ["docker exec app ls", "ssh host uptime", "docker ps"])
 def test_powershell_plain_is_not_held(command):
     assert ps(command).decision is None
+
+
+# ── what is fed on stdin ────────────────────────────────────────────────────
+# What reaches the remote command on stdin is read as it would be here: text on
+# the line (heredoc, herestring) is judged as the code it is; another command's
+# output run as code there asks, as `cat x | bash` does here; a file (`< x`)
+# stays quiet, as `bash < x` does here.
+STDIN_ASKS = [
+    ("ssh host <<'EOF'\nrm -rf /\nEOF", "rm.outside"),
+    ("ssh host bash <<EOF\nrm -rf /var/www\nEOF", "rm.outside"),
+    ('ssh host <<< "rm -rf /"', "rm.outside"),
+    ('ssh host "cd /x && bash" <<< "rm -rf /"', "rm.outside"),
+    ('sudo ssh host <<< "rm -rf /"', "rm.outside"),
+    ('ssh host python3 <<< "import shutil; shutil.rmtree(\'/\')"', "code.inline_risky"),
+    ('ssh host <<< "$X"', "code.stdin_runtime"),
+    ('echo "rm -rf /" | ssh host', "pipe.into_interpreter"),
+    ('echo "rm -rf /" | ssh host bash', "pipe.into_interpreter"),
+    ("cat deploy.sh | ssh host", "pipe.into_interpreter"),
+    ("cat deploy.sh | ssh host bash -s", "pipe.into_interpreter"),
+    ("cat <<EOF | ssh host\nrm -rf /\nEOF", "pipe.into_interpreter"),
+    ('echo "rm -rf /" | docker exec -i c sh', "pipe.into_interpreter"),
+    ('echo "rm -rf /" | kubectl exec -i p -- sh', "pipe.into_interpreter"),
+    ("docker exec -i c sh <<'EOF'\nrm -rf /data\nEOF", "rm.outside"),
+]
+
+
+@pytest.mark.parametrize("command,inner", STDIN_ASKS)
+def test_what_is_fed_to_the_remote_command_is_read(command, inner):
+    v = bash(command)
+    assert v.decision == "ask" and RULE in rules_of(v) and inner in rules_of(v), (command, v.reasons)
+
+
+@pytest.mark.parametrize("command", [
+    "ssh host <<EOF\nls\nEOF", 'ssh host <<< "uptime"', "ssh host < wipe.sh", "ssh host bash -s < wipe.sh",
+    "ssh -n host <<< 'rm -rf /'", "ssh -f host <<< 'rm -rf /'", "cat x | ssh host ls", "cat x | ssh host 'cat > f'",
+    "git diff | ssh host 'patch -p1'", "tar c . | ssh host tar x", "cat x | ssh host bash run.sh",
+    "printf 'select 1' | ssh db psql",
+])
+def test_what_is_fed_as_data_stays_quiet(command):
+    v = bash(command)
+    assert v.decision is None, (command, v.reasons)
+
+
+@needs_helper
+@pytest.mark.parametrize("command,inner", [
+    ('"rm -rf /" | ssh host', "rm.outside"),
+    ("@'\nrm -rf /\n'@ | ssh host", "rm.outside"),
+    ('"rm -rf /" | docker exec -i c sh', "rm.outside"),
+    ("Get-Content wipe.sh | ssh host", "pipe.into_interpreter"),
+    ("$x | ssh host", "pipe.into_interpreter"),
+])
+def test_powershell_reads_what_is_piped_to_the_remote_command(command, inner):
+    v = ps(command)
+    assert v.decision == "ask" and RULE in rules_of(v) and inner in rules_of(v), (command, v.reasons)
+
+
+@needs_helper
+@pytest.mark.parametrize("command", ["'ls' | ssh host", "git diff | ssh host 'patch -p1'", "'rm -rf /' | ssh -n host"])
+def test_powershell_data_piped_to_the_remote_command_stays_quiet(command):
+    assert ps(command).decision is None
+
+
+@pytest.mark.parametrize("command,inner", [
+    ('ssh jump ssh host <<< "rm -rf /"', "rm.outside"),
+    ("ssh jump 'ssh host' <<< 'rm -rf /'", "rm.outside"),
+    ("echo 'rm -rf /' | ssh bastion ssh db", "pipe.into_interpreter"),
+    ("ssh host docker exec -i c sh <<< 'rm -rf /'", "rm.outside"),
+    ("docker exec -i c ssh host <<< 'rm -rf /'", "rm.outside"),
+    ("cat x | (ssh host)", "pipe.into_interpreter"),
+    ("cat x | { ssh host; }", "pipe.into_interpreter"),
+    ("cat x | (cd /tmp && ssh host)", "pipe.into_interpreter"),
+    ("cat x | kubectl exec --stdin p -- sh", "pipe.into_interpreter"),
+    ("docker compose exec app sh <<< 'rm -rf /'", "rm.outside"),
+])
+def test_stdin_reaches_through_nesting_and_groups(command, inner):
+    v = bash(command)
+    assert v.decision == "ask" and RULE in rules_of(v) and inner in rules_of(v), (command, v.reasons)
+
+
+@pytest.mark.parametrize("command", [
+    "docker exec c sh <<< 'rm -rf /'", "docker exec -t c sh <<< 'rm -rf /'", "cat x | docker exec c sh",
+    "cat x | kubectl exec p -- sh", "echo host | xargs ssh", "ssh jump <<EOF\nssh h2\nEOF",
+    "ssh jump ssh h2 uptime <<< x",
+])
+def test_no_stdin_there_stays_quiet(command):
+    v = bash(command)
+    assert v.decision is None, (command, v.reasons)
+
+
+def test_many_readers_of_the_same_text_are_judged_once():
+    import time
+    text = "rm -rf /"
+    for i in range(4):
+        text = "ssh h '" + ";".join(["sh"] * 25) + "' <<'E%d'\n%s\nE%d" % (i, text, i)
+    start = time.monotonic()
+    v = bash(text)
+    assert time.monotonic() - start < 5 and v.decision == "ask" and "rm.outside" in rules_of(v)

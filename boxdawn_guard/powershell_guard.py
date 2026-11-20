@@ -589,6 +589,14 @@ class _PowerShell:
                 return
             j._judge(name, args, depth, stdin_fed=True, stdin_text=text)
             return
+        if fed:  # `"…" | ssh host`: what is piped reaches the remote command (`_remote`)
+            outer = j.stdin_now
+            j.stdin_now = ("pipe", None) if c.get("pipe_from_text") is False else ("fed", text)
+            try:
+                j._judge(name, args, depth)
+            finally:
+                j.stdin_now = outer
+            return
         j._judge(name, args, depth)
 
     def _powershell_exe(self, args: list[Value], fed: bool, text: Value, depth: int, exe: str = "powershell") -> None:
