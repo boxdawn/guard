@@ -781,7 +781,7 @@ class _Judge:
                 else:
                     self._scan_code(name, code)
                 return
-            if stdin_fed and name in r.interpreters and not _positional(args):
+            if stdin_fed and name in r.interpreters and not _code_or_file(name, args, r):
                 if stdin_text is None:
                     self.flag("ask", "code.stdin_runtime", f"text known only at run time is fed into `{name}` as code")
                 elif name in r.shells:
@@ -1975,8 +1975,31 @@ def _code_or_file(name: str, args: list[Value], rules: CommandRules) -> bool:
         return True
     if name in rules.shells and any(a is not None and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args):
         return False
-    positional = _positional(args)
-    return bool(positional) and positional[0] not in _STDIN_FILES
+    at = _first_operand(name, args, rules)
+    return at is not None and args[at] not in _STDIN_FILES
+
+
+def _first_operand(name: str, args: list[Value], rules: CommandRules) -> Optional[int]:
+    """The first word that is not an option or an option's value
+    (`bash -euo pipefail x.sh`: `x.sh`, not `pipefail`)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return i + 1 if i + 1 < len(args) else None
+        if a is not None and (a.startswith("-") or name in rules.shells and a.startswith("+")):
+            i += 2 if _takes_value(name, a, rules) else 1
+            continue
+        return i
+    return None
+
+
+def _takes_value(name: str, flag: str, rules: CommandRules) -> bool:
+    """The interpreter option's value is the next word (`-o pipefail`, `-W ignore`)."""
+    if flag in _SCRIPT_VALUE_FLAGS.get(name, frozenset()):
+        return True
+    return name in rules.shells and (flag in _SHELL_VALUE_FLAGS or flag in ("--rcfile", "--init-file")
+                                     or re.fullmatch(r"[-+][A-Za-z]*[oO]", flag) is not None)
 
 
 _STDIN_FILES = frozenset({"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
@@ -2169,7 +2192,6 @@ def _script_candidates(name: str, args: list[Value], rules: CommandRules,
     word known only at run time (`python3 $FLAGS x.py`: it may be an option,
     it may be the script). Empty when the interpreter runs no file, or only
     checks one (`bash -n`, `node --check`, `php -l`)."""
-    takes = _SCRIPT_VALUE_FLAGS.get(name, frozenset())
     check = _CHECK_ONLY.get(name, frozenset())
     shell = name in rules.shells
     powershell = name in ("pwsh", "powershell")
@@ -2203,9 +2225,7 @@ def _script_candidates(name: str, args: list[Value], rules: CommandRules,
         if name in ("python", "python3") and re.fullmatch(r"-[bBdEhiIOqsSuvVx]*m.*", a):
             return []  # a module, by name
         if a.startswith("-") and a != "-" or shell and a.startswith("+"):
-            value = a in takes or shell and (a in _SHELL_VALUE_FLAGS or a in ("--rcfile", "--init-file")
-                                             or re.fullmatch(r"[-+][A-Za-z]*[oO]", a) is not None)
-            i += 2 if value else 1
+            i += 2 if _takes_value(name, a, rules) else 1
             continue
         if name in ("deno", "bun") and a == "run":
             i += 1
