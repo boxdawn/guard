@@ -173,7 +173,7 @@ def evaluate_powershell(command: str, *, cwd: str, home: str, rules: CommandRule
                         parse: Parse = parse) -> Optional[Verdict]:
     """None when there is no PowerShell parser on this machine and it is not
     Windows (the PowerShell tool is opt-in elsewhere)."""
-    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}))
+    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}), reads_scripts=True)
     ps = _PowerShell(judge, parse, {k.lower(): v for k, v in (known_env or {}).items()}, home)
     try:
         ps.run(command, 0)

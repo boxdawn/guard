@@ -25,6 +25,7 @@ import os
 import posixpath
 import re
 import shlex
+import time
 from dataclasses import dataclass, field
 from glob import escape as glob_escape, iglob
 from itertools import islice
@@ -41,6 +42,10 @@ _LEVEL = {None: 0, "ask": 1, "deny": 2}
 _MAX_DEPTH = 4  # sh -c inside eval inside sh -c ...
 
 _PARSER = Parser(Language(tree_sitter_bash.language()))
+
+
+class _OutOfTime(Exception):
+    """A script read from disk took longer than its share of the hook's time."""
 
 
 @dataclass(frozen=True)
@@ -119,7 +124,7 @@ RULE_IDS = frozenset({
     "tar.outside", "unzip.outside", "rsync.outside", "rsync.delete", "dotnet.outside",
     "device.app_data", "device.wipe", "device.flash", "wsl.unregister",
     "db.reset", "git.discard_changes", "git.stash_drop", "git.stash", "git.alias", "git.config_command", "rm.history", "iac.auto_approve",
-    "mirror.delete", "gh.delete", "fetch.then_run", "remote.run",
+    "mirror.delete", "gh.delete", "fetch.then_run", "remote.run", "script.refused",
 })
 # Where the target sits, never what it is. "project_root" is the project
 # directory itself; "unknown" is a path known only at run time.
@@ -140,7 +145,7 @@ def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
     """`known_env`: variables whose value the caller read from the process
     environment (the hook passes TEMP/TMP/TMPDIR). Used only when the line
     itself never assigns them — the same rules as any other variable."""
-    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}))
+    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}), reads_scripts=True)
     try:
         judge.run(command, depth=0)
     except Exception as exc:  # noqa: BLE001 - a guard that crashes must not pass
@@ -305,6 +310,12 @@ class _Judge:
     # The argument words of the command being judged as written (bash only): `docker run -v
     # "$PWD":/app` still shows where in the container the mount is when its value is unknown.
     raw_args: Optional[list[str]] = None
+    # A shell script the line runs is read from disk: set for the line typed here only, not for
+    # a script's own text, a remote line or an alias (they name files elsewhere, or loop).
+    reads_scripts: bool = False
+    scripts_read: int = 0
+    script_deadline: float = 0.0
+    deadline: float = 0.0  # a script's judge stops (`_OutOfTime`) past this
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -348,6 +359,8 @@ class _Judge:
         self.piped = _piped_commands(root)
         try:
             for node in _walk(root):
+                if self.deadline and time.monotonic() > self.deadline:
+                    raise _OutOfTime
                 if node.type == "command":
                     self._command(node, depth)
                 elif node.type == "file_redirect":
@@ -575,6 +588,8 @@ class _Judge:
         worst = "inside"
         order = {"inside": 0, "cwd": 1, "outside": 2, "unknown": 3}
         for base in self.workdirs:
+            if self.deadline and time.monotonic() > self.deadline:
+                raise _OutOfTime  # a script with many `cd`s: each one is a folder tried here
             if base is None and not (target.startswith("/") or target.startswith("~")
                                      or _posix(target) != target):
                 where = "unknown"
@@ -765,6 +780,8 @@ class _Judge:
     def _judge(self, name: Value, args: list[Value], depth: int, *,
                stdin_fed: bool = False, stdin_text: Value = None) -> None:
         r = self.rules
+        if self.deadline and time.monotonic() > self.deadline:
+            raise _OutOfTime
         if name is None:
             self.flag("ask", "name.runtime", "the command name is only known at run time")
             return
@@ -1048,6 +1065,11 @@ class _Judge:
             name = name.lower()  # `Python.exe` is `python` there
         name = _INTERPRETER_NAMES.sub(lambda m: m.group(1), name)  # python3.12, pypy3, nodejs
         name = {"py": "python", "nodejs": "node", "pypy": "python"}.get(name, name)
+        if self.reads_scripts:
+            try:
+                self._read_script(word, name, args)
+            except Exception:  # noqa: BLE001 - reading a script only ever adds an ask
+                pass
         if self.fetched:
             if (re.search(r"[/\\]", word) or word.startswith("~")) and not _DOCUMENT.search(word):
                 self._runs_fetched(word)  # `./x.sh`; a bare name is looked up on PATH, not here
@@ -1075,6 +1097,69 @@ class _Judge:
             return  # `bash -n < x.sh` reads it for mistakes
         if name in self.rules.interpreters and not _code_or_file(name, args, self.rules):
             self._runs_fetched(_value(source, self.env), source.text.decode("utf-8", "replace"))
+
+    # a shell script this line runs ─────────────────────────────────────────
+    def _read_script(self, word: str, name: str, args: list[Value]) -> None:
+        """`bash x.sh`, `./x.sh`: what the script holds is read from disk, as
+        typed here. Only what would be refused asks; a delete of a path known
+        only at run time (`rm -rf "$TMP"`, how scripts clean up) does not."""
+        path, direct = None, False
+        if name in _BASH_LIKE and _code_on_line(name, args, self.rules) is None:
+            at = _script_candidates(name, args, self.rules)
+            if at and not any(a and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args[:at[-1]]):
+                path = args[at[-1]]  # not `bash -s x.sh`: that runs stdin, and `x.sh` is its `$1`
+        elif re.search(r"[/\\]", word) and not _DOCUMENT.search(word):
+            path, direct = word, True  # `./x.sh`: a shell script only if it says so (below)
+        if path is None or self.scripts_read >= _SCRIPTS_MOST or (
+                self.script_deadline and time.monotonic() > self.script_deadline):
+            return
+        if not self.script_deadline:
+            self.script_deadline = time.monotonic() + _SCRIPT_SECONDS
+        refused = []
+        for base, text in self._script_texts(path, shebang=direct):
+            if time.monotonic() > self.script_deadline:
+                return
+            inner = _Judge(cwd=self._native(base), home=self.home, rules=self.rules,
+                           known_env=self.known_env, deadline=self.script_deadline)
+            try:
+                inner.run(text, 0)
+            except _OutOfTime:
+                return  # too much to read in time: the line is judged as it was
+            refused += [(f, r) for f, r in zip(inner.findings, inner.reasons)
+                        if f.level == "deny" and f.rule != "rm.runtime"]
+        if not refused:
+            return
+        self.flag("ask", "script.refused", f"`{path}` runs a command that would be refused")
+        for finding, reason in list(dict.fromkeys(refused))[:_SCRIPT_REASONS_MOST]:
+            self._record("ask", finding.rule, reason, finding.target)
+
+    def _script_texts(self, path: str, shebang: bool) -> list[tuple[str, str]]:
+        """The folder the script runs in and its text, for each folder the line
+        may be in that has it (order is not tracked). Left out: not there, too
+        long, on another computer (`//host/…`: a look there can take seconds),
+        or (`shebang`) no `#!` line naming a shell."""
+        found = []
+        for base in list(dict.fromkeys(self.workdirs or [self.cwd]))[:_SCRIPT_FOLDERS_MOST]:
+            if base is None or self.scripts_read >= _SCRIPTS_MOST:
+                continue
+            native = self._native(self._absolute(path, base))
+            if native.replace("\\", "/").startswith("//"):
+                continue
+            self.scripts_read += 1
+            try:
+                if not os.path.isfile(native) or os.path.getsize(native) > _SCRIPT_BYTES_MOST:
+                    continue
+                with open(native, "rb") as f:
+                    text = f.read(_SCRIPT_BYTES_MOST).decode("utf-8", "replace")
+            except OSError:
+                continue
+            first = text.lstrip("﻿").split("\n", 1)[0]
+            if shebang and not (re.match(r"#!.*\b(?:ba|z|da|k)?sh\b", first) or (
+                    path.endswith(".sh") and not first.startswith("#!"))):
+                continue
+            if all(native != seen for seen, _, _ in found):  # one file reached from two folders
+                found.append((native, base, text))
+        return [(base, text) for _, base, text in found]
 
     def _output(self, dest: Value) -> None:
         if dest is None:
@@ -2183,6 +2268,12 @@ _DOCUMENT = re.compile(r"(?i)\.(png|jpe?g|gif|bmp|svg|webp|ico|tiff?|heic|pdf|ht
 _FETCHED_MOST = 64   # downloads kept for one line; past that the line is not followed further
 _FOLDERS_MOST = 32   # folders a relative name is tried in
 _LOOKS_MOST = 200    # redirects and `tee`s of one line that are looked through for a download
+_SCRIPTS_MOST = 8    # looks on disk for the shell scripts of one line
+_SCRIPT_FOLDERS_MOST = 4  # folders a script's name is looked for in
+_SCRIPT_SECONDS = 1.0  # for reading all the scripts of one line; past it they are left unread
+_BASH_LIKE = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})  # a script of theirs reads as bash
+_SCRIPT_BYTES_MOST = 32 * 1024  # a longer script is not read
+_SCRIPT_REASONS_MOST = 3  # what a script would have refused, shown
 
 
 def _redirect_body(node: Node) -> Node:
