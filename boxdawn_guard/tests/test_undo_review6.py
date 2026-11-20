@@ -128,6 +128,7 @@ def test_a_stop_part_way_names_the_files_written_and_not(project, monkeypatch, c
     assert "put back: a.txt" in err and "not put back: b.txt" in err and "stopped part way" in err
 
 
+@pytest.mark.shipped_hook_budget
 def test_a_command_waits_for_the_snapshot_still_being_taken(project):
     store = _store(project)
     assert store.acquire()
