@@ -163,6 +163,18 @@ def test_the_reason_says_where_it_runs_in_korean():
     assert "`docker`: 컨테이너나 다른 기계 안에서 위험한 명령을 실행합니다" in said
 
 
+@pytest.mark.parametrize("command,said", [
+    ("docker system prune -af", "`docker` prune: 데이터를 지웁니다"),
+    ("podman system prune -af", "`podman` prune: 데이터를 지웁니다"),
+    ("docker compose down -v", "`docker compose down -v`: 프로젝트 볼륨을 지웁니다"),
+    ("docker-compose down -v", "`docker-compose down -v`: 프로젝트 볼륨을 지웁니다"),
+    ("podman compose down -v", "`podman compose down -v`: 프로젝트 볼륨을 지웁니다"),
+])
+def test_the_prune_reason_names_the_program_in_korean(command, said):
+    v = bash(command)
+    assert said in [messages_ko.translate(r) for r in v.reasons], v.reasons
+
+
 # ── PowerShell ──────────────────────────────────────────────────────────────
 _helper = os.environ.get("BDX_PSPARSE")
 needs_helper = pytest.mark.skipif(not (_helper and os.path.isfile(_helper)),
