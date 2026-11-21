@@ -57,7 +57,28 @@ _HEREDOC = re.compile(r"<<(?!<)")
 def _parse(text: str):
     if not _HEREDOC.search(text):
         text = _LONE_EQ.sub(lambda m: "\\" + m.group(1)[1], text)  # `==` -> `\=`, `=~` -> `\~`
-    return _PARSER.parse(text.encode("utf-8"))
+    data = text.encode("utf-8")
+    tree = _PARSER.parse(data)
+    # After an assignment (`A=1 C:/tools/python.exe x`) the grammar reads a drive letter as a
+    # stray name and the command as `:/tools/python.exe`. The letter is read as Git Bash reads
+    # the path, `/c/tools/…`: the same length, so every offset stays where it was.
+    for _ in range(_DRIVE_FIXES_MOST):
+        spot = next((n.named_children[-1].start_byte for n in _walk(tree.root_node)
+                     if n.type == "ERROR" and n.named_children and _drive_letter(n.named_children[-1], data)), None)
+        if spot is None:
+            break
+        data = data[:spot] + b"/" + bytes([data[spot]]).lower() + data[spot + 2:]
+        tree = _PARSER.parse(data)
+    return tree
+
+
+_DRIVE_FIXES_MOST = 32
+
+
+def _drive_letter(node, data: bytes) -> bool:
+    """A one-letter name the grammar split off a path, right before its `:` (`C` of `C:/x`)."""
+    return (node.type == "variable_name" and node.end_byte - node.start_byte == 1
+            and chr(data[node.start_byte]).isalpha() and data[node.end_byte:node.end_byte + 1] == b":")
 
 
 class _OutOfTime(Exception):
