@@ -59,7 +59,7 @@ def test_the_rest_of_the_line_keeps_its_values():
     'C="rm -rf"; $C ~',                         # split by the shell: runs `rm -rf ~`
     "X=; $X rm -rf ~",                          # empty: runs `rm -rf ~`
     "S=/c/*; $S/x",                             # globbed
-    'S="/c/my tools"; "$S/python.exe" x.py',    # not one word unquoted elsewhere; kept unknown
+    'S="/c/my tools"; $S/python.exe x.py',      # unquoted with a space: split by the shell
     "X=eval; $X 'rm -rf ~'",                    # a builtin that reassigns
     "X=read; $X S; $S/x",
     "if true; then S=/c/tools; fi; $S/python.exe x.py",   # may not have run

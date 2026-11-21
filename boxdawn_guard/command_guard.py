@@ -417,6 +417,26 @@ class _Judge:
                     word = next((a for a in rest if a is None or not a.startswith("-")), "")
                 if word is None:
                     named_by_variable.append(node)
+                elif word == "printf":
+                    # only `printf -v NAME …` sets a value: that name, or all when it is not written out
+                    args = [_value(a) for a in _arguments(node)]
+                    if "printf" in args and _value(name_node.named_children[0]) in ("command", "builtin"):
+                        args = args[args.index("printf") + 1:]  # `command printf -v Y …`
+                    i = 0
+                    while i < len(args):  # the options, up to the format
+                        a = args[i]
+                        if a is None:
+                            return {}  # unknown: it may hold `-vNAME` and a format of its own
+                        if a == "--" or not a.startswith("-"):
+                            break  # the format: what follows is its arguments
+                        if a.startswith("-v"):  # each `-v` counts: bash keeps the last one
+                            target = a[2:] or (args[i + 1] if i + 1 < len(args) else None)
+                            if target is None or not re.fullmatch(r"[A-Za-z_]\w*(\[.*\])?", target):
+                                return {}
+                            poisoned.add(target.split("[", 1)[0])
+                            i += 1 if a[2:] else 2  # step over the name: it is not the format
+                            continue
+                        i += 1
                 elif word in _REASSIGNS:
                     return {}  # eval, read, source …: any name may change unseen
 
@@ -453,9 +473,11 @@ class _Judge:
         words += _arguments(node)
         for i, w in enumerate(words):
             word = _value(w, env)
-            if not word or re.search(r"[\s*?\[]", word):
-                # unknown; or the shell splits or globs it (`C="rm -rf"; $C ~` runs `rm -rf ~`,
-                # `X=; $X rm …` runs `rm …`): what runs is not this one word
+            if not word:
+                return False  # unknown; or empty (`X=; $X rm …` runs `rm …`)
+            if w.type not in ("string", "raw_string") and re.search(r"[\s*?\[]", word):
+                # unquoted, the shell splits or globs it (`C="rm -rf"; $C ~` runs `rm -rf ~`):
+                # what runs is not this one word. Quoted (`"$C"` with a space in a path) it is.
                 return False
             if i == 0 or not word.startswith("-"):
                 if "/" in word.replace("\\", "/"):
