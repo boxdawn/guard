@@ -62,7 +62,7 @@ def _parse(text: str):
     # After an assignment (`A=1 C:/tools/python.exe x`) the grammar reads a drive letter as a
     # stray name and the command as `:/tools/python.exe`. The letter is read as Git Bash reads
     # the path, `/c/tools/…`: the same length, so every offset stays where it was.
-    for _ in range(_DRIVE_FIXES_MOST):
+    for _ in range(_DRIVE_FIXES_MOST if len(data) <= _DRIVE_FIX_BYTES_MOST else 0):
         spot = next((n.named_children[-1].start_byte for n in _walk(tree.root_node)
                      if n.type == "ERROR" and n.named_children and _drive_letter(n.named_children[-1], data)), None)
         if spot is None:
@@ -73,6 +73,7 @@ def _parse(text: str):
 
 
 _DRIVE_FIXES_MOST = 32
+_DRIVE_FIX_BYTES_MOST = 32 * 1024  # a longer line is not parsed again: each pass costs as much as the first
 
 
 def _drive_letter(node, data: bytes) -> bool:

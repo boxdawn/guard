@@ -42,5 +42,14 @@ def test_it_is_judged_as_the_same_line_written_the_git_bash_way(command, written
     assert seen(bash(command)) == seen(bash(written))
 
 
+def test_a_long_line_is_not_parsed_again_and_stays_quick():
+    import time
+    line = "; ".join(["A=1 C:/tools/p x"] * 40) + "; echo " + "x" * 40000
+    started = time.monotonic()
+    v = bash(line)
+    assert time.monotonic() - started < 3
+    assert v.decision == "ask"  # read as before: not readable
+
+
 def test_a_drive_path_as_an_argument_is_read_as_before():
     assert seen(bash("A=1 rm -rf C:/Users/me/other")) == seen(bash("rm -rf C:/Users/me/other"))
