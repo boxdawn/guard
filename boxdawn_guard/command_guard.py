@@ -361,17 +361,41 @@ class _Judge:
         self._collect_workdirs(root, depth)
         self.piped = _piped_commands(root)
         try:
-            for node in _walk(root):
-                if self.deadline and time.monotonic() > self.deadline:
-                    raise _OutOfTime
-                if node.type == "command":
-                    self._command(node, depth)
-                elif node.type == "file_redirect":
-                    self._redirect(node)
-                elif node.type == "pipeline":
-                    self._pipeline(node)
+            self._judge_tree(root, depth)
         finally:
             self.env, self.workdirs, self.piped = outer
+
+    def _judge_tree(self, start: Node, depth: int) -> None:
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if self.deadline and time.monotonic() > self.deadline:
+                raise _OutOfTime
+            loop = _literal_loop(node)
+            if loop is not None:
+                self._each_value(node, depth, *loop)
+                continue
+            if node.type == "command":
+                self._command(node, depth)
+            elif node.type == "file_redirect":
+                self._redirect(node)
+            elif node.type == "pipeline":
+                self._pipeline(node)
+            stack.extend(reversed(node.children))
+
+    def _each_value(self, loop: Node, depth: int, name: str, values: list[str]) -> None:
+        """`for n in 1 2 3; do … > "note_$n.txt"; done`: the body is judged once for each
+        value written in the list, with the loop's variable set to it there."""
+        body = loop.child_by_field_name("body")
+        if body is None:
+            return
+        outer = self.env
+        try:
+            for value in values:
+                self.env = {**outer, name: [(loop.start_byte, value, (body.start_byte, body.end_byte))]}
+                self._judge_tree(body, depth)
+        finally:
+            self.env = outer
 
     # variables ──────────────────────────────────────────────────────────
     def _collect_env(self, root: Node) -> dict:
@@ -2148,6 +2172,51 @@ def _walk(node: Node):
         n = stack.pop()
         yield n
         stack.extend(reversed(n.children))
+
+
+_LOOP_VALUES_MOST = 16  # a longer list is judged as before: its variable unknown
+
+
+def _literal_loop(node: Node) -> Optional[tuple[str, list[str]]]:
+    """`for n in 1 2 "a b"`: the variable and its values, when every value is written out
+    (no expansion, glob or brace the shell would turn into other words) and there are few."""
+    if node.type != "for_statement":
+        return None
+    var = node.child_by_field_name("variable")
+    words = node.children_by_field_name("value")
+    if var is None or not words or len(words) > _LOOP_VALUES_MOST:
+        return None
+    values = []
+    for w in words:
+        if w.type not in ("word", "number", "string", "raw_string"):
+            return None
+        value = _value(w)  # no variables: a value from elsewhere stays unknown
+        # a space or glob in a value is split or globbed where the body uses it unquoted
+        if not value or re.search(r"[\s*?\[{~]", value):
+            return None
+        values.append(value)
+    name = var.text.decode()
+    body = node.child_by_field_name("body")
+    if body is None:
+        return None
+    for n in _walk(body):
+        if n.type == "variable_assignment" and (n.child_by_field_name("name") or n).text.decode() == name:
+            return None  # `d=/etc` in the body: not the listed value any more
+        if n.type in ("declaration_command", "unset_command", "arithmetic_expansion", "c_style_for_statement"):
+            return None  # `declare d=…`, `unset d`, `((d=…))` may set it too
+        if n.type in ("for_statement", "select_statement") and \
+                (n.child_by_field_name("variable") or n).text.decode() == name:
+            return None  # an inner `for d in /etc` leaves d at its last value
+        if n.type == "command":
+            head = n.child_by_field_name("name")
+            if head is None or not head.named_children:
+                continue
+            if "$" in head.text.decode("utf-8", "replace"):
+                return None  # `$c /etc`: the value is what runs
+            word = _value(head.named_children[0])
+            if word in _REASSIGNS or word in ("command", "builtin"):
+                return None  # `read d`, `printf -v d`, `command read d`: may reassign
+    return name, values
 
 
 def _arguments(node: Node) -> list[Node]:
