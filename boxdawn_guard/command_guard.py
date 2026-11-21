@@ -554,6 +554,30 @@ class _Judge:
                 return True
         return False
 
+    def _remote_stdin_file(self, node: Node, name: Value, args: list[Value]) -> tuple[bool, Value]:
+        """`ssh host < x.sh`, `docker exec -i c sh < x.sh`: a local file on the stdin of a command
+        run on another machine or in a container. It is read here, within the limits a script is
+        read in, and judged there as text fed on stdin is (`ssh host <<'EOF'`)."""
+        first, _ = self._final(name, args)
+        if first not in _STDIN_TO_REMOTE:
+            return False, None
+        redirects = list(node.children_by_field_name("redirect"))
+        if node.parent is not None and node.parent.type == "redirected_statement":
+            redirects += node.parent.children_by_field_name("redirect")
+        for r in redirects:
+            op = "".join(c.text.decode() for c in r.children if not c.is_named)
+            descriptor = r.child_by_field_name("descriptor")
+            source = r.child_by_field_name("destination")
+            if r.type != "file_redirect" or op != "<" or source is None or source.type == "process_substitution" \
+                    or (descriptor is not None and descriptor.text != b"0"):
+                continue
+            path = _value(source, self.env)
+            if path is None or self.scripts_read >= _SCRIPTS_MOST:
+                return False, None
+            texts = {text for _, text in self._script_texts(path, shebang=False)}
+            return (True, texts.pop()) if len(texts) == 1 else (False, None)
+        return False, None
+
     def _stdin_from_file(self, node: Node) -> bool:
         """`bash < a.sh`: this command's stdin is a file of its own."""
         redirects = list(node.children_by_field_name("redirect"))
@@ -820,6 +844,11 @@ class _Judge:
             self.flag("ask", "name.runtime", "the command name is only known at run time")
             return
         fed, text = self._stdin(node)
+        if not fed and self.reads_scripts:
+            try:
+                fed, text = self._remote_stdin_file(node, name, args)
+            except Exception:  # noqa: BLE001 - reading a file only ever adds to the judgement
+                fed, text = False, None
         try:
             self._fetch_command(node, name, args)
         except Exception:  # noqa: BLE001 - it only adds an ask; the judgement below does not wait on it
@@ -2508,6 +2537,8 @@ def _run_powershell(inner: "_Judge", text: str, parse: Optional[Callable]) -> No
 
 
 _BASH_LIKE = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})  # a script of theirs reads as bash
+# Commands that hand their stdin to a command on another machine or in a container.
+_STDIN_TO_REMOTE = frozenset({"ssh", "sshpass", "docker", "podman", "docker-compose", "podman-compose", "kubectl"})
 _SCRIPT_BYTES_MOST = 32 * 1024  # a longer script is not read
 _SCRIPT_REASONS_MOST = 3  # what a script would have refused, shown
 
