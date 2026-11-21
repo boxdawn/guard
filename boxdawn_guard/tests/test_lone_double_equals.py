@@ -37,6 +37,30 @@ def test_what_follows_a_lone_double_equals_is_judged_on_its_own(command, alone):
     assert seen(bash(command)) == seen(bash(alone))
 
 
+@pytest.mark.parametrize("command, alone", [
+    # a review found these: the same trip with `=~`, before a comment, after a continued line
+    ("echo =~\nrm -rf ~", "rm -rf ~"),
+    ("echo x =~\nrm -rf ~", "rm -rf ~"),
+    ("echo == # c\nrm -rf ~", "rm -rf ~"),
+    ("echo ==\t# c\nrm -rf ~", "rm -rf ~"),
+    ("echo =~ #\nrm -rf ~", "rm -rf ~"),
+    ("echo a \\\n==\nrm -rf ~", "rm -rf ~"),
+    ("echo a \\\n=~\nrm -rf ~", "rm -rf ~"),
+])
+def test_other_shapes_of_the_same_trip(command, alone):
+    assert seen(bash(command)) == seen(bash(alone))
+
+
+@pytest.mark.parametrize("command", [
+    # `==` as a here-document's end mark is left alone: changing it moved where the document ended
+    "cat <<- ==\nhi\n\t==\nrm -rf ~\n=\n",
+    "cat <<- ==\nhi\n\t==\nrm -rf ~\n\t=\n",
+    "cat << ==\nhi\n==\nrm -rf ~\n",
+])
+def test_a_here_document_ending_with_double_equals_still_judges_what_follows(command):
+    assert bash(command).decision == "deny"
+
+
 @pytest.mark.parametrize("command", [
     "echo ==",
     "sed -n 1,2p a; echo ==; sed -n 3,4p a",

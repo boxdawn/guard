@@ -46,11 +46,16 @@ _PARSER = Parser(Language(tree_sitter_bash.language()))
 # break it joins the next line to the command (`echo ==` ⏎ `rm -rf ~` read as one `echo`),
 # before `;`, `|` or `&` it fails. Such a `==` is read as the word it is, through a stand-in
 # of the same length, so every offset in the text stays where it was.
-_LONE_EQ = re.compile(r"(?<=[ \t])==(?=[ \t]*(?:\r?\n|;|&|\||\)|$))")
+# `=~` trips it the same way. A word after a space or tab, or first on a line continued with `\`.
+_LONE_EQ = re.compile(r"(?:(?<=[ \t])|(?<=\\\n)|(?<=\\\r\n))(==|=~)(?=[ \t]*(?:\r?\n|;|&|\||\)|#|$))")
+# `<< ==` makes `==` a here-document's end mark: changing it would move where the document ends.
+_EQ_DELIMITER = re.compile(r"<<-?[ \t]*['\"]?(?:==|=~)")
 
 
 def _parse(text: str):
-    return _PARSER.parse(_LONE_EQ.sub(r"\\=", text).encode("utf-8"))
+    if not _EQ_DELIMITER.search(text):
+        text = _LONE_EQ.sub(lambda m: "\\" + m.group(1)[1], text)  # `==` -> `\=`, `=~` -> `\~`
+    return _PARSER.parse(text.encode("utf-8"))
 
 
 class _OutOfTime(Exception):
