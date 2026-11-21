@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 
 from boxdawn_guard import block_log, messages_ko, secret_files, undo
@@ -301,6 +302,15 @@ def decide(payload: dict) -> dict | None:
         if tool == "Bash":
             return _grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd"))
         return _search_without_secrets(tool, tool_input, payload.get("cwd"))
+    if _undo_can_take(payload, tool, verdict):
+        payload[_SNAPSHOT_TAKEN] = True  # one snapshot per call: `_snapshot_before` takes no second one
+        try:
+            row = undo.before_command(payload, data_dir)
+        except Exception:  # noqa: BLE001 - a snapshot that fails leaves the ask as it was
+            row = None
+        if row is not None and not any(row.get(k) for k in ("too_large", "unreadable", "special")) \
+                and _left_out_untracked(undo.project_of(payload), row):
+            return None  # every file git would rewrite is in that snapshot: no need to ask
     if bundle_exp is not None:
         block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
     return {"hookSpecificOutput": {
@@ -311,11 +321,114 @@ def decide(payload: dict) -> dict | None:
     }}
 
 
+# What only rewrites the files of the project's own repository, which a snapshot holds:
+# with undo on, a snapshot taken in time stands in for the ask. Not here: what changes
+# `.git` itself (stash drop, branch delete, history), `git clean` (it reaches files a
+# snapshot leaves out: repositories inside the project, large files), anything outside.
+_UNDO_COVERS = frozenset({"git.reset_hard", "git.discard_changes", "git.stash"})
+_SNAPSHOT_TAKEN = "_boxdawn_snapshot_taken"
+# Variables that move git to another folder's files (not GIT_ASKPASS, GIT_EDITOR, ...: Claude Code sets those).
+_GIT_PLACES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CONFIG",
+               "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS")
+
+
+def _undo_can_take(payload: dict, tool: str, verdict) -> bool:
+    """An ask that a snapshot can answer: undo on, every finding one of `_UNDO_COVERS`
+    on the project's root (the guard marks only git run in the line's own folder),
+    that folder the project, its own repository there, and no git variable in play."""
+    if not undo.enabled() or tool not in ("Bash", "PowerShell") or not verdict.findings:
+        return False
+    if verdict.decision != "ask" and not verdict.escalated:
+        return False
+    if any(f.rule not in _UNDO_COVERS or f.level != "ask" or f.target != "project_root" for f in verdict.findings):
+        return False
+    command = (payload.get("tool_input") or {}).get("command") or ""
+    if not _UNDO_LINE.fullmatch(command):
+        # The whole line is one of these git commands and nothing else: anything put
+        # beside it (`export GIT''_WORK_TREE=…;`, `ev''al 'c''d x';`, `git config …;`,
+        # a hook written first, `find … -execdir git …`) may send git elsewhere unseen.
+        return False
+    if any(os.environ.get(k) for k in _GIT_PLACES):
+        return False  # set before the session: another folder's files
+    project, cwd = undo.project_of(payload), payload.get("cwd")
+    if not project or not cwd or os.path.realpath(cwd) != project:
+        return False
+    if not os.path.exists(os.path.join(project, ".git")):
+        return False  # a folder inside a larger repository
+    if os.path.exists(os.path.join(project, ".gitmodules")):
+        return False  # submodules: their files are repositories a snapshot leaves out
+    return _plain_repository(project)
+
+
+# The only lines a snapshot may answer: one git command, written out, toward HEAD and this
+# folder's files. `-q`/`--quiet` may go anywhere after the subcommand.
+_Q = r"(?:[ \t]+(?:-q|--quiet))*"
+_UNDO_LINE = re.compile(
+    r"[ \t]*git[ \t]+(?:"
+    rf"reset{_Q}[ \t]+--hard{_Q}(?:[ \t]+HEAD)?{_Q}"
+    rf"|checkout{_Q}(?:[ \t]+--)?[ \t]+\.{_Q}"
+    rf"|restore{_Q}(?:[ \t]+--)?[ \t]+\.{_Q}"
+    rf"|stash(?:[ \t]+push)?{_Q}(?:[ \t]+(?:-u|--include-untracked)){{0,1}}{_Q}"
+    rf"|stash[ \t]+(?:pop|apply){_Q}"
+    r")[ \t]*")
+
+
+def _left_out_untracked(project: str, row: dict) -> bool:
+    """The folders the snapshot left out (`node_modules`, repositories inside, links) hold no
+    file git tracks, so `reset`, `checkout` and `stash` do not reach them."""
+    if row.get("folders_more"):
+        return False  # not all of them are named
+    folders = [f.rsplit(" (", 1)[0] for f in row.get("folders") or []]
+    if not folders:
+        return True
+    git = undo._git_exe(project)
+    if not git:
+        return False
+    try:
+        # `:(icase)`: on Windows and macOS `Node_Modules` on disk is git's `node_modules`
+        tracked = subprocess.run([git, "-C", project, "ls-files", "-z", "--",
+                                  *(f":(icase){f}" for f in folders)], capture_output=True, timeout=2)
+        return tracked.returncode == 0 and not tracked.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _plain_repository(project: str) -> bool:
+    """No setting that sends git to files elsewhere or runs code on checkout (`core.worktree`,
+    an included file, submodule recursion, hooks, filters), no hook in the repository, and
+    nothing staged: `reset --hard` empties the index, and what was staged apart from the file
+    on disk is in no snapshot."""
+    git = undo._git_exe(project)
+    if not git:
+        return False
+    try:
+        settings = subprocess.run([git, "-C", project, "config", "--get-regexp",
+                                   r"^(core\.worktree|core\.hookspath|submodule\.recurse|include\..*|includeif\..*"
+                                   r"|filter\..*)$"],
+                                  capture_output=True, timeout=2)
+        if settings.returncode not in (0, 1):  # 1: no such setting; 0: found some; anything else: not known
+            return False
+        for line in settings.stdout.decode("utf-8", "replace").splitlines():
+            key = line.split(" ", 1)[0].lower()
+            if not key.startswith("filter.lfs."):  # Git for Windows sets git-lfs's for everyone
+                return False
+        hooks = os.path.join(project, ".git", "hooks")
+        if not os.path.isdir(os.path.join(project, ".git")) or any(
+                not name.endswith(".sample") for name in (os.listdir(hooks) if os.path.isdir(hooks) else [])):
+            return False  # a worktree's `.git` file points elsewhere; a hook may run on checkout
+        staged = subprocess.run([git, "-C", project, "diff", "--cached", "--quiet"], capture_output=True, timeout=2)
+        return staged.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _snapshot_before(payload: dict, out: dict | None) -> None:
     """`undo` on: a snapshot of the project before a command that was not denied.
     The decision is already made and stays as it is, whatever happens here."""
     if not undo.enabled() or payload.get("tool_name") not in ("Bash", "PowerShell"):
         return
+    if payload.get(_SNAPSHOT_TAKEN):
+        return  # `decide` took it already, in place of an ask
     if out is not None and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
         return
     command = (payload.get("tool_input") or {}).get("command")

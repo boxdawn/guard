@@ -1530,6 +1530,12 @@ class _Judge:
         if sub is None:
             self.flag("ask", "git.runtime", "the git subcommand is known only at run time")
             return
+        # Where the files git rewrites are: "cwd" (the project's root) only when git runs in the
+        # folder the line starts in, with no `-C`, `cd`, work tree or git folder of its own.
+        # With undo on, the hook may take a snapshot in place of asking (command_hook).
+        git_dir_set = "GIT_DIR" in self.env or "GIT_DIR" in self.known_env or any(
+            a is not None and (a == "--git-dir" or a.startswith("--git-dir=")) for a in args[:i])
+        files = "cwd" if base == self.cwd and not git_dir_set and not configs else None  # `-c core.worktree=…`
         if configs:
             # The alias is judged as what it stands for, and the name as written still is:
             # a `git-<name>` program on PATH comes before an alias.
@@ -1546,7 +1552,10 @@ class _Judge:
                     a and a.startswith(":") for a in rest):
                 self.flag("ask", "git.push_delete", "`git push` deletes or mirrors remote refs")
         elif sub == "reset" and "--hard" in rest:
-            self.flag("ask", "git.reset_hard", "`git reset --hard` discards uncommitted work")
+            # Toward another commit HEAD moves too, which a snapshot of the files does not put back.
+            to_head = all(a in ("--hard", "-q", "--quiet", "HEAD") for a in rest)
+            self.flag("ask", "git.reset_hard", "`git reset --hard` discards uncommitted work",
+                      files if to_head else None)
         elif sub == "clean" and ("f" in flags or "--force" in rest):
             self.flag("ask", "git.clean", "`git clean -f` deletes untracked files")
         elif sub == "branch" and ("D" in flags or ("--delete" in rest and "--force" in rest)):
@@ -1556,7 +1565,7 @@ class _Judge:
         elif sub in ("checkout", "restore", "switch") and _discards_changes(sub, rest, self._git_path_kind(base)):
             # `git checkout -- .` / `git restore src` overwrite edits the way `reset --hard` does.
             # One named file (`git checkout -- a.py`) is how an agent undoes its own edit: no decision.
-            self.flag("ask", "git.discard_changes", f"`git {sub}` overwrites uncommitted changes")
+            self.flag("ask", "git.discard_changes", f"`git {sub}` overwrites uncommitted changes", files)
         elif sub == "rm" and ("r" in flags or "-r" in rest) and any(
                 o in (".", "./", "*", ":/") for o in _operands(rest)) and "--cached" not in rest:
             self.flag("ask", "git.discard_changes", "`git rm -r .` deletes every tracked file")
@@ -1567,12 +1576,15 @@ class _Judge:
         elif sub == "stash" and rest[:1] in (["pop"], ["apply"], ["branch"]):
             # Puts back the newest stash, which may be someone else's or an old one, and
             # without --index drops what was staged.
-            self.flag("ask", "git.stash", f"`git stash {rest[0]}` writes a stash, maybe not this one, over the files")
+            self.flag("ask", "git.stash", f"`git stash {rest[0]}` writes a stash, maybe not this one, over the files",
+                      files)
         elif sub == "stash" and (not rest or rest[0] is None or rest[0].startswith("-")
                                  or rest[0] not in ("list", "show", "create", "store")):
             # `git stash`, `push`, `save`: uncommitted work, maybe the user's or another
-            # agent's, leaves the folder.
-            self.flag("ask", "git.stash", "`git stash` takes uncommitted changes out of the folder")
+            # agent's, leaves the folder. With `-a`/`--all` ignored files go too, which a snapshot leaves out.
+            every = "--all" in rest or "a" in flags
+            self.flag("ask", "git.stash", "`git stash` takes uncommitted changes out of the folder",
+                      None if every else files)
 
     def _git_path_kind(self, base: str | None):
         """What a git path names on disk: "dir", "file", or None when it is not there."""
