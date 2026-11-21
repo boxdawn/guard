@@ -804,7 +804,7 @@ class _Judge:
                 return
             rest = _strip_options(args, takes_value={"-u", "-g", "-U", "-C", "-h", "-p"})
             if rest:
-                self._judge(rest[0], rest[1:], depth)
+                self._judge(rest[0], rest[1:], depth, stdin_fed=stdin_fed, stdin_text=stdin_text)
             return
 
         if name in r.wrappers:
@@ -875,6 +875,8 @@ class _Judge:
             handler(self, name, args, depth)
         elif name in r.db_clients:
             self._db(name, args)
+            if stdin_fed and stdin_text and not any(a in r.db_code_flags or a in r.db_file_flags for a in args):
+                self._db_text(name, stdin_text)  # `psql <<< 'DROP TABLE t'`, `mysql <<EOF … EOF`
 
     def _env(self, args: list[Value], rest: list[Value], depth: int, fed: bool, text: Value) -> None:
         """`env -C dir` moves the one command it runs, so the rest of the line stays."""
@@ -1714,6 +1716,11 @@ class _Judge:
             if a in r.db_file_flags:
                 self.flag("ask", "db.file", f"`{name}` runs statements from a file")
 
+    def _db_text(self, name: str, text: str) -> None:
+        """Statements fed on stdin, checked as `-c` ones are."""
+        if any(re.search(pattern, text, flags=re.I) for pattern in self.rules.db_destructive):
+            self.flag("deny", "db.destructive", f"`{name}` runs a destructive statement")
+
     def _remote(self, name: str, words: list[Value], shell: bool, depth: int,
                 inner: Optional["_Judge"] = None) -> None:
         """A command run inside a container or on another machine (#37574).
@@ -1744,7 +1751,7 @@ class _Judge:
                 name0 = posixpath.basename(name0.replace("\\", "/"))
                 name0 = name0[:-4] if name0.lower().endswith(".exe") else name0
             inner.stdin_now = (how, text)
-            inner._judge(name0, words[1:], depth + 1)
+            inner._judge(name0, words[1:], depth + 1, stdin_fed=how == "fed", stdin_text=text)
             readers.append((name0, words[1:]))
         elif any(w is None for w in words):
             inner._judge("sh", ["-c", None], depth + 1)
@@ -1758,6 +1765,11 @@ class _Judge:
         said = set()  # the same text read by many readers is judged once (`ssh h 'sh;sh;…'`)
         for name0, args in readers if how else ():
             name0, args = inner._final(name0, args)
+            r = self.rules
+            if shell and how == "fed" and text and name0 in r.db_clients and not any(
+                    a in r.db_code_flags or a in r.db_file_flags for a in args):
+                inner._db_text(name0, text)  # `ssh host psql <<< 'DROP TABLE t'`
+                continue
             if name0 is None or name0 not in self.rules.interpreters or _code_or_file(name0, args, self.rules):
                 continue
             key = "sh" if name0 in self.rules.shells else name0
