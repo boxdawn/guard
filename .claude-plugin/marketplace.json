@@ -9,8 +9,8 @@
       "name": "boxdawn-guard",
       "source": {
         "source": "archive",
-        "url": "https://github.com/boxdawn/guard/releases/download/v0.4.13/boxdawn-guard-plugin.zip",
-        "sha256": "d1f49de60b0152fb294fb26711c6dc9684d592ee83ff96b75c72f006bdb7a090"
+        "url": "https://github.com/boxdawn/guard/releases/download/v0.4.14/boxdawn-guard-plugin.zip",
+        "sha256": "9038273a65dd5776cbba1ac09deecc0beb11a1cbace51bdb78a041c040d2f3f0"
       }
     }
   ]
