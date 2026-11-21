@@ -42,6 +42,44 @@ _LEVEL = {None: 0, "ask": 1, "deny": 2}
 _MAX_DEPTH = 4  # sh -c inside eval inside sh -c ...
 
 _PARSER = Parser(Language(tree_sitter_bash.language()))
+# The grammar takes a word that is just `==` for the start of a comparison: before a line
+# break it joins the next line to the command (`echo ==` ⏎ `rm -rf ~` read as one `echo`),
+# before `;`, `|` or `&` it fails. Such a `==` is read as the word it is, through a stand-in
+# of the same length, so every offset in the text stays where it was.
+# `=~` trips it the same way. A word after a blank (space, tab, form feed, vertical tab: the grammar
+# reads them all as blanks), or first on a line continued with `\`.
+_LONE_EQ = re.compile(r"(?:(?<=[ \t\f\v])|(?<=\\\n)|(?<=\\\r\n))(==|=~)(?=[ \t\f\v]*(?:\r?\n|;|&|\||\)|#|$))")
+# A here-document's end mark may hold such a word (`<<'a =='`, `<<-\==`): a stand-in there would
+# move where the document ends. A line with a here-document is read as it is.
+_HEREDOC = re.compile(r"<<(?!<)")
+
+
+def _parse(text: str):
+    if not _HEREDOC.search(text):
+        text = _LONE_EQ.sub(lambda m: "\\" + m.group(1)[1], text)  # `==` -> `\=`, `=~` -> `\~`
+    data = text.encode("utf-8")
+    tree = _PARSER.parse(data)
+    # After an assignment (`A=1 C:/tools/python.exe x`) the grammar reads a drive letter as a
+    # stray name and the command as `:/tools/python.exe`. The letter is read as Git Bash reads
+    # the path, `/c/tools/…`: the same length, so every offset stays where it was.
+    for _ in range(_DRIVE_FIXES_MOST if len(data) <= _DRIVE_FIX_BYTES_MOST else 0):
+        spot = next((n.named_children[-1].start_byte for n in _walk(tree.root_node)
+                     if n.type == "ERROR" and n.named_children and _drive_letter(n.named_children[-1], data)), None)
+        if spot is None:
+            break
+        data = data[:spot] + b"/" + bytes([data[spot]]).lower() + data[spot + 2:]
+        tree = _PARSER.parse(data)
+    return tree
+
+
+_DRIVE_FIXES_MOST = 32
+_DRIVE_FIX_BYTES_MOST = 32 * 1024  # a longer line is not parsed again: each pass costs as much as the first
+
+
+def _drive_letter(node, data: bytes) -> bool:
+    """A one-letter name the grammar split off a path, right before its `:` (`C` of `C:/x`)."""
+    return (node.type == "variable_name" and node.end_byte - node.start_byte == 1
+            and chr(data[node.start_byte]).isalpha() and data[node.end_byte:node.end_byte + 1] == b":")
 
 
 class _OutOfTime(Exception):
@@ -353,9 +391,11 @@ class _Judge:
         if depth > _MAX_DEPTH:
             self.flag("ask", "parse.too_deep", "commands nested too deep to read")
             return
-        tree = _PARSER.parse(text.encode("utf-8"))
+        tree = _parse(text)
         root = tree.root_node
-        if root.has_error:
+        if root.has_error or (_HEREDOC.search(text) and _LONE_EQ.search(text)):
+            # a lone `==` on a line with a here-document is read as written, and may have
+            # joined the next line to its command
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
         outer = (self.env, self.workdirs, self.piped, self.loops_ok)
         self.env = self._collect_env(root)
@@ -1883,7 +1923,7 @@ class _Judge:
             line = " ".join(words)
             inner.run(line, depth + 1)
             if how:
-                for n in _walk(_PARSER.parse(line.encode("utf-8")).root_node):
+                for n in _walk(_parse(line).root_node):
                     if n.type == "command":
                         readers.append(inner._final(*inner._name_args(n)))
         said = set()  # the same text read by many readers is judged once (`ssh h 'sh;sh;…'`)
