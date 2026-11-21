@@ -46,6 +46,11 @@ def test_what_follows_a_lone_double_equals_is_judged_on_its_own(command, alone):
     ("echo =~ #\nrm -rf ~", "rm -rf ~"),
     ("echo a \\\n==\nrm -rf ~", "rm -rf ~"),
     ("echo a \\\n=~\nrm -rf ~", "rm -rf ~"),
+    # a second review: form feed and vertical tab are blanks to the grammar too
+    ("echo\f==\nrm -rf ~", "rm -rf ~"),
+    ("echo x\f==\nrm -rf ~", "rm -rf ~"),
+    ("echo\v==\nrm -rf ~", "rm -rf ~"),
+    ("echo x\f=~\nrm -rf ~", "rm -rf ~"),
 ])
 def test_other_shapes_of_the_same_trip(command, alone):
     assert seen(bash(command)) == seen(bash(alone))
@@ -56,9 +61,24 @@ def test_other_shapes_of_the_same_trip(command, alone):
     "cat <<- ==\nhi\n\t==\nrm -rf ~\n=\n",
     "cat <<- ==\nhi\n\t==\nrm -rf ~\n\t=\n",
     "cat << ==\nhi\n==\nrm -rf ~\n",
+    # a second review: end marks that hold the word in other spellings
+    "cat <<'a =='\nx\na ==\nrm -rf ~\n",
+    'cat <<" =="\nx\n ==\nrm -rf ~\n',
+    "cat <<' =~'\nx\n =~\nrm -rf ~\n",
+    "cat <<-\\==\nx\n\t==\nrm -rf ~\n",
+    "cat <<-'='=\nx\n\t==\nrm -rf ~\n",
+    "cat <<-'x ==;'\nx\n\tx ==;\nrm -rf ~\n",
 ])
 def test_a_here_document_ending_with_double_equals_still_judges_what_follows(command):
     assert bash(command).decision == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    "cat <<EOF\nx\nEOF\necho ==\nrm -rf ~",
+    "cat <<EOF > a.txt\nx\nEOF\necho ==\ngit push --force",
+])
+def test_on_a_line_with_a_here_document_a_lone_double_equals_is_not_passed(command):
+    assert bash(command).decision in ("ask", "deny")
 
 
 @pytest.mark.parametrize("command", [

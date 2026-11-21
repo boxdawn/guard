@@ -46,14 +46,16 @@ _PARSER = Parser(Language(tree_sitter_bash.language()))
 # break it joins the next line to the command (`echo ==` ⏎ `rm -rf ~` read as one `echo`),
 # before `;`, `|` or `&` it fails. Such a `==` is read as the word it is, through a stand-in
 # of the same length, so every offset in the text stays where it was.
-# `=~` trips it the same way. A word after a space or tab, or first on a line continued with `\`.
-_LONE_EQ = re.compile(r"(?:(?<=[ \t])|(?<=\\\n)|(?<=\\\r\n))(==|=~)(?=[ \t]*(?:\r?\n|;|&|\||\)|#|$))")
-# `<< ==` makes `==` a here-document's end mark: changing it would move where the document ends.
-_EQ_DELIMITER = re.compile(r"<<-?[ \t]*['\"]?(?:==|=~)")
+# `=~` trips it the same way. A word after a blank (space, tab, form feed, vertical tab: the grammar
+# reads them all as blanks), or first on a line continued with `\`.
+_LONE_EQ = re.compile(r"(?:(?<=[ \t\f\v])|(?<=\\\n)|(?<=\\\r\n))(==|=~)(?=[ \t\f\v]*(?:\r?\n|;|&|\||\)|#|$))")
+# A here-document's end mark may hold such a word (`<<'a =='`, `<<-\==`): a stand-in there would
+# move where the document ends. A line with a here-document is read as it is.
+_HEREDOC = re.compile(r"<<(?!<)")
 
 
 def _parse(text: str):
-    if not _EQ_DELIMITER.search(text):
+    if not _HEREDOC.search(text):
         text = _LONE_EQ.sub(lambda m: "\\" + m.group(1)[1], text)  # `==` -> `\=`, `=~` -> `\~`
     return _PARSER.parse(text.encode("utf-8"))
 
@@ -369,7 +371,9 @@ class _Judge:
             return
         tree = _parse(text)
         root = tree.root_node
-        if root.has_error:
+        if root.has_error or (_HEREDOC.search(text) and _LONE_EQ.search(text)):
+            # a lone `==` on a line with a here-document is read as written, and may have
+            # joined the next line to its command
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
         outer = (self.env, self.workdirs, self.piped, self.loops_ok)
         self.env = self._collect_env(root)
