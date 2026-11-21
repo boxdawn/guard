@@ -316,6 +316,7 @@ class _Judge:
     scripts_read: int = 0
     scripts_seen: set = field(default_factory=set)  # files this line's scripts were read from, once each
     script_deadline: float = 0.0
+    loops_ok: bool = False  # this line's loops over listed values may be judged per value (`run`)
     # Set on a PowerShell line: its parser, which also reads a `.ps1` script that line runs.
     ps_parse: Optional[Callable] = None
     deadline: float = 0.0  # a script's judge stops (`_OutOfTime`) past this
@@ -356,24 +357,30 @@ class _Judge:
         root = tree.root_node
         if root.has_error:
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
-        outer = (self.env, self.workdirs, self.piped)
+        outer = (self.env, self.workdirs, self.piped, self.loops_ok)
         self.env = self._collect_env(root)
         self._collect_workdirs(root, depth)
         self.piped = _piped_commands(root)
+        # A loop's values are used only on a line where nothing outside the loop can change how
+        # its variable reads: values not dropped (`trap`, `IFS=`, `eval` …), no function, no
+        # `declare` (`declare -n d` makes d a reference), no array element set (`d[0]=…`).
+        self.loops_ok = "HOME" in self.env and not any(
+            n.type in ("function_definition", "declaration_command", "subscript") for n in _walk(root))
         try:
-            self._judge_tree(root, depth)
+            self._judge_tree(root, depth, 1)
         finally:
-            self.env, self.workdirs, self.piped = outer
+            self.env, self.workdirs, self.piped, self.loops_ok = outer
 
-    def _judge_tree(self, start: Node, depth: int) -> None:
+    def _judge_tree(self, start: Node, depth: int, runs: int) -> None:
+        """`runs`: how many times this part is judged already, inside loops over listed values."""
         stack = [start]
         while stack:
             node = stack.pop()
             if self.deadline and time.monotonic() > self.deadline:
                 raise _OutOfTime
-            loop = _literal_loop(node)
-            if loop is not None:
-                self._each_value(node, depth, *loop)
+            loop = _literal_loop(node) if self.loops_ok else None
+            if loop is not None and runs * len(loop[1]) <= _LOOP_RUNS_MOST:
+                self._each_value(node, depth, runs, *loop)
                 continue
             if node.type == "command":
                 self._command(node, depth)
@@ -383,7 +390,7 @@ class _Judge:
                 self._pipeline(node)
             stack.extend(reversed(node.children))
 
-    def _each_value(self, loop: Node, depth: int, name: str, values: list[str]) -> None:
+    def _each_value(self, loop: Node, depth: int, runs: int, name: str, values: list[str]) -> None:
         """`for n in 1 2 3; do … > "note_$n.txt"; done`: the body is judged once for each
         value written in the list, with the loop's variable set to it there."""
         body = loop.child_by_field_name("body")
@@ -393,7 +400,7 @@ class _Judge:
         try:
             for value in values:
                 self.env = {**outer, name: [(loop.start_byte, value, (body.start_byte, body.end_byte))]}
-                self._judge_tree(body, depth)
+                self._judge_tree(body, depth, runs * len(values))
         finally:
             self.env = outer
 
@@ -2175,6 +2182,7 @@ def _walk(node: Node):
 
 
 _LOOP_VALUES_MOST = 16  # a longer list is judged as before: its variable unknown
+_LOOP_RUNS_MOST = 64    # loops inside loops: past this many judgings of a body, as before
 
 
 def _literal_loop(node: Node) -> Optional[tuple[str, list[str]]]:

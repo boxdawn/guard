@@ -69,6 +69,29 @@ def test_these_still_ask(command):
     assert bash(command).decision == "ask"
 
 
+@pytest.mark.parametrize("command", [
+    # a review found these: something outside the loop changes how its variable reads
+    'declare -n d; for d in HOME; do rm -rf "$d"; done',
+    "trap 'd=/etc' DEBUG; for d in x; do rm -rf \"$d\"; done",
+    'f(){ d=/etc; }; for d in x; do f; rm -rf "$d"; done',
+    'for d in x; do d[0]=/etc; rm -rf "$d"; done',
+    "IFS=.; for d in x./etc; do rm -rf $d; done",
+    "for d in x./etc; do IFS=.; rm -rf $d; done",
+])
+def test_a_line_that_can_change_the_variable_elsewhere_is_judged_as_before(command):
+    assert bash(command).decision == "deny"
+
+
+def test_loops_inside_loops_stay_quick():
+    import time
+    values = " ".join(f"v{i}" for i in range(16))
+    line = f"for a in {values}; do for b in {values}; do for c in {values}; do for e in {values}; do " \
+           'echo hi > "x_$a$b$c$e"; done; done; done; done'
+    started = time.monotonic()
+    bash(line)
+    assert time.monotonic() - started < 2
+
+
 def test_a_long_list_is_judged_as_before():
     values = " ".join(f"v{i}" for i in range(17))
     assert bash(f'for d in {values}; do rm -rf "$d"; done').decision == "deny"
