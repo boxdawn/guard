@@ -42,6 +42,15 @@ _LEVEL = {None: 0, "ask": 1, "deny": 2}
 _MAX_DEPTH = 4  # sh -c inside eval inside sh -c ...
 
 _PARSER = Parser(Language(tree_sitter_bash.language()))
+# The grammar takes a word that is just `==` for the start of a comparison: before a line
+# break it joins the next line to the command (`echo ==` ⏎ `rm -rf ~` read as one `echo`),
+# before `;`, `|` or `&` it fails. Such a `==` is read as the word it is, through a stand-in
+# of the same length, so every offset in the text stays where it was.
+_LONE_EQ = re.compile(r"(?<=[ \t])==(?=[ \t]*(?:\r?\n|;|&|\||\)|$))")
+
+
+def _parse(text: str):
+    return _PARSER.parse(_LONE_EQ.sub(r"\\=", text).encode("utf-8"))
 
 
 class _OutOfTime(Exception):
@@ -353,7 +362,7 @@ class _Judge:
         if depth > _MAX_DEPTH:
             self.flag("ask", "parse.too_deep", "commands nested too deep to read")
             return
-        tree = _PARSER.parse(text.encode("utf-8"))
+        tree = _parse(text)
         root = tree.root_node
         if root.has_error:
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
@@ -1883,7 +1892,7 @@ class _Judge:
             line = " ".join(words)
             inner.run(line, depth + 1)
             if how:
-                for n in _walk(_PARSER.parse(line.encode("utf-8")).root_node):
+                for n in _walk(_parse(line).root_node):
                     if n.type == "command":
                         readers.append(inner._final(*inner._name_args(n)))
         said = set()  # the same text read by many readers is judged once (`ssh h 'sh;sh;…'`)
