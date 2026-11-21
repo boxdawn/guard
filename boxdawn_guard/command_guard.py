@@ -409,7 +409,7 @@ class _Judge:
                 name_node = node.child_by_field_name("name")
                 word = _value(name_node.named_children[0]) if name_node is not None and name_node.named_children else ""
                 if word in ("command", "builtin"):  # `command read X` is `read X`
-                    rest = [_value(a) for a in node.children_by_field_name("argument")]
+                    rest = [_value(a) for a in _arguments(node)]
                     word = next((a for a in rest if a is None or not a.startswith("-")), "")
                 if word is None or word in _REASSIGNS:
                     return {}  # eval, read, source …: any name may change unseen
@@ -720,7 +720,7 @@ class _Judge:
             if name.lower().endswith(".exe"):
                 name = name[:-4]
         args = extra
-        for a in node.children_by_field_name("argument"):
+        for a in _arguments(node):
             value = _value(a, self.env)
             unquoted = a.type == "concatenation" and any(c.type == "word" and b"{" in c.text for c in a.children)
             args.extend(_braces(value) if value is not None and unquoted else [value])
@@ -755,7 +755,7 @@ class _Judge:
                     self.flag("ask", "pipe.into_interpreter", f"output of another command is run as `{first}` code")
         self.stdin_now = ("fed", text) if fed else ("pipe", None) if piped else self.stdin_base
         outer_raw = self.raw_args
-        self.raw_args = [a.text.decode("utf-8", "replace") for a in node.children_by_field_name("argument")]
+        self.raw_args = [a.text.decode("utf-8", "replace") for a in _arguments(node)]
         try:
             self._judge(name, args, depth, stdin_fed=fed, stdin_text=text)
         finally:
@@ -990,7 +990,7 @@ class _Judge:
         raws: list[Optional[str]] = []
         if name is not None and inner.type not in ("string", "raw_string"):
             raws += [None] * (len(_braces(name)) - 1)
-        for a in node.children_by_field_name("argument"):
+        for a in _arguments(node):
             value = _value(a, self.env)
             unquoted = a.type == "concatenation" and any(c.type == "word" and b"{" in c.text for c in a.children)
             count = len(_braces(value)) if value is not None and unquoted else 1
@@ -2031,6 +2031,18 @@ def _walk(node: Node):
         n = stack.pop()
         yield n
         stack.extend(reversed(n.children))
+
+
+def _arguments(node: Node) -> list[Node]:
+    """A command's arguments. The grammar reads the `0` of `0<`, `0<<<`, `0<&` as an argument
+    (`3<` and `2>` it reads as descriptors); a `0` that touches the redirect after it is
+    that redirect's descriptor, stdin, and is left out."""
+    args = node.children_by_field_name("argument")
+    redirects = list(node.children_by_field_name("redirect"))
+    if node.parent is not None and node.parent.type == "redirected_statement":
+        redirects += node.parent.children_by_field_name("redirect")
+    starts = {r.start_byte for r in redirects}
+    return [a for a in args if not (a.type == "number" and a.text == b"0" and a.end_byte in starts)]
 
 
 _RSYNC_VALUES = frozenset({"-e", "--rsh", "--exclude", "--include", "--filter", "-f", "--files-from",
