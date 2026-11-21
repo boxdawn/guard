@@ -383,6 +383,7 @@ class _Judge:
         unknown — the bypass shapes are listed in the tests.
         """
         poisoned: set[str] = set()
+        named_by_variable: list[Node] = []  # `$S/python.exe`: read once the values are known (below)
         for node in _walk(root):
             kind = node.type
             if kind == "variable_assignment":
@@ -414,7 +415,9 @@ class _Judge:
                 if word in ("command", "builtin"):  # `command read X` is `read X`
                     rest = [_value(a) for a in _arguments(node)]
                     word = next((a for a in rest if a is None or not a.startswith("-")), "")
-                if word is None or word in _REASSIGNS:
+                if word is None:
+                    named_by_variable.append(node)
+                elif word in _REASSIGNS:
                     return {}  # eval, read, source …: any name may change unseen
 
         env: dict = {"HOME": [(-1, self.home, None)]}
@@ -435,7 +438,34 @@ class _Judge:
             env.setdefault(name, []).append((node.start_byte, value, span))
         for name in poisoned:
             env.pop(name, None)
+        # A command named through a variable may itself be `eval`, `read` …, which could change
+        # any of these values unseen. It is not when its name, read from values set before it,
+        # is a file path (a program, not a shell builtin) or a known name that reassigns nothing.
+        for node in named_by_variable:
+            if not self._ordinary_name(node, env):
+                return {}
         return env
+
+    @staticmethod
+    def _ordinary_name(node: Node, env: dict) -> bool:
+        name_node = node.child_by_field_name("name")
+        words = [name_node.named_children[0]] if name_node is not None and name_node.named_children else []
+        words += _arguments(node)
+        for i, w in enumerate(words):
+            word = _value(w, env)
+            if not word or re.search(r"[\s*?\[]", word):
+                # unknown; or the shell splits or globs it (`C="rm -rf"; $C ~` runs `rm -rf ~`,
+                # `X=; $X rm …` runs `rm …`): what runs is not this one word
+                return False
+            if i == 0 or not word.startswith("-"):
+                if "/" in word.replace("\\", "/"):
+                    return True  # `/c/tools/python.exe`: a file is no builtin
+                if word in ("command", "builtin"):
+                    continue  # `command $X …`: the next word is what runs
+                # Any builtin runs in this shell, and some change values (`X=export; $X Y=…`):
+                # rather than list those, a builtin named through a variable keeps them unknown.
+                return word not in _BASH_BUILTINS
+        return True
 
     # stdin ──────────────────────────────────────────────────────────────
     def _stdin(self, node: Node) -> tuple[bool, Value]:
@@ -2048,6 +2078,18 @@ _HANDLERS = {
 _REASSIGNS = frozenset({
     "eval", "source", ".", "read", "mapfile", "readarray", "getopts", "unset",
     "let", "declare", "typeset", "local", "readonly", "printf",  # printf -v
+    "export",  # `command export Y=…` (a plain `export Y=…` is read as an assignment)
+    "trap",    # `trap 'Y=…' DEBUG` runs before each command
+})
+# Every bash builtin: a command named through a variable that turns out to be one of these
+# keeps the line's values unknown, as before: a builtin runs in this shell.
+_BASH_BUILTINS = frozenset({
+    ".", ":", "[", "alias", "bg", "bind", "break", "builtin", "caller", "cd", "command", "compgen",
+    "complete", "compopt", "continue", "declare", "dirs", "disown", "echo", "enable", "eval", "exec",
+    "exit", "export", "false", "fc", "fg", "getopts", "hash", "help", "history", "jobs", "kill", "let",
+    "local", "logout", "mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly",
+    "return", "set", "shift", "shopt", "source", "suspend", "test", "times", "trap", "true", "type",
+    "typeset", "ulimit", "umask", "unalias", "unset", "wait",
 })
 
 
