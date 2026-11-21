@@ -921,6 +921,11 @@ class _Judge:
                 self._fetched_in(node)
             except Exception:  # noqa: BLE001 - it only adds an ask
                 pass
+            if self.reads_scripts:
+                try:
+                    self._script_in(node)
+                except Exception:  # noqa: BLE001 - reading a script only ever adds an ask
+                    pass
             return
         dest_node = node.child_by_field_name("destination")
         if dest_node is None:
@@ -1110,6 +1115,32 @@ class _Judge:
                 path = args[at[-1]]  # not `bash -s x.sh`: that runs stdin, and `x.sh` is its `$1`
         elif re.search(r"[/\\]", word) and not _DOCUMENT.search(word):
             path, direct = word, True  # `./x.sh`: a shell script only if it says so (below)
+        self._read_script_at(path, direct)
+
+    def _script_in(self, node: Node) -> None:
+        """`bash < x.sh`: a shell that runs no code or file of its own runs its stdin,
+        and that is the file, read as `bash x.sh` is."""
+        op = "".join(c.text.decode() for c in node.children if not c.is_named)
+        descriptor = node.child_by_field_name("descriptor")
+        source = node.child_by_field_name("destination")
+        if op != "<" or descriptor is not None and descriptor.text != b"0" or source is None:
+            return
+        if source.type == "process_substitution":
+            return  # `bash < <(curl …)`: another command's output, judged as a pipe
+        first = next((n for n in _walk(_redirect_body(node)) if n.type == "command"), None)
+        if first is None:
+            return
+        name, args = self._final(*self._name_args(first))
+        if name not in _BASH_LIKE or _code_on_line(name, args, self.rules) is not None:
+            return
+        at = _script_candidates(name, args, self.rules)
+        if at and not any(a and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args[:at[-1]]):
+            return  # `bash x.sh < data`: the script is `x.sh`, stdin is its input
+        if any(a and re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", a) for a in args):
+            return  # `bash -n < x.sh` reads it for mistakes
+        self._read_script_at(_value(source, self.env), False)
+
+    def _read_script_at(self, path: Value, direct: bool) -> None:
         if path is None or self.scripts_read >= _SCRIPTS_MOST or (
                 self.script_deadline and time.monotonic() > self.script_deadline):
             return
