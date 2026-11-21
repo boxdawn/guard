@@ -144,7 +144,9 @@ def test_the_hook_takes_one_and_says_nothing(project, monkeypatch, capsys):
 
 
 def test_an_ask_still_asks_and_a_denied_command_takes_none(project, monkeypatch, capsys):
-    ask = json.loads(_hook(_payload(project, "git reset --hard HEAD"), monkeypatch, capsys))
+    # An ask a snapshot cannot answer (`git clean` reaches files a snapshot leaves out);
+    # the ones it can (`git reset --hard`, ...) are in test_undo_instead_of_ask.py.
+    ask = json.loads(_hook(_payload(project, "git clean -fd"), monkeypatch, capsys))
     assert ask["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert len(_store(project).snapshots()) == 1
     deny = json.loads(_hook(_payload(project, "rm -rf ~"), monkeypatch, capsys))

@@ -1031,16 +1031,17 @@ def start_in_background(project: str, command: str = "") -> None:
                      close_fds=True)
 
 
-def before_command(payload: dict, data_dir: str | None) -> None:
+def before_command(payload: dict, data_dir: str | None) -> dict | None:
     """Called by the hook for a Bash or PowerShell call it did not deny. A command
     that goes on without a snapshot gets an "unprotected" row in the record; a cause
     that every command would repeat (system not supported, project refused, no git)
     gets one row, written again only after another row.
     While another snapshot is being taken (the one at session start, say), this waits
-    for it within `HOOK_BUDGET`, then takes its own in what is left of it."""
+    for it within `HOOK_BUDGET`, then takes its own in what is left of it.
+    Returns the snapshot's row when one was taken in time, else None."""
     project = project_of(payload)
     if not (enabled() and data_dir and project):
-        return
+        return None
     store = Store(project, data_dir)
     command = payload.get("tool_input", {}).get("command")
     why = {"before": command[:200] if isinstance(command, str) else "", "session": payload.get("session_id")}
@@ -1049,29 +1050,33 @@ def before_command(payload: dict, data_dir: str | None) -> None:
         store.note_once("no snapshots: this system is not supported yet" if sys.platform not in SUPPORTED else
                         f"no snapshots here: the project is {refused}" if refused else
                         "no snapshots: git is not installed", why)
-        return
+        return None
     finish_later = False
+    row = None
     started = time.perf_counter()
     store.record_by = time.monotonic() + HOOK_BUDGET + LOG_WAIT
     try:
         while not store.acquire():
             if time.perf_counter() - started + 0.05 >= HOOK_BUDGET:
                 store.note({"unprotected": "another snapshot was still being taken", **why})
-                return
+                return None
             time.sleep(0.05)
         try:
-            store.snapshot(why, budget=HOOK_BUDGET - (time.perf_counter() - started))
+            row = store.snapshot(why, budget=HOOK_BUDGET - (time.perf_counter() - started))
         finally:
             store.release()
     except subprocess.TimeoutExpired:
         finish_later = True
     except Exception as exc:  # noqa: BLE001 - whatever it was, the record must say this command had no snapshot
         store.note({"unprotected": f"the snapshot failed ({type(exc).__name__}: {str(exc)[:200]})", **why})
+        row = None
     if finish_later:
         # Started before the row is written: a record that cannot be written must not cost the snapshot too.
         start_in_background(project, why["before"])
         store.note({"unprotected": f"the snapshot took over {HOOK_BUDGET:g}s (waiting included); "
                                    "finishing in the background", **why})
+        return None
+    return row
 
 
 def start(project: str, data_dir: str, note: str = "session start", late_for: str | None = None) -> str:
