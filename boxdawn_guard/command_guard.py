@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from glob import escape as glob_escape, iglob
 from itertools import islice
-from typing import Optional
+from typing import Callable, Optional
 
 import tree_sitter_bash
 from tree_sitter import Language, Node, Parser
@@ -314,7 +314,10 @@ class _Judge:
     # a script's own text, a remote line or an alias (they name files elsewhere, or loop).
     reads_scripts: bool = False
     scripts_read: int = 0
+    scripts_seen: set = field(default_factory=set)  # files this line's scripts were read from, once each
     script_deadline: float = 0.0
+    # Set on a PowerShell line: its parser, which also reads a `.ps1` script that line runs.
+    ps_parse: Optional[Callable] = None
     deadline: float = 0.0  # a script's judge stops (`_OutOfTime`) past this
 
     def __post_init__(self) -> None:
@@ -1109,6 +1112,18 @@ class _Judge:
         typed here. Only what would be refused asks; a delete of a path known
         only at run time (`rm -rf "$TMP"`, how scripts clean up) does not."""
         path, direct = None, False
+        ps1 = None
+        if name in ("pwsh", "powershell"):
+            at = _script_candidates(name, args, self.rules)
+            ps1 = args[at[-1]] if at else None  # `pwsh -File x.ps1`, `powershell x.ps1`
+        elif self.ps_parse is not None and re.search(r"[/\\]", word):
+            ps1 = word  # `.\x.ps1`, `& ./x.ps1` on a PowerShell line
+        if ps1 is not None and ps1.lower().endswith(".ps1"):
+            parse = self.ps_parse
+            self._read_script_at(ps1, False, run=lambda inner, text: _run_powershell(inner, text, parse))
+            return
+        if name in ("pwsh", "powershell"):
+            return
         if name in _BASH_LIKE and _code_on_line(name, args, self.rules) is None:
             at = _script_candidates(name, args, self.rules)
             if at and not any(a and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", a) for a in args[:at[-1]]):
@@ -1140,7 +1155,8 @@ class _Judge:
             return  # `bash -n < x.sh` reads it for mistakes
         self._read_script_at(_value(source, self.env), False)
 
-    def _read_script_at(self, path: Value, direct: bool) -> None:
+    def _read_script_at(self, path: Value, direct: bool, run=None) -> None:
+        """`run(inner, text)`: how the script's text is judged (default: as bash)."""
         if path is None or self.scripts_read >= _SCRIPTS_MOST or (
                 self.script_deadline and time.monotonic() > self.script_deadline):
             return
@@ -1153,7 +1169,10 @@ class _Judge:
             inner = _Judge(cwd=self._native(base), home=self.home, rules=self.rules,
                            known_env=self.known_env, deadline=self.script_deadline)
             try:
-                inner.run(text, 0)
+                if run is None:
+                    inner.run(text, 0)
+                else:
+                    run(inner, text)
             except _OutOfTime:
                 return  # too much to read in time: the line is judged as it was
             refused += [(f, r) for f, r in zip(inner.findings, inner.reasons)
@@ -1174,7 +1193,7 @@ class _Judge:
             if base is None or self.scripts_read >= _SCRIPTS_MOST:
                 continue
             native = self._native(self._absolute(path, base))
-            if native.replace("\\", "/").startswith("//"):
+            if native.replace("\\", "/").startswith("//") or native in self.scripts_seen:
                 continue
             self.scripts_read += 1
             try:
@@ -1190,6 +1209,7 @@ class _Judge:
                 continue
             if all(native != seen for seen, _, _ in found):  # one file reached from two folders
                 found.append((native, base, text))
+                self.scripts_seen.add(native)  # and once only on the line (`powershell .\x.ps1` reaches it twice)
         return [(base, text) for _, base, text in found]
 
     def _output(self, dest: Value) -> None:
@@ -2314,6 +2334,14 @@ _LOOKS_MOST = 200    # redirects and `tee`s of one line that are looked through 
 _SCRIPTS_MOST = 8    # looks on disk for the shell scripts of one line
 _SCRIPT_FOLDERS_MOST = 4  # folders a script's name is looked for in
 _SCRIPT_SECONDS = 1.0  # for reading all the scripts of one line; past it they are left unread
+def _run_powershell(inner: "_Judge", text: str, parse: Optional[Callable]) -> None:
+    """A `.ps1` script's text, judged as a PowerShell line typed in its folder."""
+    from boxdawn_guard import powershell_guard  # it imports this module
+    inner.ps_parse = parse or powershell_guard.parse
+    known = {k.lower(): v for k, v in inner.known_env.items()}
+    powershell_guard._PowerShell(inner, inner.ps_parse, known, inner.home).run(text, 0)
+
+
 _BASH_LIKE = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})  # a script of theirs reads as bash
 _SCRIPT_BYTES_MOST = 32 * 1024  # a longer script is not read
 _SCRIPT_REASONS_MOST = 3  # what a script would have refused, shown

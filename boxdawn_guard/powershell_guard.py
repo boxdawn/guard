@@ -21,12 +21,14 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from boxdawn_guard import secret_files
 from boxdawn_guard.command_guard import (
-    CommandRules, Value, Verdict, _DOCUMENT, _MAX_DEPTH, _Judge, _code_or_file, _powershell_option,
+    CommandRules, Value, Verdict, _DOCUMENT, _MAX_DEPTH, _Judge, _OutOfTime, _code_or_file,
+    _powershell_option,
 )
 
 Parse = Callable[[str], dict]
@@ -173,7 +175,8 @@ def evaluate_powershell(command: str, *, cwd: str, home: str, rules: CommandRule
                         parse: Parse = parse) -> Optional[Verdict]:
     """None when there is no PowerShell parser on this machine and it is not
     Windows (the PowerShell tool is opt-in elsewhere)."""
-    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}), reads_scripts=True)
+    judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}), reads_scripts=True,
+                   ps_parse=parse)
     ps = _PowerShell(judge, parse, {k.lower(): v for k, v in (known_env or {}).items()}, home)
     try:
         ps.run(command, 0)
@@ -216,6 +219,8 @@ class _PowerShell:
             fetcher_at = None  # where the last command that downloads starts
             fed_a_secret = listed_a_secret = False
             for c in commands:
+                if j.deadline and time.monotonic() > j.deadline:
+                    raise _OutOfTime  # a script's judge: past its time, the line is judged as it was
                 try:
                     while saved and saved[0][0] < c["start"]:
                         j._note_fetched(_native_path(saved.pop(0)[1]))
