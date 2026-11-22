@@ -27,6 +27,10 @@ def said(command, monkeypatch, language="English"):
     ("echo ok > a.txt; echo bad > /etc/hosts.bak; cat a.txt", "(in `echo bad > /etc/hosts.bak`)"),
     ("X=$(rm -rf ~); echo $X", "(in `rm -rf ~`)"),
     ("git status\ngit diff > /etc/x.diff\nls", "(line 2: `git diff > /etc/x.diff`)"),
+    # the grammar hangs this redirect on the whole chain; the shell gives it to `git diff`
+    ("cd /work/proj && git diff > /etc/x.diff", "(in `git diff > /etc/x.diff`)"),
+    ("cd /work/proj && echo a | tee b > /etc/x.txt", "(in `tee b > /etc/x.txt`)"),
+    ("ls\ncd /work/proj &&\n  git diff > /etc/x.diff", "(line 3: `git diff > /etc/x.diff`)"),
 ])
 def test_the_reason_names_the_command_it_is_about(command, part, monkeypatch):
     assert said(command, monkeypatch)[1].endswith(part)

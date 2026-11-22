@@ -2306,7 +2306,18 @@ def _place(node: Node) -> Optional[tuple[Optional[int], str]]:
     root = node
     while root.parent is not None:
         root = root.parent
-    text = " ".join(node.text.decode("utf-8", "replace").split())
+    text = node.text.decode("utf-8", "replace")
+    body = node.child_by_field_name("body") if node.type == "redirected_statement" else None
+    if body is not None and body.type in ("list", "pipeline"):
+        # `cd x && git diff > ../a.diff`: the grammar hangs the redirect on the chain, the
+        # shell gives it to the last command; show that command with it, not the chain.
+        last = body
+        while last.type in ("list", "pipeline") and last.named_children:
+            last = last.named_children[-1]
+        text = " ".join([last.text.decode("utf-8", "replace"),
+                         *(r.text.decode("utf-8", "replace") for r in node.children_by_field_name("redirect"))])
+        node = last
+    text = " ".join(text.split())
     if text == " ".join(root.text.decode("utf-8", "replace").split()):
         return None
     if len(text) > _PLACE_MOST:
