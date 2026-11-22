@@ -181,7 +181,7 @@ _TARGET_OF_WHERE = {"inside": "project", "cwd": "project_root",
 def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
              unattended: bool = False, known_env: dict[str, str] | None = None) -> Verdict:
     """`known_env`: variables whose value the caller read from the process
-    environment (the hook passes TEMP/TMP/TMPDIR). Used only when the line
+    environment (the hook passes TEMP/TMP/TMPDIR/USERPROFILE/APPDATA/LOCALAPPDATA). Used only when the line
     itself never assigns them — the same rules as any other variable."""
     judge = _Judge(cwd=cwd, home=home, rules=rules, known_env=dict(known_env or {}), reads_scripts=True)
     try:
@@ -453,6 +453,8 @@ class _Judge:
         run, runs in a subshell, or could reassign unseen leaves the name
         unknown — the bypass shapes are listed in the tests.
         """
+        if _SETS_IFS.search(root.text):
+            return {}  # `{IFS}>f` and `wait -p IFS` put a number in IFS: words split differently
         poisoned: set[str] = set()
         named_by_variable: list[Node] = []  # `$S/python.exe`: read once the values are known (below)
         for node in _walk(root):
@@ -483,7 +485,7 @@ class _Judge:
             elif kind == "command":
                 name_node = node.child_by_field_name("name")
                 word = _value(name_node.named_children[0]) if name_node is not None and name_node.named_children else ""
-                if word in ("command", "builtin"):  # `command read X` is `read X`
+                if word in ("command", "builtin", "time"):  # `command read X`, `time read X` are `read X`
                     rest = [_value(a) for a in _arguments(node)]
                     word = next((a for a in rest if a is None or not a.startswith("-")), "")
                 if word is None:
@@ -491,7 +493,7 @@ class _Judge:
                 elif word == "printf":
                     # only `printf -v NAME …` sets a value: that name, or all when it is not written out
                     args = [_value(a) for a in _arguments(node)]
-                    if "printf" in args and _value(name_node.named_children[0]) in ("command", "builtin"):
+                    if "printf" in args and _value(name_node.named_children[0]) in ("command", "builtin", "time"):
                         args = args[args.index("printf") + 1:]  # `command printf -v Y …`
                     i = 0
                     while i < len(args):  # the options, up to the format
@@ -527,6 +529,8 @@ class _Judge:
             value = "" if value_node is None else _value(value_node, env)
             span = None if scope is None else (scope.start_byte, scope.end_byte)
             env.setdefault(name, []).append((node.start_byte, value, span))
+        if "IFS" in poisoned:
+            return {}  # `for IFS in /`, `printf -v IFS /`: words split differently, as for `IFS=`
         for name in poisoned:
             env.pop(name, None)
         # A command named through a variable may itself be `eval`, `read` …, which could change
@@ -553,8 +557,8 @@ class _Judge:
             if i == 0 or not word.startswith("-"):
                 if "/" in word.replace("\\", "/"):
                     return True  # `/c/tools/python.exe`: a file is no builtin
-                if word in ("command", "builtin"):
-                    continue  # `command $X …`: the next word is what runs
+                if word in ("command", "builtin", "time"):
+                    continue  # `command $X …`, `time $X …`: the next word is what runs
                 # Any builtin runs in this shell, and some change values (`X=export; $X Y=…`):
                 # rather than list those, a builtin named through a variable keeps them unknown.
                 return word not in _BASH_BUILTINS
@@ -2228,6 +2232,8 @@ _BASH_BUILTINS = frozenset({
 
 
 _NOT_STRAIGHT = (False, None)
+# IFS set by a redirect (`{IFS}>f`, `{IFS}<<<x`) or an option (`wait -p IFS`), not an assignment
+_SETS_IFS = re.compile(rb"\{IFS\}|-\w*p\s*IFS\b")
 
 
 def _straight_line(assignment: Node) -> tuple[bool, Optional[Node]]:
@@ -2313,8 +2319,8 @@ def _literal_loop(node: Node) -> Optional[tuple[str, list[str]]]:
             if "$" in head.text.decode("utf-8", "replace"):
                 return None  # `$c /etc`: the value is what runs
             word = _value(head.named_children[0])
-            if word in _REASSIGNS or word in ("command", "builtin"):
-                return None  # `read d`, `printf -v d`, `command read d`: may reassign
+            if word in _REASSIGNS or word in ("command", "builtin", "time"):
+                return None  # `read d`, `printf -v d`, `command read d`, `time read d`: may reassign
     return name, values
 
 

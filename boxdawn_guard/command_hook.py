@@ -265,7 +265,8 @@ def decide(payload: dict) -> dict | None:
     block_log.prune(data_dir)
     # The signed server bundle if one is stored and good, else the fixed rules.
     rules, bundle_exp = load_stored(data_dir)
-    known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR", "USERPROFILE") if os.environ.get(k)}
+    known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
+                 if os.environ.get(k)}
     where = {
         "cwd": payload.get("cwd") or os.getcwd(),
         "home": os.path.expanduser("~"),
