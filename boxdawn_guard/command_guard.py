@@ -141,6 +141,9 @@ class Verdict:
     findings: tuple[Finding, ...] = ()
     escalated: bool = False    # an "ask" became "deny" because nobody is present
     grep_ends: tuple[int, ...] = ()  # where a recursive `grep` name ends, in bytes of the line
+    # Beside each reason, on a line of more than one command: which one it is about,
+    # ((line number or None, its text), or None). Local only, like `reasons`.
+    places: tuple[Optional[tuple[Optional[int], str]], ...] = ()
 
 
 # Stable ids (SARIF: rule ids SHALL be stable). Retire an id, never reuse it.
@@ -193,7 +196,9 @@ def evaluate(command: str, *, cwd: str, home: str, rules: CommandRules,
     if escalated:
         decision = "deny"
         judge.reasons.append("nobody is present to approve it")
-    return Verdict(decision, tuple(judge.reasons), tuple(judge.findings), escalated, tuple(sorted(set(judge.grep_ends))))
+    places = (judge.places + [None] * len(judge.reasons))[:len(judge.reasons)]
+    return Verdict(decision, tuple(judge.reasons), tuple(judge.findings), escalated, tuple(sorted(set(judge.grep_ends))),
+                   tuple(places))
 
 
 def evaluate_file_tool(tool: str, paths: list[str], *, cwd: str, home: str, rules: CommandRules,
@@ -358,6 +363,11 @@ class _Judge:
     # Set on a PowerShell line: its parser, which also reads a `.ps1` script that line runs.
     ps_parse: Optional[Callable] = None
     deadline: float = 0.0  # a script's judge stops (`_OutOfTime`) past this
+    # Which command of the line typed here a reason is about (`Verdict.places`): set while
+    # that command is judged, on a line of more than one command; None otherwise.
+    at: Optional[Node] = None
+    point_at_part: bool = False
+    places: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._windows = bool(re.match(r"^([A-Za-z]:|\\\\)", self.cwd))
@@ -385,6 +395,7 @@ class _Judge:
             self.decision = level
         self.reasons.append(reason)
         self.findings.append(Finding(rule, level, target))
+        self.places.append(_place(self.at) if self.point_at_part and self.at is not None else None)
 
     # entry ──────────────────────────────────────────────────────────────
     def run(self, text: str, depth: int) -> None:
@@ -397,6 +408,8 @@ class _Judge:
             # a lone `==` on a line with a here-document is read as written, and may have
             # joined the next line to its command
             self.flag("ask", "parse.unreadable", "the shell syntax could not be read")
+        if depth == 0:
+            self.point_at_part = sum(n.type == "command" for n in _walk(root)) > 1
         outer = (self.env, self.workdirs, self.piped, self.loops_ok)
         self.env = self._collect_env(root)
         self._collect_workdirs(root, depth)
@@ -422,12 +435,18 @@ class _Judge:
             if loop is not None and runs * len(loop[1]) <= _LOOP_RUNS_MOST:
                 self._each_value(node, depth, runs, *loop)
                 continue
-            if node.type == "command":
-                self._command(node, depth)
-            elif node.type == "file_redirect":
-                self._redirect(node)
-            elif node.type == "pipeline":
-                self._pipeline(node)
+            if depth == 0 and node.type in ("command", "file_redirect", "pipeline"):
+                self.at = _statement(node)
+            try:
+                if node.type == "command":
+                    self._command(node, depth)
+                elif node.type == "file_redirect":
+                    self._redirect(node)
+                elif node.type == "pipeline":
+                    self._pipeline(node)
+            finally:
+                if depth == 0:
+                    self.at = None
             stack.extend(reversed(node.children))
 
     def _each_value(self, loop: Node, depth: int, runs: int, name: str, values: list[str]) -> None:
@@ -2268,6 +2287,32 @@ def _straight_line(assignment: Node) -> tuple[bool, Optional[Node]]:
     if parent is None or parent.type != "program":
         return _NOT_STRAIGHT
     return True, scope
+
+
+def _statement(node: Node) -> Node:
+    """The part of the line a person reads as one command: `rm -rf x` of `cd a && rm -rf x`,
+    with its redirect (`echo > f`), and for a redirect the command it belongs to."""
+    while node.parent is not None and (node.type == "file_redirect" or node.parent.type == "redirected_statement"):
+        node = node.parent
+    return node
+
+
+_PLACE_MOST = 80  # characters of the command shown beside a reason
+
+
+def _place(node: Node) -> Optional[tuple[Optional[int], str]]:
+    """(its line number when the text has more than one line, else None; its text on one line),
+    or None when it is the whole line (`curl … | bash`): nothing to point at."""
+    root = node
+    while root.parent is not None:
+        root = root.parent
+    text = " ".join(node.text.decode("utf-8", "replace").split())
+    if text == " ".join(root.text.decode("utf-8", "replace").split()):
+        return None
+    if len(text) > _PLACE_MOST:
+        text = text[:_PLACE_MOST - 1] + "…"
+    many_lines = b"\n" in root.text.strip()
+    return (node.start_point[0] + 1 if many_lines else None), text
 
 
 def _walk(node: Node):

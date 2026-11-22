@@ -151,6 +151,11 @@ GREP_NOTE = "Boxdawn 차단기가 비밀 파일을 빼려고 이 grep 에 --excl
 FAILED = "Boxdawn 차단기가 고장 나서 ({}) 막습니다"
 
 
+# Beside a reason, which command of the line it is about (`Verdict.places`).
+PLACE = "(`{}` 에서)"
+PLACE_LINE = "({}번째 줄 `{}`)"
+
+
 def translate(reason: str) -> str:
     for pattern, korean in _PATTERNS:
         m = pattern.match(reason)
