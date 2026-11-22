@@ -2,8 +2,14 @@
 Claude Code session is blocked by it — on whatever OS this runs on.
 
 Usage: python packaging/runtime_test.py <assembled-plugin-dir>
-Needs `claude` on PATH and ANTHROPIC_API_KEY. Exits non-zero on any
-unexpected result, so CI goes red.
+Needs `claude` on PATH. Exits non-zero on any unexpected result, so CI
+goes red.
+
+A stand-in for the model API (in this process, on a local port) answers
+each session: it calls the tool named in the prompt with the command
+written there, then says DONE. So no key is used and nothing is paid for.
+Claude Code, the plugin install, the hook and the checks on disk are real.
+BDX_RT_REAL_MODEL=1 uses the real model instead (needs ANTHROPIC_API_KEY).
 
 What counts is what happened on disk, not what the model says:
   ok    echo marker > ok.txt                  ran if ok.txt exists
@@ -29,9 +35,12 @@ import os
 import pathlib
 import platform
 import shutil
+import re
 import subprocess
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = "claude-haiku-5-5"
 CASES = {
@@ -53,6 +62,112 @@ DATA = pathlib.Path.home() / ".claude" / "plugins" / "data" / "boxdawn-guard-box
 CLAUDE = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
 PROJECTS = pathlib.Path.home() / ".claude" / "projects"
 TRANSCRIPT_DIRS: set[pathlib.Path] = set()
+SESSION_ENV: dict[str, str] = {}  # the stand-in's address, when it is used
+
+
+# The model stand-in. Each answer is read from the request alone: the prompt names the tool
+# and the command; once a tool result is in the conversation, the answer is DONE.
+def _prompt(body: dict) -> str:
+    for m in body.get("messages") or []:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+        text = " ".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+        if "BDXRT" in text or "run exactly this command" in text:
+            return text
+    return ""
+
+
+def _answered(body: dict) -> bool:
+    return any(isinstance(b, dict) and b.get("type") == "tool_result"
+               for m in body.get("messages") or [] if isinstance(m.get("content"), list) for b in m["content"])
+
+
+def _reply(body: dict) -> list[dict]:
+    names = {t.get("name") for t in body.get("tools") or []}
+    prompt = _prompt(body)
+    call = None
+    m = re.search(r"Use the (\w+) tool to run exactly this command once, unchanged, and nothing else: "
+                  r"(.*?)  Then reply with the single word DONE\.", prompt, re.S)
+    if m:
+        call = (m.group(1), {"command": m.group(2), "description": "t"})
+    elif "grep -rn BDXRTKEY ." in prompt:
+        call = ("Bash", {"command": "grep -rn BDXRTKEY .", "description": "t"})
+    elif "Grep tool once with pattern BDXRTKEY" in prompt:
+        call = ("Grep", {"pattern": "BDXRTKEY", "output_mode": "content"})
+    if call and call[0] in names and not _answered(body):
+        return [{"type": "tool_use", "id": "toolu_bdxrt", "name": call[0], "input": call[1]}]
+    return [{"type": "text", "text": "DONE"}]
+
+
+def _sse(content: list[dict], model: str):
+    stop = "tool_use" if content[0]["type"] == "tool_use" else "end_turn"
+    yield "message_start", {"type": "message_start", "message": {
+        "id": "msg_stand_in", "type": "message", "role": "assistant", "model": model, "content": [],
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}}}
+    for i, block in enumerate(content):
+        if block["type"] == "text":
+            start, delta = {"type": "text", "text": ""}, {"type": "text_delta", "text": block["text"]}
+        else:
+            start = {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+        yield "content_block_start", {"type": "content_block_start", "index": i, "content_block": start}
+        yield "content_block_delta", {"type": "content_block_delta", "index": i, "delta": delta}
+        yield "content_block_stop", {"type": "content_block_stop", "index": i}
+    yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                            "usage": {"output_tokens": 1}}
+    yield "message_stop", {"type": "message_stop"}
+
+
+class _StandIn(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, payload: bytes, ctype: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self._send(b"{}", "application/json")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if "count_tokens" in self.path:
+            return self._send(b'{"input_tokens":1}', "application/json")
+        if "/messages" not in self.path:
+            return self._send(b"{}", "application/json")
+        content, model = _reply(body), body.get("model", "stand-in")
+        if body.get("stream"):
+            text = "".join(f"event: {n}\ndata: {json.dumps(d)}\n\n" for n, d in _sse(content, model))
+            return self._send(text.encode(), "text/event-stream")
+        stop = "tool_use" if content[0]["type"] == "tool_use" else "end_turn"
+        self._send(json.dumps({"id": "msg_stand_in", "type": "message", "role": "assistant", "model": model,
+                               "content": content, "stop_reason": stop, "stop_sequence": None,
+                               "usage": {"input_tokens": 1, "output_tokens": 1}}).encode(), "application/json")
+
+
+def start_stand_in() -> ThreadingHTTPServer:
+    class Quiet(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):  # a connection Claude Code drops is not news
+            pass
+
+    server = Quiet(("127.0.0.1", 0), _StandIn)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    SESSION_ENV.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{server.server_address[1]}",
+                       ANTHROPIC_API_KEY="stand-in-not-a-key", DISABLE_AUTOUPDATER="1", DISABLE_TELEMETRY="1",
+                       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+    return server
 
 
 def sh(args, cwd):
@@ -89,7 +204,7 @@ def session(d: pathlib.Path, mode: str, case: str, tool: str = "Bash") -> dict:
     command = (PS_CASES if tool == "PowerShell" else CASES)[case]
     prompt = (f"Use the {tool} tool to run exactly this command once, unchanged, and nothing else: "
               f"{command}  Then reply with the single word DONE.")
-    env = {**os.environ, "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"} if tool == "PowerShell" else None
+    env = {**os.environ, **SESSION_ENV, **({"CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"} if tool == "PowerShell" else {})}
     p = subprocess.run(
         [CLAUDE, "-p", prompt, "--model", MODEL, "--permission-mode", mode,
          "--allowedTools", tool, "--setting-sources", "project",
@@ -126,7 +241,7 @@ def search_sees(d: pathlib.Path, tool: str) -> tuple[bool, bool]:
         p = subprocess.run(
             [CLAUDE, "-p", prompt + " Then print what it found.", "--model", MODEL, "--permission-mode", "default",
              "--allowedTools", tool, "--setting-sources", "project", "--output-format", "json", "--max-turns", "4"],
-            cwd=d, capture_output=True, text=True, timeout=300)
+            cwd=d, capture_output=True, text=True, timeout=300, env={**os.environ, **SESSION_ENV})
     finally:
         (d / ".env").unlink()
         (d / "plain.txt").unlink()
@@ -158,9 +273,12 @@ def main() -> int:
     sh([CLAUDE, "plugin", "marketplace", "add", str(market), "--scope", "project"], guarded)
     sh([CLAUDE, "plugin", "install", "boxdawn-guard@boxdawn", "--scope", "project"], guarded)
     shutil.rmtree(DATA, ignore_errors=True)
+    server = None if os.environ.get("BDX_RT_REAL_MODEL") == "1" else start_stand_in()
     try:
         return run_plan(market, guarded, control)
     finally:
+        if server is not None:
+            server.shutdown()
         # Leave the machine as it was: removing the marketplace uninstalls
         # its plugin and deletes the plugin's data dir.
         subprocess.run([CLAUDE, "plugin", "marketplace", "remove", "boxdawn"], cwd=guarded,
