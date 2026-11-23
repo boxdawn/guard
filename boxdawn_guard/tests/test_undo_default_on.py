@@ -115,6 +115,28 @@ def test_the_homes_catch_all_folders_are_not_projects(tmp_path, monkeypatch, rel
     assert got is refused
 
 
+def test_a_share_is_not_reached_for(tmp_path, monkeypatch):
+    # An unreachable share took 21 s to resolve; it is never the project, so it is not resolved.
+    monkeypatch.setenv("OneDriveCommercial", r"\\10.255.255.1\share\OneDrive")
+    monkeypatch.setattr(undo, "_windows_known_folders", lambda: ["//10.255.255.1/share/Documents"])
+    real = os.path.realpath
+    seen = []
+    monkeypatch.setattr(undo.os.path, "realpath", lambda p, *a, **k: seen.append(p) or real(p, *a, **k))
+    assert undo._shared_folder(os.path.realpath(str(tmp_path)), [str(tmp_path / "home")]) is False
+    assert not any(p.replace("\\", "/").startswith("//") for p in seen)
+
+
+def test_many_ignored_build_folders_fit_on_the_command_line(project):
+    with open(os.path.join(project, ".gitignore"), "ab") as f:
+        f.write(b"dist/\n")
+    for i in range(1200):
+        os.makedirs(os.path.join(project, f"package-with-a-long-name-{i:04d}", "dist"))
+    _write(project, "package-with-a-long-name-0000/dist/a.js", b"x")
+    row, names = _left_out(project)
+    assert "package-with-a-long-name-0000/dist/a.js" not in names
+    assert any("build output" in f for f in row["folders"])
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows known folders")
 def test_where_windows_keeps_the_desktop_is_not_a_project():
     known = undo._windows_known_folders()

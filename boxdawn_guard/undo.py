@@ -455,7 +455,8 @@ def _windows_known_folders() -> list[str]:
         try:
             if ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(guid)) != 0:
                 continue
-            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), wintypes.DWORD(0), None,
+            # KF_FLAG_DONT_VERIFY: the path only; a folder redirected to a share is not reached for.
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), wintypes.DWORD(0x4000), None,
                                                           ctypes.byref(path)) == 0 and path.value:
                 found.append(path.value)
         except (OSError, AttributeError):
@@ -475,7 +476,9 @@ def _shared_folder(project: str, homes: list[str]) -> bool:
     folders += _windows_known_folders()
     here = os.path.normcase(project).rstrip("\\/")
     for folder in folders:
-        if not folder:
+        # A share is never the project (network projects are refused before this), and
+        # resolving one that cannot be reached takes many seconds on every command.
+        if not folder or folder.replace("\\", "/").startswith("//"):
             continue
         try:
             if os.path.normcase(os.path.realpath(folder)).rstrip("\\/") == here:
@@ -835,15 +838,20 @@ class Store:
             if not ignored:
                 return set()
             # A file git tracks there anyway (`git add -f bin/rails`) is source: the folder stays in.
-            tracked = subprocess.run([*base, "ls-files", "-z", "--", *(f":(icase){f}/" for f in sorted(ignored))],
-                                     capture_output=True, timeout=timeout, env=env)
+            # Every tracked file, not one pathspec per folder: a thousand folders would pass
+            # the Windows command-line limit.
+            tracked = subprocess.run([*base, "ls-files", "-z"], capture_output=True, timeout=timeout, env=env)
             if tracked.returncode != 0:
                 return set()
         except (OSError, subprocess.SubprocessError):
             return set()
         fold = str.casefold
-        holding = {fold(os.fsdecode(p)) for p in tracked.stdout.split(b"\0") if p}
-        return {f for f in ignored if not any(h.startswith(fold(f) + "/") for h in holding)}
+        holding = set()  # every folder above a tracked file
+        for p in tracked.stdout.split(b"\0"):
+            parts = fold(os.fsdecode(p)).split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                holding.add("/".join(parts[:i]))
+        return {f for f in ignored if fold(f) not in holding}
 
     def _pipe_above(self, rel: str, seen: dict[str, bool]) -> bool:
         """A pipe or a device named `.gitattributes` in the project folder or a folder on the
