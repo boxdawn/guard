@@ -278,8 +278,8 @@ def decide(payload: dict) -> dict | None:
     else:
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
             tool_input["command"], known_env=known_env, **where)
-        # Asked with undo off too: copies taken while it was on are still there to go back to.
-        if _UNDO_RESTORE.search(tool_input["command"]) and \
+        # Asked with undo off too while copies taken when it was on are still there to go back to.
+        if _UNDO_RESTORE.search(tool_input["command"]) and _copies_to_go_back_to(payload, data_dir) and \
                 (verdict is None or verdict.decision != "deny"):
             # Going back writes over the project's files: the person says so, the agent does not.
             # What else the line was asked about stays in front of the person, and in the record.
@@ -319,6 +319,16 @@ def decide(payload: dict) -> dict | None:
         "permissionDecision": verdict.decision,
         "permissionDecisionReason": "Boxdawn guard: " + _said(verdict.reasons, verdict.places),
     }}
+
+
+def _copies_to_go_back_to(payload: dict, data_dir: str | None) -> bool:
+    if undo.enabled():
+        return True
+    project = undo.project_of(payload)
+    try:
+        return bool(data_dir and project) and os.path.exists(undo.Store(project, data_dir).log)
+    except (OSError, ValueError):
+        return True  # not known: ask
 
 
 def _said(reasons, places) -> str:

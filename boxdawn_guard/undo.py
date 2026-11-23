@@ -1,6 +1,6 @@
 """Snapshots of the project before each Bash or PowerShell command, and the way back.
 
-Off unless the plugin setting `undo` is on, and only on the systems in
+On unless the plugin setting `undo` is turned off, and only on the systems in
 `SUPPORTED`. A snapshot is a commit in a "shadow" git repository kept in the
 plugin's data folder, outside the project (`--git-dir=<shadow>
 --work-tree=<project>`). Taking one only reads the project: its own `.git`,
@@ -158,8 +158,11 @@ def enabled() -> bool:
 
 
 def chosen() -> bool:
-    """Turned on by the user, not on by default: only then may a snapshot stand in for an ask."""
-    return (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO") or "").lower() in ("true", "1", "yes")
+    """A snapshot may stand in for an ask only when the user turned on a setting of its own,
+    off by default: telling "on by default" from "turned on" by the value of `undo` alone
+    would hang on whether Claude Code ever saves a default the user did not pick."""
+    return enabled() and (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO_INSTEAD_OF_GIT_ASKS") or "").lower() in (
+        "true", "1", "yes")
 
 
 def project_of(payload: dict) -> str | None:
@@ -433,26 +436,52 @@ def _inside(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder.rstrip("\\/") + os.sep)
 
 
-_SHARED = ("desktop", "documents", "downloads")
+_SHARED = ("Desktop", "Documents", "Downloads")
+# Windows Known Folder ids: Desktop, Documents, Downloads. Where Windows keeps them is asked,
+# not guessed from names: OneDrive moves them and gives them the system's language ("바탕 화면").
+_KNOWN_FOLDERS = ("{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+                  "{374DE290-123F-4565-9164-39C4925E467B}")
+
+
+def _windows_known_folders() -> list[str]:
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+    found = []
+    for text in _KNOWN_FOLDERS:
+        guid = (ctypes.c_byte * 16)()
+        path = ctypes.c_wchar_p()
+        try:
+            if ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(guid)) != 0:
+                continue
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), wintypes.DWORD(0), None,
+                                                          ctypes.byref(path)) == 0 and path.value:
+                found.append(path.value)
+        except (OSError, AttributeError):
+            continue
+        finally:
+            if path:
+                ctypes.windll.ole32.CoTaskMemFree(path)
+    return found
 
 
 def _shared_folder(project: str, homes: list[str]) -> bool:
-    """The project is itself Desktop, Documents or Downloads, a OneDrive folder, or one of
-    those three in OneDrive: a session opened there would copy all the person's files.
-    A project folder inside them is a project."""
-    for home in homes:
-        if not home:
+    """The project is itself Desktop, Documents or Downloads (where Windows keeps them, or
+    under the home's own names), or a OneDrive root: a session opened there would copy all
+    the person's files. A project folder inside them is a project."""
+    folders = [os.path.join(h, name) for h in homes if h for name in _SHARED]
+    folders += [os.environ.get(k) or "" for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")]
+    folders += _windows_known_folders()
+    here = os.path.normcase(project).rstrip("\\/")
+    for folder in folders:
+        if not folder:
             continue
         try:
-            rel = os.path.relpath(os.path.normcase(project), os.path.normcase(os.path.realpath(home)))
-        except ValueError:  # another drive
+            if os.path.normcase(os.path.realpath(folder)).rstrip("\\/") == here:
+                return True
+        except (OSError, ValueError):
             continue
-        parts = rel.replace("\\", "/").casefold().split("/")
-        if parts[0] in ("..", ".") or len(parts) > 2:
-            continue
-        onedrive = parts[0].startswith("onedrive")
-        if (len(parts) == 1 and (parts[0] in _SHARED or onedrive)) or (onedrive and parts[1] in _SHARED):
-            return True
     return False
 
 
@@ -784,23 +813,37 @@ class Store:
         return out
 
     def _ignored_by_project(self, folders: list[str], left) -> set[str]:
-        """Which of `folders` the project's own git ignores. No git, no repository, or
-        anything going wrong: none (they go in the snapshot)."""
+        """Which of `folders` the project's own repository (its `.git` in the project folder)
+        ignores and holds no tracked file in. Not the account's global ignore file, not a
+        repository around the project. No git, no such repository, or anything going wrong:
+        none (they go in the snapshot)."""
         git = _git_exe(self.project)
-        if not git:
+        if not git or not os.path.isdir(os.path.join(self.project, ".git")):
             return set()
         remaining = left()  # out of time: raises, as everywhere else in the walk
+        timeout = 2.0 if remaining is None else min(remaining, 2.0)
+        base = [git, "-c", "core.fsmonitor=false", "-c", f"core.excludesFile={os.devnull}", "-C", self.project]
+        env = Store._env()  # no GIT_* from the session, no global or system config
         try:
-            # --no-index: the patterns only, the index is not read; no fsmonitor either.
-            done = subprocess.run([git, "-c", "core.fsmonitor=false", "-C", self.project, "check-ignore",
-                                   "--no-index", "-z", "--stdin"],
+            # --no-index: the patterns only (.gitignore files, .git/info/exclude).
+            done = subprocess.run([*base, "check-ignore", "--no-index", "-z", "--stdin"],
                                   input=b"\0".join(os.fsencode(f + "/") for f in folders),
-                                  capture_output=True, timeout=2.0 if remaining is None else min(remaining, 2.0))
+                                  capture_output=True, timeout=timeout, env=env)
+            if done.returncode not in (0, 1):  # 1: none ignored
+                return set()
+            ignored = {os.fsdecode(p).rstrip("/") for p in done.stdout.split(b"\0") if p}
+            if not ignored:
+                return set()
+            # A file git tracks there anyway (`git add -f bin/rails`) is source: the folder stays in.
+            tracked = subprocess.run([*base, "ls-files", "-z", "--", *(f":(icase){f}/" for f in sorted(ignored))],
+                                     capture_output=True, timeout=timeout, env=env)
+            if tracked.returncode != 0:
+                return set()
         except (OSError, subprocess.SubprocessError):
             return set()
-        if done.returncode not in (0, 1):  # 1: none ignored; 128: not a repository
-            return set()
-        return {os.fsdecode(p).rstrip("/") for p in done.stdout.split(b"\0") if p}
+        fold = str.casefold
+        holding = {fold(os.fsdecode(p)) for p in tracked.stdout.split(b"\0") if p}
+        return {f for f in ignored if not any(h.startswith(fold(f) + "/") for h in holding)}
 
     def _pipe_above(self, rel: str, seen: dict[str, bool]) -> bool:
         """A pipe or a device named `.gitattributes` in the project folder or a folder on the
@@ -1096,21 +1139,31 @@ def clean_stale(data_dir: str, now: float | None = None) -> int:
     except OSError:
         return 0
     removed = 0
-    for name in names:
-        key, ext = os.path.splitext(name)
-        if ext != ".jsonl" or not re.fullmatch(r"[0-9a-f]{16}", key):
-            continue
+    keys = {os.path.splitext(n)[0] for n in names if re.fullmatch(r"[0-9a-f]{16}\.(jsonl|git)", n)}
+    for key in sorted(keys):
         store = Store.__new__(Store)  # the project's path is not kept: the key is enough here
         store.project, store.root, store._held, store._special, store.record_by = "", root, None, [], None
         store.shadow, store.log, store.lock = (os.path.join(root, key + e) for e in (".git", ".jsonl", ".lock"))
+
+        def last_used() -> float:  # the record; a store left without one (cut short): its folder
+            return os.path.getmtime(store.log if os.path.lexists(store.log) else store.shadow)
+
         try:
-            if now - os.path.getmtime(store.log) <= FORGET_SECONDS or not store.acquire():
+            if now - last_used() <= FORGET_SECONDS or not store.acquire():
                 continue
             try:
-                if now - os.path.getmtime(store.log) > FORGET_SECONDS:  # no row came while it waited
-                    if os.path.isdir(store.shadow):
+                if now - last_used() > FORGET_SECONDS:  # no row came while it waited
+                    # The record first: one that cannot go (Windows: someone has it open) leaves the
+                    # copies too, never a record that lists copies no longer there.
+                    if os.path.lexists(store.log):
+                        os.remove(store.log)
+                    if os.path.isdir(store.shadow) and not _is_link(store.shadow):
                         shutil.rmtree(store.shadow, onerror=_writable_and_again)  # git's objects are read-only
-                    os.remove(store.log)
+                    elif os.path.lexists(store.shadow):  # a link (or junction) of no making of ours: it alone goes
+                        try:
+                            os.unlink(store.shadow)
+                        except OSError:
+                            os.rmdir(store.shadow)  # Windows: a junction to a folder
                     removed += 1
             finally:
                 store.release()

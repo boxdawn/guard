@@ -17,6 +17,11 @@ from boxdawn_guard.tests.test_undo import _git, _payload, _write, project  # noq
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
+@pytest.fixture(autouse=True)
+def _its_own_setting_on(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO_INSTEAD_OF_GIT_ASKS", "true")
+
+
 COVERED = ["git reset --hard", "git reset --hard HEAD", "git checkout -- .", "git restore .", "git checkout .",
            "git stash", "git stash push -u", "git stash pop"]
 
