@@ -295,8 +295,7 @@ def decide(payload: dict) -> dict | None:
             return {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny" if where["unattended"] else "ask",
-                "permissionDecisionReason": "Boxdawn guard: " + "; ".join(
-                    map(messages_ko.translate, reasons) if _korean() else reasons),
+                "permissionDecisionReason": "Boxdawn guard: " + _said(reasons, verdict.places if asked else ()),
                 **{k: v for k, v in kept_out.items() if k in ("updatedInput", "additionalContext")},
             }}
     if verdict is None or verdict.decision is None:
@@ -317,9 +316,25 @@ def decide(payload: dict) -> dict | None:
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": verdict.decision,
-        "permissionDecisionReason": "Boxdawn guard: " + "; ".join(
-            map(messages_ko.translate, verdict.reasons) if _korean() else verdict.reasons),
+        "permissionDecisionReason": "Boxdawn guard: " + _said(verdict.reasons, verdict.places),
     }}
+
+
+def _said(reasons, places) -> str:
+    """The reasons as the person reads them, each with the command of the line it is about
+    when the line has more than one (`Verdict.places`)."""
+    korean = _korean()
+    out = []
+    for reason, place in zip(reasons, [*places, *[None] * len(reasons)]):
+        text = messages_ko.translate(reason) if korean else reason
+        if place is not None:
+            line, part = place[0], place[1].replace("`", "'")
+            if korean:
+                text += " " + (messages_ko.PLACE_LINE.format(line, part) if line else messages_ko.PLACE.format(part))
+            else:
+                text += f" (line {line}: `{part}`)" if line else f" (in `{part}`)"
+        out.append(text)
+    return "; ".join(out)
 
 
 # What only rewrites the files of the project's own repository, which a snapshot holds:
