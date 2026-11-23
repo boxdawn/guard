@@ -38,11 +38,12 @@ def test_a_deny_on_the_same_line_stays_a_deny(project):
     assert decision == "deny"
 
 
-def test_list_and_other_lines_are_left_alone_and_undo_off_changes_nothing(project, monkeypatch):
+def test_list_and_other_lines_are_left_alone_and_undo_off_still_asks(project, monkeypatch):
     for command in (f'"{_exe()}" undo list "{project}"', "echo undo restore", "git restore ."):
         assert "snapshot" not in _decision(_payload(project, command))[1], command
+    # 11-23: with undo turned off, copies taken while it was on are still there to go back to.
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "false")
-    assert _decision(_payload(project, f'"{_exe()}" undo restore 2'))[0] is None
+    assert _decision(_payload(project, f'"{_exe()}" undo restore 2'))[0] == "ask"
 
 
 def test_the_guards_own_undo_line_takes_no_snapshot(project):

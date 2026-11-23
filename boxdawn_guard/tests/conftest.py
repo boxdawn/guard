@@ -17,6 +17,10 @@ def _no_settings_of_this_machine(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(place / "project"))
     monkeypatch.setattr(command_hook, "_MANAGED_SETTINGS", str(place / "managed-settings.json"))
     monkeypatch.setattr(command_hook, "_system_is_korean", lambda: False)  # not this machine's language either
+    # Unset, as Claude Code leaves it for a user who never chose; recorded so that a test that
+    # sets it some other way (the Copilot hook writes it) cannot pass it on to the next test.
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "")
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_UNDO")
 
 
 @pytest.fixture(autouse=True)

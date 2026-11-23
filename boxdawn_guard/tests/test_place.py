@@ -45,6 +45,7 @@ def _place(root, data):
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_OPTION_API_KEY"}
     env["CLAUDE_PLUGIN_ROOT"] = str(root)
     env["CLAUDE_PLUGIN_DATA"] = str(data)
+    env["CLAUDE_PLUGIN_OPTION_UNDO"] = "false"  # on by default; the stand-in binary cannot take a snapshot
     if WINDOWS:
         cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
                str(root / "scripts" / "place.ps1")]

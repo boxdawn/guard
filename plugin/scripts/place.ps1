@@ -43,6 +43,10 @@ if ($args[0] -ne 'copilot' -and $env:CLAUDE_PLUGIN_OPTION_UNDO -notin @('false',
     $env:CLAUDE_PROJECT_DIR.TrimEnd('\').Length -gt 2) {
     Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList @('undo-start', "`"$($env:CLAUDE_PROJECT_DIR.TrimEnd('\'))`"") -WindowStyle Hidden
 }
+# Copies of projects not used for 30 days go, with undo on or off.
+if ($args[0] -ne 'copilot' -and (Test-Path (Join-Path $env:CLAUDE_PLUGIN_DATA 'undo'))) {
+    Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList 'undo-clean' -WindowStyle Hidden
+}
 if ($env:CLAUDE_PLUGIN_OPTION_API_KEY) {
     Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList 'fetch-rules' -WindowStyle Hidden
 }

@@ -278,7 +278,8 @@ def decide(payload: dict) -> dict | None:
     else:
         verdict = (evaluate if tool == "Bash" else evaluate_powershell)(
             tool_input["command"], known_env=known_env, **where)
-        if undo.enabled() and _UNDO_RESTORE.search(tool_input["command"]) and \
+        # Asked with undo off too: copies taken while it was on are still there to go back to.
+        if _UNDO_RESTORE.search(tool_input["command"]) and \
                 (verdict is None or verdict.decision != "deny"):
             # Going back writes over the project's files: the person says so, the agent does not.
             # What else the line was asked about stays in front of the person, and in the record.
@@ -349,10 +350,11 @@ _GIT_PLACES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "
 
 
 def _undo_can_take(payload: dict, tool: str, verdict) -> bool:
-    """An ask that a snapshot can answer: undo on, every finding one of `_UNDO_COVERS`
+    """An ask that a snapshot can answer: undo turned on by the user (on by default is
+    not enough: the ask, and the deny with nobody there, stay), every finding one of `_UNDO_COVERS`
     on the project's root (the guard marks only git run in the line's own folder),
     that folder the project, its own repository there, and no git variable in play."""
-    if not undo.enabled() or tool not in ("Bash", "PowerShell") or not verdict.findings:
+    if not undo.chosen() or tool not in ("Bash", "PowerShell") or not verdict.findings:
         return False
     if verdict.decision != "ask" and not verdict.escalated:
         return False

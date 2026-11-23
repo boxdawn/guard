@@ -18,7 +18,7 @@ if sys.argv[1:2] == ["fetch-rules"]:
         print(f"boxdawn guard block record: {sent}", file=sys.stderr)
     sys.exit(0)
 
-if sys.argv[1:2] in (["undo"], ["undo-start"]):
+if sys.argv[1:2] in (["undo"], ["undo-start"], ["undo-clean"]):
     from boxdawn_guard.undo import _cli
     sys.exit(_cli(sys.argv[1:]))
 

@@ -52,11 +52,11 @@ In Claude Code, before each Bash or PowerShell command, the guard saves a copy o
 Claude lists the copies, one before each command, and puts back the one you pick after you approve it. Putting a copy back saves the current state first, so it can be undone too.
 
 - **On unless you turn it off**: `undo` in `/plugin`. Nothing is sent anywhere.
-- **What it costs.** Each command waits for its copy: under a second in the projects we measured (0.3 s in a 57 MB copy, 0.75 s in a 632 MB one), never more than about 4 seconds. Copies take disk space in the plugin's data folder; at each session start, ones older than 7 days are dropped, and the oldest while a project's take more than 2 GB.
-- **Only the project folder.** Not saved: the project's `.git` folder (commits, branches, stashes), `node_modules` and similar folders, repositories inside the project, files over 50 MB, databases, cloud resources and anything outside the folder.
+- **What it costs.** Each command waits for its copy: under a second in the projects we measured (0.3 s in a 57 MB copy, 0.75 s in a 632 MB one), never more than about 4 seconds. A project with tens of thousands of folders takes about 3.5 seconds on every command and its copies are often not ready in time. Copies take disk space in the plugin's data folder: when a session opens a project, its copies older than 7 days are dropped, and its oldest while they take more than 2 GB; at every session start, all copies of a project with no new copy for 30 days are removed, with snapshots on or off.
+- **Only the project folder.** Not saved: the project's `.git` folder (commits, branches, stashes), `node_modules` and similar folders, build output your git ignores (`target`, `build`, `dist`, `out`, `bin`, `obj`), repositories inside the project, files over 50 MB, databases, cloud resources and anything outside the folder. A session opened in your home folder, a drive, or Desktop, Documents, Downloads or OneDrive itself takes no copies; a project folder inside them does.
 - **A large project starts unprotected.** The first copy is taken when a session starts (82 seconds for the 632 MB project above); a command that runs before it is ready has no copy, and the list says so.
 - **For an agent's mistakes, not an agent working against you.** The agent can read the copies, `.env` included, and a command that reaches the plugin's data folder can spoil them.
-- With copies on, a `git reset --hard`, `git checkout -- .`, `git restore .` or `git stash` that only rewrites the project's own files goes on without asking, because the copy taken before it can bring the files back.
+- **The guard's decisions stay the same.** Only if you turn `undo` on yourself in `/plugin` does a `git reset --hard`, `git checkout -- .`, `git restore .` or `git stash` that only rewrites the project's own files go on without asking, because the copy taken before it can bring the files back.
 
 The setting's description in `/plugin` lists every limit.
 

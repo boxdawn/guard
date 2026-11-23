@@ -53,6 +53,10 @@ case "${1:-}:${CLAUDE_PLUGIN_OPTION_UNDO:-}" in copilot:*|*:[Ff][Aa][Ll][Ss][Ee]
     nohup "$dst/bdxguard.exe" undo-start "$CLAUDE_PROJECT_DIR" </dev/null >/dev/null 2>&1 &
   fi ;;
 esac
+# Copies of projects not used for 30 days go, with undo on or off.
+if [ "${1:-}" != copilot ] && [ -d "$CLAUDE_PLUGIN_DATA/undo" ]; then
+  nohup "$dst/bdxguard.exe" undo-clean </dev/null >/dev/null 2>&1 &
+fi
 if [ -n "${CLAUDE_PLUGIN_OPTION_API_KEY:-}" ]; then
   nohup "$dst/bdxguard.exe" fetch-rules </dev/null >/dev/null 2>&1 &
 fi
