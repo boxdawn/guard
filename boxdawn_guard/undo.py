@@ -146,7 +146,9 @@ _GIT_READS = frozenset({".gitattributes", ".gitignore", ".gitmodules"})  # opene
 
 
 def enabled() -> bool:
-    return (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO") or "").lower() in ("true", "1", "yes")
+    """On unless the user turned it off. Claude Code gives a hook no variable for an
+    option the user never set (2.1.318, measured 11-23), so a missing one is the default."""
+    return (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO") or "").lower() not in ("false", "0", "no")
 
 
 def project_of(payload: dict) -> str | None:

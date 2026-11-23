@@ -4,8 +4,8 @@
     "sessionStart": [
       {
         "type": "command",
-        "bash": "sh \"$CLAUDE_PLUGIN_ROOT/scripts/place.sh\"",
-        "powershell": "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\scripts\\place.ps1\"",
+        "bash": "sh \"$CLAUDE_PLUGIN_ROOT/scripts/place.sh\" copilot",
+        "powershell": "& powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$env:CLAUDE_PLUGIN_ROOT\\scripts\\place.ps1\" copilot",
         "timeoutSec": 60
       }
     ],

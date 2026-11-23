@@ -46,8 +46,9 @@ fi
 # With an API key in the plugin's settings, fetch the signed rules in the
 # background (the session does not wait). Without one this does nothing and
 # opens no connection.
-# With `undo` on, the first snapshot of the project, also in the background.
-case "${CLAUDE_PLUGIN_OPTION_UNDO:-}" in true|1|yes)
+# With `undo` on (unless turned off), the first snapshot of the project, also in
+# the background. Not in Copilot (`place.sh copilot`), which has no undo.
+case "${1:-}:${CLAUDE_PLUGIN_OPTION_UNDO:-}" in copilot:*|*:[Ff][Aa][Ll][Ss][Ee]|*:0|*:[Nn][Oo]) ;; *)
   if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
     nohup "$dst/bdxguard.exe" undo-start "$CLAUDE_PROJECT_DIR" </dev/null >/dev/null 2>&1 &
   fi ;;

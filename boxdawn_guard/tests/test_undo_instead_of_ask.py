@@ -87,6 +87,15 @@ def test_undo_off_changes_nothing(project, monkeypatch):
     assert _snapshots(project) == []
 
 
+def test_copilot_has_no_undo_even_by_default(project, monkeypatch):
+    # Copilot has no way to list, restore or turn snapshots off: its ask stays an ask.
+    from boxdawn_guard import copilot_hook
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_UNDO", raising=False)
+    out = copilot_hook.decide({"toolName": "bash", "toolArgs": {"command": "git reset --hard"}, "cwd": project})
+    assert out["permissionDecision"] == "ask"
+    assert _snapshots(project) == []
+
+
 def test_a_git_variable_in_the_environment_keeps_the_ask(project, monkeypatch):
     monkeypatch.setenv("GIT_WORK_TREE", "/elsewhere")
     assert _decision(_payload(project, "git reset --hard")) == "ask"
