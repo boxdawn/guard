@@ -50,6 +50,21 @@ jobs:
           exe=dist/bdxguard/bdxguard
           [ -f "$exe.exe" ] && exe="$exe.exe"
           python packaging/check_binary.py "$exe" 21
+      # The built binary records a deny on this machine, keeps the command out
+      # of the record, and `log` prints it by reason.
+      - name: binary keeps and shows the judgment record
+        shell: bash
+        run: |
+          exe=dist/bdxguard/bdxguard
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          d=$(mktemp -d)
+          echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf /bdx-ci-marker"},"cwd":"/work/proj"}' \
+            | CLAUDE_PLUGIN_DATA="$d" "$exe" | grep -q '"deny"'
+          # Not `! grep`: `set -e` does not stop on a negated command.
+          if grep -rq bdx-ci-marker "$d/judged"; then exit 1; fi
+          out=$(CLAUDE_PLUGIN_DATA="$d" "$exe" log)
+          echo "$out"
+          case "$out" in *"1 deny and ask decisions"*"rm.outside"*) ;; *) exit 1 ;; esac
       # `undo` in a real Claude Code session with the built binary: a script the
       # agent runs damages a project, and a person's `undo restore` puts every
       # file back. The model API is a stand-in inside the test, so no key is

@@ -176,3 +176,14 @@ def test_writers_during_a_send_lose_no_line(server, tmp_path, monkeypatch):  # n
         if (tmp_path / block_log.LOG_DIR).is_dir() else 0
     assert sent + left == writers * each, (sent, left, results[-3:])
     assert len({b["batch"] for b in _sent(server)}) == len(_sent(server))
+
+
+@pytest.mark.parametrize("status", [200, 401])
+def test_the_record_kept_on_this_machine_is_never_sent_nor_removed(server, tmp_path, status):  # noqa: F811
+    from boxdawn_guard import judgment_log
+    assert judgment_log.record(str(tmp_path), DENY, tool="Bash")
+    _record(tmp_path)
+    server.status = status
+    _send(server, tmp_path)
+    assert all(len(body["lines"]) == 1 for body in _sent(server))
+    assert len(judgment_log.read(str(tmp_path))) == 1

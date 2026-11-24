@@ -66,7 +66,9 @@ def _open_append(path: Path) -> int:
     lines (2026-11-01). A handle with append access only is appended to by
     the system itself."""
     if os.name != "nt":
-        return os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        # O_NONBLOCK: a FIFO put where the day's file goes fails at once instead of
+        # holding the hook until it times out. A regular file does not notice it.
+        return os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK, 0o600)
     import ctypes
     import msvcrt
     from ctypes import wintypes

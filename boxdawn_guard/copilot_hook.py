@@ -41,6 +41,8 @@ def decide(payload: dict) -> dict | None:
     # Copilot has no undo (no way to list, restore or turn it off), so no snapshot
     # stands in for an ask here.
     os.environ["CLAUDE_PLUGIN_OPTION_UNDO"] = "false"
+    # Nor a way to see the judgment record or turn it off, so none is kept.
+    os.environ["CLAUDE_PLUGIN_OPTION_JUDGMENT_LOG"] = "false"
     # Here, not at the top: the deadline in `main` has to cover loading the rules code.
     from boxdawn_guard import command_hook
     out = command_hook.decide({"tool_name": _SHELLS[tool], "tool_input": args, "cwd": payload.get("cwd")})

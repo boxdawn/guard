@@ -19,7 +19,8 @@ def _no_settings_of_this_machine(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(command_hook, "_system_is_korean", lambda: False)  # not this machine's language either
     # Unset, as Claude Code leaves it for a user who never chose; recorded so that a test that
     # sets it some other way (the Copilot hook writes it) cannot pass it on to the next test.
-    for name in ("CLAUDE_PLUGIN_OPTION_UNDO", "CLAUDE_PLUGIN_OPTION_UNDO_INSTEAD_OF_GIT_ASKS"):
+    for name in ("CLAUDE_PLUGIN_OPTION_UNDO", "CLAUDE_PLUGIN_OPTION_UNDO_INSTEAD_OF_GIT_ASKS",
+                 "CLAUDE_PLUGIN_OPTION_JUDGMENT_LOG"):
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
 

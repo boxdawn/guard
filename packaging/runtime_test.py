@@ -324,6 +324,22 @@ def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path)
     failures += not no_record
     print(f"{'PASS' if no_record else 'FAIL'}  no block record without a key")
     total = len(plan) + 1
+    # The record kept on this machine has the denies above, and only closed-set values. Not
+    # for the directory edition: it runs the build it pins, which may come before the record.
+    if ids:
+        text = "".join(p.read_text(encoding="ascii") for p in sorted((DATA / "judged").glob("*.jsonl"))) \
+            if (DATA / "judged").is_dir() else ""
+        local = [json.loads(raw) for raw in text.splitlines()]
+        keys = {"v", "t", "tool", "decision", "escalated", "findings", "build"}
+        local_ok = bool(local) and all(
+            set(line) == keys and line["decision"] in ("deny", "ask") and line["findings"]
+            and all(set(f) == {"rule", "level", "target"} for f in line["findings"]) for line in local)
+        # No word of the commands above (rule names like git.reset_hard are expected).
+        no_command = not any(word in text for word in ("boxdawn_guard_probe", "--hard", "HEAD", "HOME", "dev/zero"))
+        total += 1
+        failures += not (local_ok and no_command)
+        print(f"{'PASS' if local_ok and no_command else 'FAIL'}  local judgment record: {len(local)} lines, "
+              f"no command in it: {no_command}")
     # The directory edition is frozen under review and keeps nothing out of a search.
     for tool in () if "--no-search" in sys.argv else ("Bash", "Grep"):
         for label, d, want in (("plugin", guarded, (True, False)), ("control", control, (True, True))):
