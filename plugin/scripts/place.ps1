@@ -36,11 +36,16 @@ if (-not $keep -and -not ((Test-Path $dstId) -and ((Get-Content -Raw $srcId) -eq
 # With an API key in the plugin's settings, fetch the signed rules in the
 # background (the session does not wait). Without one this does nothing and
 # opens no connection.
-# With `undo` on, the first snapshot of the project, also in the background.
+# With `undo` on (unless turned off), the first snapshot of the project, also in
+# the background. Not in Copilot (`place.ps1 copilot`), which has no undo.
 # A drive root is never a project, and without its `\` it would name another folder.
-if ($env:CLAUDE_PLUGIN_OPTION_UNDO -in @('true', '1', 'yes') -and $env:CLAUDE_PROJECT_DIR -and
+if ($args[0] -ne 'copilot' -and $env:CLAUDE_PLUGIN_OPTION_UNDO -notin @('false', '0', 'no') -and $env:CLAUDE_PROJECT_DIR -and
     $env:CLAUDE_PROJECT_DIR.TrimEnd('\').Length -gt 2) {
     Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList @('undo-start', "`"$($env:CLAUDE_PROJECT_DIR.TrimEnd('\'))`"") -WindowStyle Hidden
+}
+# Copies of projects not used for 30 days go, with undo on or off.
+if ($args[0] -ne 'copilot' -and (Test-Path (Join-Path $env:CLAUDE_PLUGIN_DATA 'undo'))) {
+    Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList 'undo-clean' -WindowStyle Hidden
 }
 if ($env:CLAUDE_PLUGIN_OPTION_API_KEY) {
     Start-Process -FilePath (Join-Path $dst 'bdxguard.exe') -ArgumentList 'fetch-rules' -WindowStyle Hidden

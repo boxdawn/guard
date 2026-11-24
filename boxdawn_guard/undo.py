@@ -1,13 +1,14 @@
 """Snapshots of the project before each Bash or PowerShell command, and the way back.
 
-Off unless the plugin setting `undo` is on, and only on the systems in
+On unless the plugin setting `undo` is turned off, and only on the systems in
 `SUPPORTED`. A snapshot is a commit in a "shadow" git repository kept in the
 plugin's data folder, outside the project (`--git-dir=<shadow>
 --work-tree=<project>`). Taking one only reads the project: its own `.git`,
 index and files are not written. Needs git 2.25 or later.
 
 In a snapshot: every file under the project folder, ignored ones too.
-Not in it, and named in the record: folders in `HEAVY`, nested repositories,
+Not in it, and named in the record: folders in `HEAVY`, folders in `BUILD` that
+the project's own git ignores, nested repositories,
 a folder that cannot be listed, on Windows a folder that is a link or
 junction, a file over `MAX_FILE_BYTES`, a file that could not be saved (one
 another program holds open, or a name git does not take, such as `nul` or
@@ -123,6 +124,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -131,6 +133,10 @@ import time
 
 HEAVY = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".next", ".tox", ".mypy_cache",
                    ".pytest_cache", ".ruff_cache", ".cache", ".gradle", ".turbo"})
+# Build output, left out only where the project's own git ignores it: a build rewrites these
+# while a late snapshot is still reading them, and on Windows those writes fail (measured
+# 11-23: 26 of 15,274 rewrites of 300 1 MB files). Elsewhere a folder of these names may be source.
+BUILD = frozenset({"target", "build", "dist", "out", "bin", "obj"})
 MAX_FILE_BYTES = 50 * 1024 * 1024
 KEEP_SECONDS = 7 * 24 * 3600
 MAX_STORE_BYTES = 2 * 1024 ** 3
@@ -146,7 +152,17 @@ _GIT_READS = frozenset({".gitattributes", ".gitignore", ".gitmodules"})  # opene
 
 
 def enabled() -> bool:
-    return (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO") or "").lower() in ("true", "1", "yes")
+    """On unless the user turned it off. Claude Code gives a hook no variable for an
+    option the user never set (2.1.318, measured 11-23), so a missing one is the default."""
+    return (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO") or "").lower() not in ("false", "0", "no")
+
+
+def chosen() -> bool:
+    """A snapshot may stand in for an ask only when the user turned on a setting of its own,
+    off by default: telling "on by default" from "turned on" by the value of `undo` alone
+    would hang on whether Claude Code ever saves a default the user did not pick."""
+    return enabled() and (os.environ.get("CLAUDE_PLUGIN_OPTION_UNDO_INSTEAD_OF_GIT_ASKS") or "").lower() in (
+        "true", "1", "yes")
 
 
 def project_of(payload: dict) -> str | None:
@@ -420,6 +436,58 @@ def _inside(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder.rstrip("\\/") + os.sep)
 
 
+_SHARED = ("Desktop", "Documents", "Downloads")
+# Windows Known Folder ids: Desktop, Documents, Downloads. Where Windows keeps them is asked,
+# not guessed from names: OneDrive moves them and gives them the system's language ("바탕 화면").
+_KNOWN_FOLDERS = ("{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+                  "{374DE290-123F-4565-9164-39C4925E467B}")
+
+
+def _windows_known_folders() -> list[str]:
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+    found = []
+    for text in _KNOWN_FOLDERS:
+        guid = (ctypes.c_byte * 16)()
+        path = ctypes.c_wchar_p()
+        try:
+            if ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(guid)) != 0:
+                continue
+            # KF_FLAG_DONT_VERIFY: the path only; a folder redirected to a share is not reached for.
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), wintypes.DWORD(0x4000), None,
+                                                          ctypes.byref(path)) == 0 and path.value:
+                found.append(path.value)
+        except (OSError, AttributeError):
+            continue
+        finally:
+            if path:
+                ctypes.windll.ole32.CoTaskMemFree(path)
+    return found
+
+
+def _shared_folder(project: str, homes: list[str]) -> bool:
+    """The project is itself Desktop, Documents or Downloads (where Windows keeps them, or
+    under the home's own names), or a OneDrive root: a session opened there would copy all
+    the person's files. A project folder inside them is a project."""
+    folders = [os.path.join(h, name) for h in homes if h for name in _SHARED]
+    folders += [os.environ.get(k) or "" for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")]
+    folders += _windows_known_folders()
+    here = os.path.normcase(project).rstrip("\\/")
+    for folder in folders:
+        # A share is never the project (network projects are refused before this), and
+        # resolving one that cannot be reached takes many seconds on every command.
+        if not folder or folder.replace("\\", "/").startswith("//"):
+            continue
+        try:
+            if os.path.normcase(os.path.realpath(folder)).rstrip("\\/") == here:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def _refused(project: str, data_dir: str) -> str | None:
     """A project that is the home folder, above it, a drive, on the network, or
     around the store would put far more than a project in the snapshot."""
@@ -437,6 +505,8 @@ def _refused(project: str, data_dir: str) -> str | None:
         pass
     if any(home and _inside(os.path.realpath(home), project) for home in homes):
         return "the home folder or above it"
+    if _shared_folder(project, homes):
+        return "a folder of the home that holds everything else (Desktop, Documents, Downloads, OneDrive)"
     if _inside(os.path.realpath(data_dir), project):
         return "around the snapshot store"
     return None
@@ -685,8 +755,17 @@ class Store:
         """Folders the snapshot does not go into, found without following a link."""
         out: dict[str, str] = {}
         self._special = []
-        stack = [""]
-        while stack:
+        stack, build = [""], []
+        while stack or build:
+            if not stack:
+                ignored = self._ignored_by_project(build, left)
+                for child in build:
+                    if child in ignored:
+                        out[child] = "build output"
+                    else:
+                        stack.append(child)
+                build = []
+                continue
             left()
             rel = stack.pop()
             try:
@@ -730,9 +809,49 @@ class Store:
                     out[child] = "heavy"
                 elif os.path.lexists(os.path.join(entry.path, ".git")):
                     out[child] = "repository"
+                elif entry.name.casefold() in BUILD:
+                    build.append(child)  # asked about all at once, then walked into if not ignored
                 else:
                     stack.append(child)
         return out
+
+    def _ignored_by_project(self, folders: list[str], left) -> set[str]:
+        """Which of `folders` the project's own repository (its `.git` in the project folder)
+        ignores and holds no tracked file in. Not the account's global ignore file, not a
+        repository around the project. No git, no such repository, or anything going wrong:
+        none (they go in the snapshot)."""
+        git = _git_exe(self.project)
+        if not git or not os.path.isdir(os.path.join(self.project, ".git")):
+            return set()
+        remaining = left()  # out of time: raises, as everywhere else in the walk
+        timeout = 2.0 if remaining is None else min(remaining, 2.0)
+        base = [git, "-c", "core.fsmonitor=false", "-c", f"core.excludesFile={os.devnull}", "-C", self.project]
+        env = Store._env()  # no GIT_* from the session, no global or system config
+        try:
+            # --no-index: the patterns only (.gitignore files, .git/info/exclude).
+            done = subprocess.run([*base, "check-ignore", "--no-index", "-z", "--stdin"],
+                                  input=b"\0".join(os.fsencode(f + "/") for f in folders),
+                                  capture_output=True, timeout=timeout, env=env)
+            if done.returncode not in (0, 1):  # 1: none ignored
+                return set()
+            ignored = {os.fsdecode(p).rstrip("/") for p in done.stdout.split(b"\0") if p}
+            if not ignored:
+                return set()
+            # A file git tracks there anyway (`git add -f bin/rails`) is source: the folder stays in.
+            # Every tracked file, not one pathspec per folder: a thousand folders would pass
+            # the Windows command-line limit.
+            tracked = subprocess.run([*base, "ls-files", "-z"], capture_output=True, timeout=timeout, env=env)
+            if tracked.returncode != 0:
+                return set()
+        except (OSError, subprocess.SubprocessError):
+            return set()
+        fold = str.casefold
+        holding = set()  # every folder above a tracked file
+        for p in tracked.stdout.split(b"\0"):
+            parts = fold(os.fsdecode(p)).split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                holding.add("/".join(parts[:i]))
+        return {f for f in ignored if fold(f) not in holding}
 
     def _pipe_above(self, rel: str, seen: dict[str, bool]) -> bool:
         """A pipe or a device named `.gitattributes` in the project folder or a folder on the
@@ -1013,6 +1132,59 @@ class Store:
         return dropped
 
 
+FORGET_SECONDS = 30 * 24 * 3600  # a project with no new row for this long loses all its copies
+
+
+def clean_stale(data_dir: str, now: float | None = None) -> int:
+    """Removes the whole store of each project whose record has not changed for
+    `FORGET_SECONDS`: `prune` runs only for the project a session opens, so without this
+    a project never opened again, or every project once undo is off, would keep its
+    copies for ever. A store someone holds the lock of is left alone."""
+    now = time.time() if now is None else now
+    root = os.path.join(os.path.realpath(data_dir), "undo")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    removed = 0
+    keys = {os.path.splitext(n)[0] for n in names if re.fullmatch(r"[0-9a-f]{16}\.(jsonl|git)", n)}
+    for key in sorted(keys):
+        store = Store.__new__(Store)  # the project's path is not kept: the key is enough here
+        store.project, store.root, store._held, store._special, store.record_by = "", root, None, [], None
+        store.shadow, store.log, store.lock = (os.path.join(root, key + e) for e in (".git", ".jsonl", ".lock"))
+
+        def last_used() -> float:  # the record; a store left without one (cut short): its folder
+            return os.path.getmtime(store.log if os.path.lexists(store.log) else store.shadow)
+
+        try:
+            if now - last_used() <= FORGET_SECONDS or not store.acquire():
+                continue
+            try:
+                if now - last_used() > FORGET_SECONDS:  # no row came while it waited
+                    # The record first: one that cannot go (Windows: someone has it open) leaves the
+                    # copies too, never a record that lists copies no longer there.
+                    if os.path.lexists(store.log):
+                        os.remove(store.log)
+                    if os.path.isdir(store.shadow) and not _is_link(store.shadow):
+                        shutil.rmtree(store.shadow, onerror=_writable_and_again)  # git's objects are read-only
+                    elif os.path.lexists(store.shadow):  # a link (or junction) of no making of ours: it alone goes
+                        try:
+                            os.unlink(store.shadow)
+                        except OSError:
+                            os.rmdir(store.shadow)  # Windows: a junction to a folder
+                    removed += 1
+            finally:
+                store.release()
+        except OSError:
+            continue  # tried again next session
+    return removed
+
+
+def _writable_and_again(func, path, _exc) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def _own_command(*args: str) -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, *args]
@@ -1144,6 +1316,10 @@ def _cli(argv: list[str]) -> int:
     if not data_dir:
         print("boxdawn guard undo: CLAUDE_PLUGIN_DATA is not set", file=sys.stderr)
         return 1
+    if argv == ["undo-clean"]:  # every session start, undo on or off
+        print(f"boxdawn guard undo: {clean_stale(data_dir)} projects not used for "
+              f"{FORGET_SECONDS // 86400} days removed", file=sys.stderr)
+        return 0
     if argv[:1] == ["undo-start"] and (len(argv) == 2 or (argv[2:3] == ["late"] and len(argv) in (3, 4))):
         late_for = argv[3] if len(argv) == 4 else "" if len(argv) == 3 else None
         note = ("session start" if late_for is None else

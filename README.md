@@ -17,7 +17,7 @@
 
 ---
 
-Boxdawn guard is a Claude Code plugin that judges every Bash and PowerShell command before it runs. A command that would wipe a directory outside your project, force-push over shared history, drop a database or destroy cloud resources is **denied** or **held for your approval**. Everything else goes to Claude Code's own permission settings. The guard never says allow.
+Boxdawn guard is a Claude Code plugin that judges every Bash and PowerShell command before it runs. A command that would wipe a directory outside your project, force-push over shared history, drop a database or destroy cloud resources is **denied** or **held for your approval**. Everything else goes to Claude Code's own permission settings. The guard never says allow. And when a command does delete or break files in your project, you can [bring them back](#bring-back-files).
 
 ## Install
 
@@ -37,9 +37,28 @@ copilot plugin marketplace add boxdawn/guard
 copilot plugin install boxdawn-guard@boxdawn
 ```
 
-The same rules judge the commands Copilot runs with its `powershell` and `bash` tools: deny or ask with the reason, or no decision. Typing into a shell that is already running (`write_powershell`, `write_bash`) always asks. Other tools, Copilot's own file viewing and search among them, get no decision, and a recursive `grep` gets no `--exclude` flags. This edition has no settings: it uses the fixed rules, with messages in English, or in Korean on a Korean system (Korean has not been run under Copilot yet).
+The same rules judge the commands Copilot runs with its `powershell` and `bash` tools: deny or ask with the reason, or no decision. Typing into a shell that is already running (`write_powershell`, `write_bash`) always asks. Other tools, Copilot's own file viewing and search among them, get no decision, and a recursive `grep` gets no `--exclude` flags. This edition has no settings and takes no snapshots: it uses the fixed rules, with messages in English, or in Korean on a Korean system (Korean has not been run under Copilot yet).
 
 When the guard fails, Copilot refuses the command. When a hook runs past Copilot's time limit, Copilot lets the command through, so the guard refuses on its own after 10 seconds. Tested with Copilot CLI 1.0.106 on Windows; the macOS and Linux builds are the same as the Claude Code plugin's but have not been run under Copilot.
+
+## Bring back files
+
+In Claude Code, before each Bash or PowerShell command, the guard saves a copy of the files in your project folder, `.env` and other ignored files too, on your machine. When a command deletes or breaks files there, type:
+
+```
+/boxdawn-guard:undo
+```
+
+Claude lists the copies, one before each command, and puts back the one you pick after you approve it. Putting a copy back saves the current state first, so it can be undone too.
+
+- **On unless you turn it off**: `undo` in `/plugin`. Nothing is sent anywhere.
+- **What it costs.** Each command waits for its copy: under a second in the projects we measured (0.3 s in a 57 MB copy, 0.75 s in a 632 MB one), never more than about 5 seconds. A project with tens of thousands of folders takes about 3.5 seconds on every command and its copies are often not ready in time. Copies take disk space in the plugin's data folder: when a session opens a project, its copies older than 7 days are dropped, and its oldest while they take more than 2 GB; at every session start, all copies of a project not used for 30 days are removed, with snapshots on or off.
+- **Only the project folder.** Not saved: the project's `.git` folder (commits, branches, stashes), `node_modules` and similar folders, build output the project's own repository ignores and tracks no file in (`target`, `build`, `dist`, `out`, `bin`, `obj`), repositories inside the project, files over 50 MB, databases, cloud resources and anything outside the folder. A session opened in your home folder, a drive, your Desktop, Documents or Downloads folder (where Windows keeps it, OneDrive included) or, on Windows, a OneDrive folder itself takes no copies; a project folder inside them does (in a OneDrive folder, the first copy reads every file, so files kept only online may be downloaded).
+- **A large project starts unprotected.** The first copy is taken when a session starts (82 seconds for the 632 MB project above); a command that runs before it is ready has no copy, and the list says so.
+- **For an agent's mistakes, not an agent working against you.** The agent can read the copies, `.env` included, and a command that reaches the plugin's data folder can spoil them.
+- **The guard's decisions stay the same**, but for one: while there are copies of the project, a line that names the guard's own `undo restore` asks first. A separate setting, off unless you turn it on (`undo_instead_of_git_asks` in `/plugin`), lets a `git reset --hard`, `git checkout -- .`, `git restore .` or `git stash` that only rewrites the project's own files go on without asking, because the copy taken before it can bring the files back.
+
+The setting's description in `/plugin` lists every limit.
 
 ## What it does
 

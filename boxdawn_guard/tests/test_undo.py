@@ -131,8 +131,16 @@ def test_nothing_changed_takes_no_new_commit(project):
     assert first["commit"] == second["commit"] and second["n"] == 2
 
 
-def test_off_by_default(project, monkeypatch, capsys):
+def test_on_by_default(project, monkeypatch, capsys):
+    # Claude Code sets no variable for an option the user never set.
     monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_UNDO")
+    assert _hook(_payload(project), monkeypatch, capsys) == ""
+    assert len(_store(project).snapshots()) == 1
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no"])
+def test_off_when_turned_off(project, monkeypatch, capsys, value):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", value)
     assert _hook(_payload(project), monkeypatch, capsys) == ""
     assert not os.path.exists(_store(project).root)
 

@@ -17,6 +17,11 @@ from boxdawn_guard.tests.test_undo import _git, _payload, _write, project  # noq
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
+@pytest.fixture(autouse=True)
+def _its_own_setting_on(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO_INSTEAD_OF_GIT_ASKS", "true")
+
+
 COVERED = ["git reset --hard", "git reset --hard HEAD", "git checkout -- .", "git restore .", "git checkout .",
            "git stash", "git stash push -u", "git stash pop"]
 
@@ -84,6 +89,15 @@ def test_a_deny_on_the_line_stays_a_deny(project):
 def test_undo_off_changes_nothing(project, monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "false")
     assert _decision(_payload(project, "git reset --hard")) == "ask"
+    assert _snapshots(project) == []
+
+
+def test_copilot_has_no_undo_even_by_default(project, monkeypatch):
+    # Copilot has no way to list, restore or turn snapshots off: its ask stays an ask.
+    from boxdawn_guard import copilot_hook
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_UNDO", "")  # on by default; recorded, so put back afterwards
+    out = copilot_hook.decide({"toolName": "bash", "toolArgs": {"command": "git reset --hard"}, "cwd": project})
+    assert out["permissionDecision"] == "ask"
     assert _snapshots(project) == []
 
 
