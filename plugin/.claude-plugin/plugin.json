@@ -39,7 +39,7 @@
     "judgment_log": {
       "type": "boolean",
       "title": "Keep a record of denies and asks on this machine",
-      "description": "On unless you turn it off. Each deny or ask is written as one line to the plugin's data folder on this machine: when, which tool (Bash or PowerShell), the decision and the guard's rule names. The command, its paths and the reason text are not kept, and nothing is sent anywhere. `/boxdawn-guard:log` in Claude Code shows the last 30 days by reason; so does `log` given to bdxguard.exe in the plugin's data folder (`current`). Lines older than 30 days are deleted, with this on or off. Decisions on Read and Grep are not recorded.",
+      "description": "On unless you turn it off. Each deny or ask one of the guard's rules gives is written as one line to the plugin's data folder on this machine: when, which tool (Bash or PowerShell), the decision and the guard's rule names. The command, its paths and the reason text are not kept, and nothing is sent anywhere. `/boxdawn-guard:log` in Claude Code shows the last 30 days by reason; so does `log` given to bdxguard.exe in the plugin's data folder (`current`). Lines older than 30 days are deleted, with this on or off. Decisions on Read and Grep, and the ask in front of the guard's own `undo restore`, are not recorded.",
       "default": true
     },
     "language": {

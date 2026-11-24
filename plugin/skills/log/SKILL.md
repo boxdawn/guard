@@ -5,7 +5,7 @@ disable-model-invocation: true
 allowed-tools: Bash("${CLAUDE_PLUGIN_DATA}/current/bdxguard.exe" log)
 ---
 
-Boxdawn guard keeps a record on this machine of each command it denied or asked about. Show it to the person.
+Boxdawn guard keeps a record on this machine of each command one of its rules denied or asked about. Show it to the person.
 
 Run this with the Bash tool (or PowerShell, with `&` in front), with the path in double quotes exactly as written, and nothing else on the line:
 

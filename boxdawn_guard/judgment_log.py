@@ -174,16 +174,27 @@ def prune(data_dir: str | None, *, now: float | None = None) -> None:
         pass
 
 
+def _closed(value, allowed) -> bool:
+    return isinstance(value, str) and value in allowed
+
+
 def _line_ok(line) -> bool:
+    """Exactly what `entry` writes: a line changed by hand is not shown, so nothing but the
+    guard's own values reaches the person (or the model, through the skill)."""
     if not isinstance(line, dict) or set(line) != _KEYS or not isinstance(line["findings"], list):
         return False
-    return (type(line["t"]) is int and line["tool"] in TOOLS and line["decision"] in LEVELS
-            and all(isinstance(f, dict) and isinstance(f.get("rule"), str) and f.get("level") in LEVELS
+    return (type(line["t"]) is int and 0 <= line["t"] < 2**32 and _closed(line["tool"], TOOLS)
+            and _closed(line["decision"], LEVELS) and type(line["escalated"]) is bool
+            and all(isinstance(f, dict) and set(f) == {"rule", "level", "target"}
+                    and isinstance(f["rule"], str) and rule_id_ok(f["rule"]) and _closed(f["level"], LEVELS)
+                    and (f["target"] is None or _closed(f["target"], TARGETS))
                     for f in line["findings"]))
 
 
-def read(data_dir: str | None) -> list[dict]:
-    """Every good line, oldest first. Lines that are not the guard's own are skipped."""
+def read(data_dir: str | None, *, now: float | None = None) -> list[dict]:
+    """Every good line of the last KEEP_DAYS days, oldest first. Lines that are not the
+    guard's own are skipped."""
+    since = (time.time() if now is None else now) - KEEP_DAYS * 86400
     folder = Path(data_dir) / LOG_DIR if data_dir else None
     if folder is None or not folder.is_dir():
         return []
@@ -200,7 +211,7 @@ def read(data_dir: str | None) -> list[dict]:
                 line = json.loads(raw)
             except ValueError:
                 continue
-            if _line_ok(line):
+            if _line_ok(line) and line["t"] >= since:
                 lines.append(line)
     return sorted(lines, key=lambda line: line["t"])
 
@@ -247,5 +258,6 @@ def _cli(argv: list[str]) -> int:
     data_dir = os.environ.get("CLAUDE_PLUGIN_DATA")
     if not data_dir and getattr(sys, "frozen", False):  # <data>/current/bdxguard.exe
         data_dir = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+    prune(data_dir)
     sys.stdout.write(show(data_dir))
     return 0

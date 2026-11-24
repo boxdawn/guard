@@ -95,13 +95,13 @@ With a Boxdawn API key on a paid plan, set in the plugin's settings (`/plugin co
 
 ## Deny and ask record
 
-**On this machine, on every plan.** Each deny or ask on a Bash or PowerShell command is appended as one line to `judged/YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/judgment_log.py`](boxdawn_guard/judgment_log.py)): when, which tool, the decision and the guard's rule names. The command, its paths and the reason text are not kept, and nothing in this record is sent anywhere. To see the last 30 days by reason, type:
+**On this machine, on every plan.** Each deny or ask one of the guard's rules gives on a Bash or PowerShell command is appended as one line to `judged/YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/judgment_log.py`](boxdawn_guard/judgment_log.py)): when, which tool, the decision and the guard's rule names. The command, its paths and the reason text are not kept, and nothing in this record is sent anywhere. To see the last 30 days by reason, type:
 
 ```
 /boxdawn-guard:log
 ```
 
-Lines older than 30 days are deleted at the next Bash or PowerShell call. It is on unless you turn it off: `judgment_log` in `/plugin`. Decisions on the `Read` and `Grep` tools are not recorded, and the Copilot CLI edition keeps no record.
+Each day's file is deleted at the first Bash or PowerShell call once the day is more than 30 days past (UTC), and `/boxdawn-guard:log` shows only the last 30 days. It is on unless you turn it off: `judgment_log` in `/plugin`. Not recorded: decisions on the `Read` and `Grep` tools, the ask in front of the guard's own `undo restore` when no rule asked about the line, and a refusal because the guard itself failed. The Copilot CLI edition keeps no record.
 
 **Sent to Boxdawn, on a paid plan.** On a paid plan, each deny or ask judged on the signed rules is appended as one line to `log/blocks-YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/block_log.py`](boxdawn_guard/block_log.py)). A line holds the tool, the decision, the rule ids and where the target sits (inside the project, outside it, …), never the command or a path. Files older than 30 days are deleted at the next Bash or PowerShell call. At session start, right after the signed rules are fetched, the lines are sent to Boxdawn and then deleted from your machine ([`boxdawn_guard/block_send.py`](boxdawn_guard/block_send.py)); the request carries the key and those lines only. To keep the record on this machine instead, turn on `keep_blocks_local` in the plugin's settings. Without a key, or on the fixed rules, nothing is written to `log/` or sent. Decisions on the `Read` and `Grep` tools are not recorded.
 
@@ -109,7 +109,7 @@ The guard's messages are in English, or in Korean when Korean is this machine's 
 
 ## Tested
 
-Every release runs real Claude Code sessions against the installed plugin on all five platforms before it is published: ordinary commands run, dangerous ones are denied or held, unattended mode denies, a session without a key leaves no record to send, and the record kept on the machine holds only closed-set values. The binary on each platform must give byte-identical decisions to the Python source.
+Every release runs real Claude Code sessions against the installed plugin on all five platforms before it is published: ordinary commands run, dangerous ones are denied or held, unattended mode denies, a session without a key leaves no record to send, and the record kept on the machine has the denies and asks with no word of their commands. The binary on each platform must give byte-identical decisions to the Python source.
 
 ## Privacy
 
