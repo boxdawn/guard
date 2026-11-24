@@ -36,6 +36,12 @@
       "description": "With snapshots on, a line that is only `git reset --hard`, `git checkout -- .`, `git restore .` or `git stash` in the project's own repository, and only rewrites files a snapshot holds, goes on without asking once its snapshot is taken, also where nobody is there to approve it (bypassPermissions). Anything else on the line, a doubt about which files git reaches, or a snapshot that is late or leaves a file out keeps the ask.",
       "default": false
     },
+    "judgment_log": {
+      "type": "boolean",
+      "title": "Keep a record of denies and asks on this machine",
+      "description": "On unless you turn it off. Each deny or ask is written as one line to the plugin's data folder on this machine: when, which tool (Bash or PowerShell), the decision and the guard's rule names. The command, its paths and the reason text are not kept, and nothing is sent anywhere. `/boxdawn-guard:log` in Claude Code shows the last 30 days by reason; so does `log` given to bdxguard.exe in the plugin's data folder (`current`). Lines older than 30 days are deleted, with this on or off. Decisions on Read and Grep are not recorded.",
+      "default": true
+    },
     "language": {
       "type": "string",
       "title": "Language",

@@ -22,6 +22,10 @@ if sys.argv[1:2] in (["undo"], ["undo-start"], ["undo-clean"]):
     from boxdawn_guard.undo import _cli
     sys.exit(_cli(sys.argv[1:]))
 
+if sys.argv[1:2] == ["log"]:
+    from boxdawn_guard.judgment_log import _cli
+    sys.exit(_cli(sys.argv[1:]))
+
 if sys.argv[1:2] == ["copilot-hook"]:
     from boxdawn_guard.copilot_hook import main
 else:

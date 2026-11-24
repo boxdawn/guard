@@ -10,7 +10,9 @@ v2.1.295+): a command hook that times out does not block by default.
 Rules: the signed server bundle stored by `fetch-rules` when it is there
 and good (`rules_bundle`), else the fixed rules in `command_rules_source`.
 A deny or ask judged on the bundle is also written to the local block
-record (`block_log`); on the fixed rules nothing is written.
+record (`block_log`); on the fixed rules nothing is written there. Every deny
+or ask, on any rules, also goes to the record kept on this machine only
+(`judgment_log`) unless the user turned it off.
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import shutil
 import subprocess
 import sys
 
-from boxdawn_guard import block_log, messages_ko, secret_files, undo
+from boxdawn_guard import block_log, judgment_log, messages_ko, secret_files, undo
 from boxdawn_guard.command_guard import evaluate, evaluate_file_tool
 from boxdawn_guard.rules_bundle import load_stored
 from boxdawn_guard.powershell_guard import evaluate_powershell
@@ -263,6 +265,7 @@ def decide(payload: dict) -> dict | None:
         return None
     data_dir = os.environ.get("CLAUDE_PLUGIN_DATA")
     block_log.prune(data_dir)
+    judgment_log.prune(data_dir)
     # The signed server bundle if one is stored and good, else the fixed rules.
     rules, bundle_exp = load_stored(data_dir)
     known_env = {k: os.environ[k] for k in ("TEMP", "TMP", "TMPDIR", "USERPROFILE", "APPDATA", "LOCALAPPDATA")
@@ -289,6 +292,8 @@ def decide(payload: dict) -> dict | None:
                 reasons.append("nobody is present to approve it")
             if asked and bundle_exp is not None:
                 block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
+            if asked:
+                judgment_log.record(data_dir, verdict, tool=tool)
             # A line let through as it is would have had secret files kept out of its grep: so here too.
             kept_out = {} if asked or tool != "Bash" or verdict is None else \
                 (_grep_without_secrets(tool_input, verdict.grep_ends, payload.get("cwd")) or {}).get(
@@ -314,6 +319,7 @@ def decide(payload: dict) -> dict | None:
             return None  # every file git would rewrite is in that snapshot: no need to ask
     if bundle_exp is not None:
         block_log.record(data_dir, verdict, tool=tool, exp=bundle_exp)
+    judgment_log.record(data_dir, verdict, tool=tool)
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": verdict.decision,

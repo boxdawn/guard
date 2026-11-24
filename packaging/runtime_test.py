@@ -324,6 +324,18 @@ def run_plan(market: pathlib.Path, guarded: pathlib.Path, control: pathlib.Path)
     failures += not no_record
     print(f"{'PASS' if no_record else 'FAIL'}  no block record without a key")
     total = len(plan) + 1
+    # The record kept on this machine has the denies above, and only closed-set values. Not
+    # for the directory edition: it runs the build it pins, which may come before the record.
+    if ids:
+        local = [json.loads(raw) for p in sorted((DATA / "judged").glob("*.jsonl"))
+                 for raw in p.read_text(encoding="ascii").splitlines()] if (DATA / "judged").is_dir() else []
+        keys = {"v", "t", "tool", "decision", "escalated", "findings", "build"}
+        local_ok = bool(local) and all(
+            set(line) == keys and line["decision"] in ("deny", "ask") and line["findings"]
+            and all(set(f) == {"rule", "level", "target"} for f in line["findings"]) for line in local)
+        total += 1
+        failures += not local_ok
+        print(f"{'PASS' if local_ok else 'FAIL'}  local judgment record: {len(local)} lines, closed values only")
     # The directory edition is frozen under review and keeps nothing out of a search.
     for tool in () if "--no-search" in sys.argv else ("Bash", "Grep"):
         for label, d, want in (("plugin", guarded, (True, False)), ("control", control, (True, True))):
