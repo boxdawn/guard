@@ -181,7 +181,7 @@ def _closed(value, allowed) -> bool:
 def _line_ok(line) -> bool:
     """Exactly what `entry` writes: a line changed by hand is not shown, so nothing but the
     guard's own values reaches the person (or the model, through the skill)."""
-    if not isinstance(line, dict) or set(line) != _KEYS or not isinstance(line["findings"], list):
+    if not isinstance(line, dict) or set(line) != _KEYS or not isinstance(line["findings"], list)             or not line["findings"]:
         return False
     return (type(line["t"]) is int and 0 <= line["t"] < 2**32 and _closed(line["tool"], TOOLS)
             and _closed(line["decision"], LEVELS) and type(line["escalated"]) is bool
@@ -209,7 +209,7 @@ def read(data_dir: str | None, *, now: float | None = None) -> list[dict]:
         for raw in text.splitlines():
             try:
                 line = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if _line_ok(line) and line["t"] >= since:
                 lines.append(line)

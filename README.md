@@ -95,7 +95,7 @@ With a Boxdawn API key on a paid plan, set in the plugin's settings (`/plugin co
 
 ## Deny and ask record
 
-**On this machine, on every plan.** Each deny or ask one of the guard's rules gives on a Bash or PowerShell command is appended as one line to `judged/YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/judgment_log.py`](boxdawn_guard/judgment_log.py)): when, which tool, the decision and the guard's rule names. The command, its paths and the reason text are not kept, and nothing in this record is sent anywhere. To see the last 30 days by reason, type:
+**On this machine, on every plan.** Each deny or ask one of the guard's rules gives on a Bash or PowerShell command is appended as one line to `judged/YYYYMMDD.jsonl` in the plugin's data folder ([`boxdawn_guard/judgment_log.py`](boxdawn_guard/judgment_log.py)): when, which tool, the decision, the guard's rule names and where each target sits (inside the project, outside it, …). The command, its paths and the reason text are not kept, and nothing in this record is sent anywhere. To see the last 30 days by reason, type:
 
 ```
 /boxdawn-guard:log
