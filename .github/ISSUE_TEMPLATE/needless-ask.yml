@@ -1,0 +1,27 @@
+name: The guard denied or asked when it need not have
+description: Tell us which rule got in the way, so we can make it ask less.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues here are public. Do not paste a command, path or anything else you would not post in public.
+  - type: input
+    id: rule
+    attributes:
+      label: Which rule
+      description: The rule name as `/boxdawn-guard:log` shows it, such as `name.runtime`. If you don't know it, say what the guard's message said.
+    validations:
+      required: true
+  - type: textarea
+    id: doing
+    attributes:
+      label: What you were doing
+      description: In your own words, what the agent was working on when it happened. No command needed.
+    validations:
+      required: true
+  - type: textarea
+    id: share
+    attributes:
+      label: The block from /boxdawn-guard:log (optional)
+      description: The indented lines under "To share", as printed. They hold the guard's build, rule names, deny or ask, and counts of decisions with where their targets were (inside the project, outside it, ...), with no command, path or time.
+      render: text

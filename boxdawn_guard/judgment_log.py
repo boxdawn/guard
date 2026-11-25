@@ -22,7 +22,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from boxdawn_guard.block_log import LEVELS, TOOLS, _build_id, _open_append
+from boxdawn_guard.block_log import _BUILD_ID, LEVELS, TOOLS, _build_id, _open_append
 from boxdawn_guard.command_guard import CUSTOM_RULE_ID, TARGETS, Verdict, rule_id_ok
 
 LOG_VERSION = 1
@@ -31,6 +31,7 @@ KEEP_DAYS = 30
 DAY_FILE = re.compile(r"(\d{8})\.jsonl")
 _KEYS = frozenset({"v", "t", "tool", "decision", "escalated", "findings", "build"})
 _LAST = 20
+ISSUE_URL = "https://github.com/boxdawn/guard/issues/new?template=needless-ask.yml"
 
 # What each rule is about, with no word of any command in it.
 RULES = {
@@ -248,7 +249,38 @@ def show(data_dir: str | None) -> str:
         rules = ", ".join(dict.fromkeys(f["rule"] for f in line["findings"])) or "-"
         unattended = "  (nobody there to approve)" if line["escalated"] else ""
         out.append(f"  {_when(line['t'])}  {line['decision']:<4}  {line['tool']:<10}  {rules}{unattended}")
+    out += ["", *_share(lines)]
     return "\n".join(out) + "\n"
+
+
+def _share(lines: list[dict]) -> list[str]:
+    """The counts by reason with no time in them and an org's own rules unnamed, for the
+    person to paste into an issue if they choose. Nothing is sent from here."""
+    counts: Counter = Counter()
+    targets: dict = {}
+    for line in lines:  # each count is of decisions, the targets' too
+        keys, seen = set(), set()
+        for f in line["findings"]:
+            key = ("custom" if CUSTOM_RULE_ID.fullmatch(f["rule"]) else f["rule"], f["level"])
+            keys.add(key)
+            targets.setdefault(key, Counter())
+            if f["target"] is not None:
+                seen.add((key, f["target"]))
+        counts.update(keys)
+        for key, target in seen:
+            targets[key][target] += 1
+    build = next((line["build"][:7] for line in reversed(lines)
+                  if isinstance(line["build"], str) and _BUILD_ID.fullmatch(line["build"])), "unknown")
+    width = max(len(rule) for rule, _ in counts)
+    out = ["To share: did the guard deny or ask when it need not have? Paste the indented lines into",
+           ISSUE_URL,
+           "They have no command, path or time in them. Nothing is sent unless you paste them.",
+           "Each count is of decisions; after it, how many of them had a target in each place.",
+           f"  guard {build}, last {KEEP_DAYS} days, {len(lines)} decisions"]
+    for (rule, level), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        where = ", ".join(f"{t} {c}" for t, c in sorted(targets[(rule, level)].items()))
+        out.append(f"  {level:<4}  {rule:<{width}}  {n:>5}  {where}".rstrip())
+    return out
 
 
 def _cli(argv: list[str]) -> int:

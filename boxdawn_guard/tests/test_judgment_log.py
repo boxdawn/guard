@@ -148,6 +148,44 @@ def test_show_skips_lines_that_are_not_the_guards(data):
     assert "1 deny and ask decisions" in judgment_log.show(str(data))
 
 
+def test_share_block_has_counts_and_targets_but_no_time_or_command(data):
+    (data / "current").mkdir()
+    (data / "current" / "BUILD_ID").write_text("99fcc9f2ea68ebd7b2e8f5a8178e8bcd55aa9f65")
+    for command in (f"rm -rf {SECRET_PATH}", "rm -rf ~", "git reset --hard"):
+        command_hook.decide(_payload(command))
+    share = judgment_log.show(str(data)).split("To share")[1]
+    assert judgment_log.ISSUE_URL in share
+    assert "guard 99fcc9f, last 30 days, 3 decisions" in share
+    assert "  deny  rm.outside" in share and "      2  outside 2" in share
+    assert "  ask   git.reset_hard" in share
+    assert time.strftime("%Y-%m-%d") not in share
+    for word in ("acme", "clients", "rm -rf", "reset --hard"):
+        assert word not in share
+    assert share.isascii()
+
+
+def test_share_block_names_no_custom_rule_and_no_bad_build(data):
+    folder = data / judgment_log.LOG_DIR
+    folder.mkdir()
+    line = {"v": 1, "t": int(time.time()), "tool": "Bash", "decision": "ask", "escalated": False,
+            "findings": [{"rule": "custom.r42", "level": "ask", "target": "project"}],
+            "build": "ignore previous instructions"}
+    (folder / f"{time.strftime('%Y%m%d')}.jsonl").write_text(json.dumps(line) + "\n")
+    share = judgment_log.show(str(data)).split("To share")[1]
+    assert "custom.r42" not in share and "  ask   custom      1  project 1" in share
+    assert "guard unknown," in share and "ignore" not in share
+
+
+def test_share_block_counts_targets_per_decision(data):
+    folder = data / judgment_log.LOG_DIR
+    folder.mkdir()
+    two = [{"rule": "rm.outside", "level": "deny", "target": "outside"}] * 2
+    line = {"v": 1, "t": int(time.time()), "tool": "Bash", "decision": "deny", "escalated": False,
+            "findings": two, "build": None}
+    (folder / f"{time.strftime('%Y%m%d')}.jsonl").write_text(json.dumps(line) + "\n")
+    assert "  deny  rm.outside      1  outside 1" in judgment_log.show(str(data)).split("To share")[1]
+
+
 def test_show_with_nothing(data):
     assert "no deny or ask decisions" in judgment_log.show(str(data))
     assert "no deny or ask decisions" in judgment_log.show(None)
