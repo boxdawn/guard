@@ -182,7 +182,9 @@ def test_secret_looking_annotation_is_left_out(tmp_path):
 
 def test_korean_note(tmp_path):
     code, text = go(Fake(runs=[run_row()], prev=prev_rows("success")), tmp_path=tmp_path, korean=True)
-    assert code == 2 and "CI 가 새로 실패했습니다" in text
+    assert code == 2 and "CI 가 새로 실패했습니다" in text and "직전 실행은 통과였습니다" in text and "success" not in text
+    code, text = go(Fake(runs=[run_row()], prev=prev_rows("success")), tmp_path=tmp_path / "en")
+    assert code == 2 and "its previous run passed" in text
 
 
 def test_main_is_off_unless_the_setting_is_on(monkeypatch):
