@@ -239,12 +239,12 @@ def note(t: dict, r: dict, detail: dict, prev: str, korean: bool) -> str:
     where = f"{t['repo']} {t['branch']} @ {t['sha'][:7]}"
     if korean:
         head = (f"Boxdawn guard: 방금 push 한 커밋에서 CI 가 새로 실패했습니다 ({where}). "
-                f"워크플로 '{r.get('workflowName')}' — 직전 실행은 {prev} 였습니다.")
+                f"워크플로 '{r.get('workflowName')}' — 직전 실행은 통과였습니다.")
         tail = (f"이 변경 때문인지 확인하세요: gh run view {r['databaseId']} --repo {t['repo']} --log-failed  "
                 "(변경과 상관없는 실패일 수도 있습니다.)")
     else:
         head = (f"Boxdawn guard: CI newly failed on the commit you just pushed ({where}). "
-                f"Workflow '{r.get('workflowName')}': its previous run was {prev}.")
+                f"Workflow '{r.get('workflowName')}': its previous run passed.")
         tail = (f"Check whether your change caused it: gh run view {r['databaseId']} --repo {t['repo']} --log-failed  "
                 "(it may also be unrelated to the change).")
     return "\n".join([head, *lines, tail])
