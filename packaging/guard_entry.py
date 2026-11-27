@@ -26,6 +26,11 @@ if sys.argv[1:2] == ["log"]:
     from boxdawn_guard.judgment_log import _cli
     sys.exit(_cli(sys.argv[1:]))
 
+if sys.argv[1:2] == ["ci-notice"]:
+    # PostToolUse, in the background (asyncRewake): exit 2 wakes the agent with stderr.
+    from boxdawn_guard.ci_notice import main
+    sys.exit(main())
+
 if sys.argv[1:2] == ["copilot-hook"]:
     from boxdawn_guard.copilot_hook import main
 else:

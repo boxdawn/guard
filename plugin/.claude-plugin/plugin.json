@@ -42,6 +42,12 @@
       "description": "On unless you turn it off. Each deny or ask one of the guard's rules gives is written as one line to the plugin's data folder on this machine: when, which tool (Bash or PowerShell), the decision, the guard's rule names and where each target sits (inside the project, outside it, ...). The command, its paths and the reason text are not kept, and nothing is sent anywhere. `/boxdawn-guard:log` in Claude Code shows the last 30 days by reason; so does `log` given to bdxguard.exe in the plugin's data folder (`current`). Each day's file is deleted once the day is more than 30 days past, with this on or off. Decisions on Read and Grep are not recorded, nor the ask in front of the guard's own `undo restore` when no rule asked about the line.",
       "default": true
     },
+    "ci_notice": {
+      "type": "boolean",
+      "title": "Tell the agent when its push newly breaks CI",
+      "description": "Off unless you turn it on. After a git push in Bash or PowerShell, the guard waits in the background (up to 25 minutes) for the GitHub Actions runs of the pushed commit, through the gh command-line tool you have signed in. When a run fails whose workflow passed on the run before it (on that branch, or on the default branch for a branch's first run), it wakes Claude with the failed workflow, job, step and a few annotation lines. It stays quiet when the run was already failing, for commit-message and pull-request-title checks, for jobs not started for billing, for a commit that changes only documentation, and for a lint or format job whose annotations all point at files the commit did not change. At most one note per push and three per session. It never blocks, retries or changes anything, and sends nothing to Boxdawn. Needs git and gh on PATH (not inside the project folder); without them it does nothing.",
+      "default": false
+    },
     "language": {
       "type": "string",
       "title": "Language",

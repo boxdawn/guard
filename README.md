@@ -109,6 +109,10 @@ If a deny or ask got in the way for nothing, tell us in [an issue](https://githu
 
 The guard's messages are in English, or in Korean when Korean is this machine's language (on Windows the display language or the first preferred language; `LC_ALL`, `LC_MESSAGES` or `LANG` elsewhere). Set `language` to English or 한국어 in the plugin's settings to fix one. The decision is the same in both.
 
+## CI after a push
+
+Off unless you turn it on: `ci_notice` in `/plugin`. After Claude runs `git push` in Bash or PowerShell, the guard waits in the background, up to 25 minutes, for the GitHub Actions runs of the pushed commit, using the `gh` command-line tool you have signed in. When a run fails and the same workflow passed on the run before it (on that branch, or on the default branch for a branch's first run), it wakes Claude with the failed workflow, job and step and a few annotation lines ([`boxdawn_guard/ci_notice.py`](boxdawn_guard/ci_notice.py)). It stays quiet when the workflow was already failing, for commit-message and pull-request-title checks, for jobs not started for billing, for a commit that changes only documentation, and for a lint or format job whose annotations all point at files the commit did not change. At most one note per push and three per session. It never blocks, retries or changes anything, and reads GitHub only; nothing goes to Boxdawn. Without `git` and `gh` on PATH it does nothing. Not in the Copilot CLI edition.
+
 ## Tested
 
 Every release runs real Claude Code sessions against the installed plugin on all five platforms before it is published: ordinary commands run, dangerous ones are denied or held, unattended mode denies, a session without a key leaves no record to send, and the record kept on the machine has the denies and asks with no word of their commands. The binary on each platform must give byte-identical decisions to the Python source.
